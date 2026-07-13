@@ -1,0 +1,41 @@
+# Local development stack. MySQL and ChromaDB are provisioned now so later
+# phases have their dependencies ready; the Phase 1 API does not require them.
+services:
+  api:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      APP_ENVIRONMENT: local
+      APP_DEBUG: "false"
+      APP_LOG_JSON: "true"
+      APP_LOG_LEVEL: INFO
+      APP_DATABASE_URL: mysql+asyncmy://app:app@mysql:3306/app
+      APP_CHROMA_HOST: chroma
+      APP_CHROMA_PORT: "8000"
+    depends_on:
+      - mysql
+      - chroma
+
+  mysql:
+    image: mysql:8.0
+    environment:
+      MYSQL_DATABASE: app
+      MYSQL_USER: app
+      MYSQL_PASSWORD: app
+      MYSQL_ROOT_PASSWORD: root
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+
+  chroma:
+    image: chromadb/chroma:latest
+    ports:
+      - "8001:8000"
+    volumes:
+      - chroma_data:/chroma/chroma
+
+volumes:
+  mysql_data:
+  chroma_data:
