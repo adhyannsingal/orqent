@@ -8,8 +8,17 @@ from app.infrastructure.db.base import Base
 TABLES = Base.metadata.tables
 
 
-def test_exactly_the_foundation_tables_exist() -> None:
-    assert set(TABLES) == {"organizations", "users", "roles", "user_roles"}
+def test_exactly_the_expected_tables_exist() -> None:
+    # Guards against a stray model registering a table nobody migrated.
+    # `refresh_tokens` joined in Phase 3B; its own metadata lives in
+    # tests/unit/test_refresh_token_model.py.
+    assert set(TABLES) == {
+        "organizations",
+        "users",
+        "roles",
+        "user_roles",
+        "refresh_tokens",
+    }
 
 
 def test_primary_key_names_follow_convention() -> None:

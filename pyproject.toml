@@ -19,6 +19,10 @@ dependencies = [
     "asyncmy>=0.2.9",
     "alembic>=1.13",
     "python-ulid>=2.7",
+    "argon2-cffi>=23.1",
+    "pyjwt>=2.9",
+    # Backs pydantic's EmailStr, which is not usable without it.
+    "email-validator>=2.2",
 ]
 
 [project.optional-dependencies]
@@ -97,4 +101,10 @@ ignore_missing_imports = true
 asyncio_mode = "auto"
 testpaths = ["tests"]
 pythonpath = ["src"]
-addopts = "-q"
+# Integration tests need a live MySQL, so they are deselected by default: the
+# standard suite must stay fast and runnable with no external services.
+# Run them with: pytest -m integration
+addopts = "-q -m 'not integration'"
+markers = [
+    "integration: requires a live MySQL (deselected by default; run with -m integration)",
+]

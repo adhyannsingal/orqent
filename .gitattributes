@@ -1,0 +1,15 @@
+# Normalize line endings: store text as LF in the repo, check out native.
+# Prevents CRLF/LF churn across macOS/Linux/Windows contributors.
+* text=auto eol=lf
+
+# Explicitly LF for shell/Python (never CRLF, which breaks shebangs/tools).
+*.py   text eol=lf
+*.sh   text eol=lf
+
+# Binary assets — never diff or line-ending-convert these.
+*.zip  binary
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.gif  binary
+*.ico  binary

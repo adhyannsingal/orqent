@@ -1,0 +1,24 @@
+# EditorConfig — consistent formatting across editors (https://editorconfig.org)
+# Complements Ruff (the authoritative formatter/linter) so files agree on
+# whitespace before Ruff ever runs.
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+indent_style = space
+indent_size = 4
+
+# Python — line length mirrors Ruff's configured limit (pyproject.toml).
+[*.py]
+max_line_length = 100
+
+# Data / config formats conventionally use 2-space indentation.
+[*.{yml,yaml,json,toml}]
+indent_size = 2
+
+# Markdown: trailing whitespace can be a meaningful hard line break.
+[*.md]
+trim_trailing_whitespace = false

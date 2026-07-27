@@ -8,8 +8,9 @@ full schema for autogeneration.
 from __future__ import annotations
 
 from app.infrastructure.db.models.organization import Organization
+from app.infrastructure.db.models.refresh_token import RefreshToken
 from app.infrastructure.db.models.role import Role
 from app.infrastructure.db.models.user import User
 from app.infrastructure.db.models.user_role import UserRole
 
-__all__ = ["Organization", "Role", "User", "UserRole"]
+__all__ = ["Organization", "RefreshToken", "Role", "User", "UserRole"]

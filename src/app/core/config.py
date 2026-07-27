@@ -47,6 +47,21 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
     log_json: bool = True
 
+    # --- Authentication (Phase 3, ADR-010) ---
+    # Symmetric signing key for access/refresh JWTs. Optional here so that
+    # importing settings never fails; the token adapter raises at construction
+    # time when it is missing (same contract as ``database_url``/``create_engine``).
+    jwt_secret_key: str | None = None
+    # Signing algorithm. HS256 (symmetric) is the V1 choice; moving to an
+    # asymmetric algorithm later is a configuration change, not a code change.
+    jwt_algorithm: str = "HS256"
+    # Access tokens are short-lived because they are stateless and therefore
+    # cannot be revoked — the expiry *is* the revocation window (ADR-010).
+    access_token_ttl_seconds: int = Field(default=900, gt=0)  # 15 minutes
+    # Refresh tokens are long-lived; revocability comes from the server-side
+    # hashed store with rotation, added in Phase 3B.
+    refresh_token_ttl_seconds: int = Field(default=2_592_000, gt=0)  # 30 days
+
     # --- Reserved for later phases (declared, intentionally unused now) ---
     database_url: str | None = None
     chroma_host: str | None = None

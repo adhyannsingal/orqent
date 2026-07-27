@@ -49,15 +49,19 @@ Architectural decisions with their rationale. Other docs cite these as `ADR-n`. 
 **Why:** Makes the transaction boundary visible and testable; multi-repository writes commit atomically. Exit rolls back uncommitted work (commit is explicit).
 **Consequences:** Services (Planned) open a UoW per write use case. See [architecture.md](architecture.md#9-unit-of-work-implemented).
 
-## ADR-010 — JWT access + rotating refresh with server-side store **[Planned]**
-**Decision:** Short-lived JWT access tokens (stateless) + long-lived opaque refresh tokens stored **hashed** in `refresh_tokens`, with rotation and reuse detection (replay of a revoked token revokes the whole family). Argon2id for passwords.
+## ADR-010 — JWT access + rotating refresh with server-side store **[Implemented]** *(amended 2026-07-24)*
+**Decision:** Short-lived JWT access tokens (stateless) + long-lived refresh tokens stored **hashed** in `refresh_tokens`, with rotation and reuse detection (replay of a revoked token revokes the whole family). Argon2id for passwords. Both token kinds are signed JWTs (HS256) carrying an explicit `token_type` claim; the signing key must be at least 32 bytes.
 **Why:** Pure stateless JWT can't be revoked (no logout/kill-switch). The hybrid keeps fast stateless access checks while making sessions revocable.
-**Consequences:** Adds the `refresh_tokens` table (Phase 3). Login resolves by globally-unique email (ADR-011).
 
-## ADR-011 — Global-unique email, one organization per user **[Planned/Implemented schema]**
+**Amendment (2026-07-24) — refresh tokens are JWTs, not opaque strings.** The original wording specified *opaque* refresh tokens. Phase 3A implemented them as JWTs, and that is now the accepted design. Opacity was only ever a means to revocability, and revocability comes entirely from the server-side hashed store — which is unchanged. Every security property the original decision required is preserved: hashed at rest, rotating, reuse-detected, server-side revocable. What the JWT form adds is the ability to reject a forged or expired refresh token by signature check *before* touching the database, and a uniform `TokenService` port for both kinds. What it costs is size (~300 bytes vs ~43) and the fact that a holder can read their own `org_id`/`roles` — neither of which is a confidentiality boundary we rely on, since the holder is the subject.
+
+**Consequences:** Adds the `refresh_tokens` table (Phase 3B), keyed on the token's `jti` with a `family_id` for lineage revocation. Login resolves by globally-unique email (ADR-011). Because a refresh token is a JWT, the store's expiry must agree with the token's `exp`; `IssuedToken` exists so the issuing call returns the generated `jti` and expiry directly rather than re-decoding. Reuse detection is **strict — no grace window in V1**: a legitimate client retry that replays a refresh token will revoke the whole family and force re-authentication. That trade favours detecting theft over avoiding a rare re-login, and a grace window can be added later without a schema change.
+**Status:** **Fully implemented in Phase 3B.** Phase 3A delivered the crypto (Argon2id hashing, JWT issue/verify, access-token enforcement at the API edge); Phase 3B added the `refresh_tokens` store, rotation, strict reuse detection with family revocation, and logout. Rotation serialises concurrent use with `SELECT ... FOR UPDATE` — a locking read, which under MySQL's default REPEATABLE READ is also what makes the second transaction observe the first's revocation instead of a stale snapshot.
+
+## ADR-011 — Global-unique email, one organization per user **[Implemented]**
 **Decision:** Email is globally unique; each user belongs to exactly one organization.
 **Why:** Per-tenant email would make login-by-email ambiguous without an org selector. Single-org removes that complexity for V1.
-**Consequences:** `users` has no per-tenant email uniqueness; `email_active` is globally unique. Multi-org membership is **[Future]** via a `memberships` join table.
+**Consequences:** `users` has no per-tenant email uniqueness; `email_active` is globally unique. Registration creates one organization per user and grants them the `owner` role. Multi-org membership is **[Future]** via a `memberships` join table.
 
 ## ADR-012 — Incremental migrations **[Planned]**
 **Decision:** Each table is created in the migration for the phase that introduces it; no full-schema-upfront.

@@ -1,0 +1,46 @@
+# Keep the Docker build context small and cache-stable. The image is built from
+# `pyproject.toml`, `README.md`, and `src/` only (see Dockerfile), so anything
+# below is unnecessary in the context.
+
+# Version control
+.git/
+.gitignore
+.gitattributes
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Python bytecode / build artifacts
+__pycache__/
+*.py[cod]
+build/
+dist/
+*.egg-info/
+
+# Test / type / lint caches & coverage
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Local environment / secrets
+.env
+.env.*
+
+# Not needed inside the image (kept out for speed; migrations run separately)
+tests/
+docs/
+.editorconfig
+.pre-commit-config.yaml
+CONTRIBUTING.md
+
+# Editor / OS / tooling
+.idea/
+.vscode/
+.claude/
+.DS_Store
+Thumbs.db

@@ -13,6 +13,18 @@ services:
       APP_DATABASE_URL: mysql+asyncmy://app:app@mysql:3306/app
       APP_CHROMA_HOST: chroma
       APP_CHROMA_PORT: "8000"
+      # LOCAL DEVELOPMENT PLACEHOLDER ONLY — this value is committed, so it is
+      # public and must never be used anywhere real. Staging and production
+      # inject their own secret from a secret manager.
+      #
+      # The application deliberately fails fast when this is missing rather than
+      # falling back to a generated or default key. A generated per-process key
+      # would silently invalidate every token on restart and break horizontal
+      # scaling (each replica signing with a different key); a hardcoded default
+      # would mean anyone reading this repository could forge a valid token for
+      # any deployment that forgot to override it. Refusing to start is the only
+      # option that cannot fail silently.
+      APP_JWT_SECRET_KEY: local-development-only-not-a-real-secret
     depends_on:
       - mysql
       - chroma
