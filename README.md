@@ -1,8 +1,7 @@
 # Orqent — Multi-Agent Orchestration Platform (Backend)
 
 Orqent is a backend platform for building and running **multi-agent AI
-workflows**. A user defines agents (an LLM configuration + prompt), composes
-them into a workflow, runs the workflow asynchronously, and gets a durable,
+workflows**. A user defines agents, composes them into a workflow, runs the workflow asynchronously, and gets a durable,
 inspectable execution history.
 
 **Guiding principle:** the workflow runtime is the product; the web framework
@@ -10,33 +9,7 @@ and the LLM library are replaceable details. Orqent owns orchestration,
 persistence, and history — FastAPI is a thin HTTP edge, and LangChain (a later
 phase) is confined to a single adapter.
 
-> **Project status:** early, built phase by phase. Foundation, database
-> infrastructure, and the initial migration are complete; authentication is
-> next. See [`docs/project_status.md`](docs/project_status.md) for the live
-> status and [`docs/roadmap.md`](docs/roadmap.md) for the phase plan.
 
-## Architecture at a glance
-
-Layered architecture with a hexagonal (ports & adapters) core for the parts
-that must never couple to a vendor: the execution engine and the LLM
-integration.
-
-```
-API (app.api)  →  Services (app.services)  →  Domain (app.domain, pure)
-                                                  ↑ implements ports
-                              Infrastructure (app.infrastructure, adapters)
-Cross-cutting: app.core        Composition root: app.container
-```
-
-- **Dependency rule:** dependencies point inward. The domain imports no
-  FastAPI/SQLAlchemy/LangChain/driver; only infrastructure imports vendors;
-  only the container wires concretions.
-- **Data:** MySQL 8 is the system of record; ChromaDB (later) is a derived,
-  rebuildable vector index.
-- Full design: [`docs/architecture.md`](docs/architecture.md); decisions and
-  rationale: [`docs/decisions.md`](docs/decisions.md).
-
-## Requirements
 
 - Python 3.12+
 - Docker + Docker Compose (for the local MySQL / ChromaDB stack)
@@ -102,23 +75,6 @@ uvicorn app.main:app --reload
 - Liveness: `GET /health/live` · Readiness: `GET /health/ready`
 - The versioned business API mounts at `/api/v1` (empty until feature phases).
 
-## Quality gates
-
-All four must pass before every commit (and at the end of every phase):
-
-```bash
-ruff format .        # format
-ruff check --fix .   # lint + import order
-mypy src             # strict type-check
-pytest               # tests
-```
-
-Or wire them as git hooks:
-
-```bash
-pre-commit install
-pre-commit run --all-files
-```
 
 ## Project structure
 
@@ -140,8 +96,3 @@ orqent/
     ├── services/           # use-case orchestration (later phase)
     └── infrastructure/     # adapters: db, repositories, llm, vector, queue, ...
 ```
-
-## Contributing
-
-See [`CONTRIBUTING.md`](CONTRIBUTING.md) for setup, the required gates, and the
-project's phase-discipline / architecture rules.
