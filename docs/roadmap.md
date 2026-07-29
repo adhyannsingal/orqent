@@ -1,5 +1,19 @@
 # Roadmap
 
+> ## ⚠️ Superseded for Phases 4+ (2026-07-29)
+>
+> Orqent was redesigned from a chain-of-agents runtime into a **visual workflow
+> automation platform**. The phase table below still describes the agent-centric
+> plan and is **out of date from Phase 4 onward**.
+>
+> Authoritative now: **ADR-018 … ADR-030** in [decisions.md](decisions.md) and
+> §11 of [project_status.md](project_status.md).
+>
+> In short: Phase 4 = workflow authoring + node contract · 5 = durable execution
+> core · 6 = control flow · 7 = queue/workers · 8 = triggers · 9 = human-in-the-loop
+> · 10 = connections + I/O nodes · 11 = AI agent node · 12 = memory/RAG ·
+> 13 = observability. Phases 1–3 below remain accurate.
+
 Phase-by-phase plan with current status. Each phase ends with a working, tested backend. Table creation per phase is in [database.md](database.md#3-planned-schema-by-phase); decisions in [decisions.md](decisions.md).
 
 ---

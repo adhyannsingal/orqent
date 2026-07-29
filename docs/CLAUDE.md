@@ -6,9 +6,9 @@ This file is the durable memory for any AI assistant working in this repository.
 
 ## What Orqent is
 
-**Orqent** is a backend platform for building and running **multi-agent AI workflows**. A user registers, creates agents (an LLM configuration + prompt), composes them into a workflow, runs the workflow asynchronously, and gets a durable, inspectable execution history. The Python package is `app`; the product name is Orqent.
+**Orqent** is a backend platform for building and running **visual workflow automations**. A user composes a graph of typed nodes — triggers, HTTP calls, database reads, transforms, conditions, loops, human approvals, file and email outputs, and **AI agents** — in a drag-and-drop builder, then runs it on a trigger, a schedule, or a webhook and gets a durable, inspectable execution history.
 
-Guiding principle: **the workflow runtime is the product; the web framework and the LLM library are replaceable details.** Orqent owns orchestration, persistence, and history. FastAPI is a thin HTTP edge. LangChain is confined to one adapter.
+Guiding principle: **the workflow runtime is the product; the web framework, the database, and the LLM library are replaceable details.** Orqent owns orchestration, persistence, and history. FastAPI is a thin HTTP edge. **AI is one node type among many — the engine must run an LLM call, an HTTP request, and a human decision through exactly the same contract** (`ADR-020`). The Python package is `app`; the product name is Orqent.
 
 Full picture: [docs/architecture.md](docs/architecture.md).
 
@@ -20,7 +20,7 @@ Full picture: [docs/architecture.md](docs/architecture.md).
 - **Migrations `0001`–`0003` exist and are applied**: foundation tables, `refresh_tokens`, and the seeded role catalog (`owner`/`admin`/`member`/`viewer`).
 - **Authentication is fully working**, not planned: Argon2id hashing and JWT (HS256) behind the `PasswordHasher`/`TokenService` ports, `AuthService` with register/login/refresh/logout, refresh-token rotation with strict reuse detection and family revocation, and `POST /api/v1/auth/{register,login,refresh,logout}` plus `GET /api/v1/auth/me`.
 - **[Implemented]** the first repositories (`user`, `organization`, `role`, `refresh_token`) and the first service (`auth_service`). `/health/ready` performs a real MySQL probe.
-- Still **[Planned]** per [docs/roadmap.md](docs/roadmap.md): agents, workflows, execution engine, queue/worker, LangChain, ChromaDB, tools.
+- **[Redesigned 2026-07-29]** Orqent is a **visual workflow automation platform**, not a chain-of-agents runtime. The core domain is durable orchestration of a typed node graph; **AI is one built-in node type with no special treatment in the engine, schema, or API**. Still **[Planned]**: workflow authoring, execution engine, control flow, queue/worker, triggers, human-in-the-loop, connections, AI agent node, memory. The roadmap in [docs/roadmap.md](docs/roadmap.md) predates the redesign — ADR-018 … ADR-030 and §11 of [project_status.md](project_status.md) are authoritative.
 - Remaining placeholder packages (`domain/engine`, `infrastructure/{llm,vector,queue,worker,tools}`) contain only docstrings describing future intent — **do not treat them as implemented.**
 
 Always distinguish **[Implemented] / [Planned] / [Future]** (defined in [docs/glossary.md](docs/glossary.md)). Do not describe planned features as if they exist.
@@ -43,8 +43,8 @@ Details: [docs/architecture.md](docs/architecture.md). Decisions: [docs/decision
 ## Project goals
 
 1. Ship a production-quality, self-documenting backend phase by phase, each phase leaving a working, tested system.
-2. Keep the execution engine framework-free and LangChain replaceable.
-3. Keep the schema DAG-ready while shipping linear workflows in V1.
+2. Keep the execution engine framework-free, node-agnostic, and durable — a run must be able to suspend for weeks and resume (`ADR-014`, `ADR-019`).
+3. Make the node abstraction uniform enough that adding a node type touches no engine, schema, or API code (`ADR-020`).
 4. Maintain strict typing, SRP, and the dependency rule throughout.
 
 ---
@@ -52,11 +52,12 @@ Details: [docs/architecture.md](docs/architecture.md). Decisions: [docs/decision
 ## Important design rules (do not violate)
 
 1. **Dependency rule** — dependencies point inward. `app.domain` imports no FastAPI, SQLAlchemy, LangChain, driver, or other layers. Only `app.infrastructure` imports vendors/drivers. Only `app.container` wires concretions. ([docs/architecture.md](docs/architecture.md#5-dependency-rule))
-2. **LangChain isolation** — only `app.infrastructure.llm` may import `langchain`, behind the `AgentRunner` port. Never leak LangChain types across the boundary. (`ADR-013`, [docs/langchain.md](docs/langchain.md))
-3. **Engine is framework-free** — the execution engine depends only on ports. (`ADR-014`)
+2. **LangChain isolation** — only the AI agent node's runner may import `langchain`, behind the `AgentRunner` port. Never leak LangChain types across the boundary. (`ADR-013`, [docs/langchain.md](docs/langchain.md))
+3. **Engine is framework-free *and* node-agnostic** — it depends on `NodeRunner`, `TaskQueue`, `Clock`, `BlobStore`, `UnitOfWork`, and knows no node type. Control-flow nodes are the one deliberate exception. (`ADR-014`, `ADR-020`)
 4. **Multi-tenancy is a column** — `organization_id` on every owned table, scoped in every query. (`ADR-016`)
 5. **Public IDs only** — expose `public_id` (ULID), never the internal BIGINT `id`. (`ADR-004`)
-6. **Immutable versions** — `agent_versions`/`workflow_versions` are never mutated; create new versions. Executions pin the version used.
+6. **Immutable published versions** — a published `workflow_version` is never mutated; edits go to the single draft and publishing freezes it. Runs pin the exact version they executed. (`ADR-026`)
+6b. **Suspension is first-class** — a node runner may return `Suspended`; the engine must persist and resume. Never assume a run completes within one worker invocation. (`ADR-019`)
 7. **Async everywhere** on the request/execution path; sessions use `expire_on_commit=False`.
 8. **Errors** — raise domain exceptions; never `HTTPException` in business code; the API layer maps to the one `ErrorResponse` envelope. ([docs/coding-standards.md](docs/coding-standards.md#error-handling-philosophy))
 
@@ -111,7 +112,7 @@ All must pass. CI (`.github/workflows/ci.yml`) runs the same gates.
 
 ## Things Claude must NEVER change without asking
 
-- Any **ADR** in [docs/decisions.md](docs/decisions.md) (async, MySQL, ChromaDB-as-derived-index, ULID/`CHAR(26)`, generated-column email uniqueness, naming convention, linear-V1, anemic ORM, Unit of Work, JWT+refresh, single-org email, incremental migrations, LangChain isolation, framework-free engine, queue-first, tenancy-as-column, app-managed timestamps).
+- Any **ADR** in [docs/decisions.md](docs/decisions.md) — ADR-001 … ADR-030. Includes the workflow-platform set added 2026-07-29: scoped-DAG graph with container loops (018), durable resumable execution with first-class suspension (019), uniform node contract with engine-native control flow (020), closed type lattice (021), code-only node registry with no untrusted execution (022), normalized graph storage (023), at-least-once with declared side effects (024), payload externalization (025), draft/published lifecycle (026), encrypted per-org connections (027), join policies and branch pruning (028), egress/SSRF policy (029), quotas and queue fairness (030). **ADR-007 (linear V1) is superseded.**
 - The **dependency rule** and **layer boundaries**.
 - The **LangChain isolation boundary** (`ADR-013`).
 - The **metadata naming convention** (`ADR-006`) once migrations exist — a change needs a rename migration.

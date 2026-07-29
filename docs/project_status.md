@@ -7,7 +7,7 @@ Current Phase:  Phase 3 — Authentication & tenancy ✅ complete (3A + 3B)
 Last Updated:   2026-07-27
 Status:         Healthy — authentication fully working end to end, 292 tests passing,
                 all quality gates green, migrations 0001–0003 applied
-Next Milestone: Phase 4 (Core CRUD — agents, versions, providers, prompt templates)
+Next Milestone: Phase 4 (Workflow authoring + node contract) — see the v2 redesign
 ```
 
 This is the project's **living status document** — the single source of truth for
@@ -196,8 +196,16 @@ topological DAG scheduling is Future.
 
 ## 4. Approved Design Decisions
 
-The authoritative log is `docs/decisions.md` (ADR-001 … ADR-017). Summary with
-rationale — **none of these may be changed without explicit approval**:
+The authoritative log is `docs/decisions.md` (ADR-001 … ADR-030). Summary with
+rationale — **none of these may be changed without explicit approval**.
+
+> **2026-07-29 — workflow platform redesign.** Orqent became a visual workflow
+> automation platform rather than a chain-of-agents runtime. ADR-007 is
+> **superseded**; ADR-003/013/014/015 were rescoped; **ADR-018 … ADR-030** were
+> added. AI is now a *supporting* subdomain — one node type among many — and the
+> core domain is durable orchestration of a typed graph. Sections 6 and 10–11
+> below still describe the pre-redesign plan for Phases 4+ and are corrected as
+> each phase lands.
 
 | ADR | Decision | Why |
 |-----|----------|-----|
@@ -207,17 +215,30 @@ rationale — **none of these may be changed without explicit approval**:
 | 004 | **ULID public IDs, `CHAR(26)`; BIGINT internal PKs never exposed** | Sequential ids leak row counts / enable enumeration; ULIDs are time-sortable (index-friendly, unlike UUIDv4) and `CHAR(26)` is debuggable in a SQL console. |
 | 005 | **Soft delete + generated `email_active` column for uniqueness** | MySQL has no partial indexes. `email_active = IF(deleted_at IS NULL, email, NULL)` with a unique index enforces uniqueness among live users while allowing re-registration after soft delete. Requires MySQL 8.0.13+. |
 | 006 | **Metadata naming convention fixed before the first migration** | Alembic derives operations from constraint names; auto-generated names diverge across environments and break migrations. Never change without a rename migration. |
-| 007 | **Linear workflows in V1, DAG-ready schema; `workflow_edges` retained** | V1 scope is linear, but keeping the node/edge model means branching later is *dropping two unique constraints* (≤1 outgoing, ≤1 incoming per node), not a schema rewrite. |
+| ~~007~~ | ~~**Linear workflows in V1**~~ — **SUPERSEDED by 018** | Branching, loops, and parallelism became core product features; DB-enforced linearity would block the primary use case, and branching changes the engine rather than only the schema. |
 | 008 | **ORM models as anemic data carriers** | A full domain-entity + mapping layer is over-engineering at this scale; business rules live in services and the engine. |
 | 009 | **Explicit Unit of Work as the transaction boundary** | Visible, testable transactions; multi-repository writes commit atomically; plain session dependency reserved for reads. |
 | 010 | **JWT access + rotating refresh tokens (hashed, server-side), Argon2id** | Pure stateless JWT cannot be revoked; the hybrid keeps stateless access checks and revocable sessions. Reuse of a revoked refresh token revokes the family. |
 | 011 | **Global-unique email; one organization per user in V1** | Per-tenant email makes login-by-email ambiguous. Multi-org membership is Future via a join table. |
 | 012 | **Incremental migrations — one table set per phase** | Creating all tables upfront designs against imagined requirements; each migration ties to a real feature. Circular/deferred FKs handled via `ALTER` back-fills. |
-| 013 | **LangChain isolated behind the `AgentRunner` port** | Keeps business logic LangChain-independent and replaceable; LangChain never owns our persistence or history. |
-| 014 | **Framework-free execution engine** | The engine is the product; port-only dependencies make it fully testable and portable. |
-| 015 | **`TaskQueue` port from day one; DB-backed in-process queue in V1** | FastAPI `BackgroundTasks` has no persistence/retry/visibility. A port makes Celery a later adapter swap. |
+| 013 | **LangChain isolated behind the `AgentRunner` port** *(rescoped)* | Now confined to the runner of a single node type, not "the execution layer" — a strictly stronger boundary. |
+| 014 | **Framework-free execution engine** *(strengthened)* | The engine is the product. It now also knows **no node type**: it depends on `NodeRunner` and resolves runners through a registry. |
+| 015 | **`TaskQueue` port from day one; DB-backed in-process queue in V1** *(extended)* | Dispatch unit is the node execution, not the run. While the queue shares MySQL, enqueue and state change are one transaction; any external broker requires a transactional outbox. |
 | 016 | **Multi-tenancy is a column from day one** (`organization_id` everywhere) | Retrofitting tenancy is among the most expensive refactors; adding it now is nearly free. |
 | 017 | **Application-managed timestamps** (Python `default`/`onupdate`) | Portable, deterministic under test, single source of "now". Limitation: `onupdate` fires only on ORM updates. |
+| 018 | **Workflow graph is a scoped DAG; loops are containers** | Acyclicity keeps readiness, reachability, and termination decidable and validation errors pointable-at. Back-edges would destroy static analysis. |
+| 019 | **Durable resumable execution; suspension is a first-class result** | Human approval may pause a run for weeks. Retrofitting suspension would rewrite the engine and every node. |
+| 020 | **Uniform node contract; control flow is engine-native** | The engine must run an LLM call, an HTTP request, and a human decision through one contract. AI gets no privileges. |
+| 021 | **Typed data flow over a small closed type lattice** | A visual builder needs instant, explainable "you can't connect these". Arbitrary JSON Schema subsumption is unexplainable. |
+| 022 | **Node registry is code; built-in catalog only** | Declining untrusted code execution removes an entire threat class, and is reversible later. |
+| 023 | **Normalized graph storage with per-node JSON config** | Node executions need a real FK; impact analysis is a feature. Config is genuinely polymorphic. |
+| 024 | **At-least-once execution with declared side-effect classes** | Exactly-once across external systems is unachievable; stating it plainly lets nodes deduplicate deliberately. |
+| 025 | **Payload externalization above a size threshold** | Blobs in MySQL wreck backup, replication, and query performance. |
+| 026 | **Draft/published version lifecycle** | A builder saves constantly, but a run whose definition can change underneath it is unauditable. |
+| 027 | **Connections/secrets: encrypted, per-org, reference-only** | Credentials in node config would be copied into every version, export, payload, and event — irrevocably. |
+| 028 | **Handle join policies and branch pruning** | Two inbound edges are genuinely ambiguous; unpruned dead branches make a `join: all` hang forever. |
+| 029 | **Egress policy for user-authored network nodes** | A user-configured HTTP node is a request forger by design; cloud metadata endpoints make it a credential leak. |
+| 030 | **Per-org quotas and queue fairness** | One tenant's ten-thousand-item loop otherwise starves every other tenant. |
 
 Also approved (recorded across docs): **`provider_configs.api_key` is nullable**
 (mock providers in Phases 5–8 need no key; real keys arrive with real
@@ -690,7 +711,16 @@ execution engine (Phase 8) is tested against a **mock `AgentRunner`**.
 
 ---
 
-## 11. Current Milestone: Phase 4 (Core CRUD)
+## 11. Current Milestone: Phase 4 (Workflow authoring + node contract)
+
+> **Redesigned 2026-07-29.** Orqent is now a visual workflow automation
+> platform. Phase 4 is no longer agents/providers/prompts CRUD — that work moves
+> to Phase 11. Phase 4 builds the **node contract, node registry, workflow /
+> version / node / edge model, draft-publish lifecycle, and graph validation**,
+> with no execution. ADR-018 … ADR-030 record the design; the roadmap table in
+> §10 below still lists the superseded phases and is corrected as each lands.
+
+### Superseded plan (retained for context)
 
 **Phase 3 is complete** (see §6). Authentication works end to end: a user can
 register, log in, call a protected endpoint, rotate their tokens, and log out.
