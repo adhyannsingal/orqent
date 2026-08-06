@@ -178,6 +178,16 @@ subdomain: nothing below grants it special treatment.
 **Why:** In a shared deployment one organization's ten-thousand-item loop will otherwise consume every worker and starve everyone else — a self-inflicted denial of service that no amount of correctness elsewhere prevents.
 **Consequences:** graph-shape limits are checked at publish, so the failure is an authoring error rather than a runtime outage; `queue_tasks` carries `organization_id` for weighted selection; retention drives a purge job over runs, events, and blobs.
 
+## ADR-031 — Pydantic is permitted in the domain, for node contracts **[Implemented]**
+**Decision:** `app.domain` may import `pydantic`, scoped to the node contract: a node type's configuration model, and the `HandleType` reference to a `BaseModel` subclass for `Record`. No other domain module gains the dependency, and the existing exclusions (FastAPI, SQLAlchemy, LangChain, drivers) are unchanged.
+**Why:** Until now `app.domain` has been stdlib-only, so this is a deliberate first exception rather than a drift. Node types must declare a configuration shape that is validated at authoring time *and* published as JSON Schema for the visual builder; Pydantic does both, is already the project's canonical data-shape library, and is a pure in-process library with no I/O, no network, and no vendor coupling. The alternative — hand-rolling schema description, validation, and JSON Schema emission — is strictly worse code for the same result.
+**Consequences:** the dependency rule is now "no frameworks, no I/O, no swappable vendors" rather than "no third-party imports at all"; the import-purity test asserts the narrower rule by name, so a future SQLAlchemy or FastAPI import in the domain still fails. Node config models live with their node in `app.infrastructure.nodes`; only the *type reference* is in the domain.
+
+## ADR-032 — Resource-dependent authorization lives in the service layer **[Planned]**
+**Decision:** Authorization answerable from the token alone stays at the API edge via `require_roles`. Authorization that depends on the resource — "the workflow's creator may publish it" — is enforced inside the service, which raises `AuthorizationError`.
+**Why:** `require_roles` reads `AuthenticatedUser.roles` and never touches storage, which is exactly why it cannot express a creator check: that needs the row loaded. Putting `require_roles("owner", "admin")` on the publish route would be actively wrong — it would lock out the creator, the opposite of the intent. Deciding this once is cheaper than rediscovering it for every resource in Phase 5 (who may cancel a run, who may decide a human task).
+**Consequences:** service methods that enforce such a rule take the `AuthenticatedUser` as a parameter; repositories that feed them eager-load what the rule reads (`WorkflowRepository.get_by_public_id` loads the creator, so the comparison costs no extra query); the rule is unit-tested as a permission matrix, so a route-level shortcut that bypasses the service fails those tests. Repositories remain free of authorization.
+
 ---
 
 ## Cross-references
