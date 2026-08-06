@@ -14,11 +14,13 @@ from __future__ import annotations
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from app.core.config import Settings, get_settings
+from app.domain.nodes.registry import NodeRegistry
 from app.domain.ports.password_hasher import PasswordHasher
 from app.domain.ports.token_service import TokenService
 from app.infrastructure.db.engine import create_engine
 from app.infrastructure.db.session import create_session_factory
 from app.infrastructure.db.unit_of_work import SqlAlchemyUnitOfWork
+from app.infrastructure.nodes import build_registry
 from app.infrastructure.security.password_hasher import Argon2PasswordHasher
 from app.infrastructure.security.token_service import JwtTokenService
 from app.services.auth_service import AuthService
@@ -34,6 +36,7 @@ class Container:
         self._password_hasher: PasswordHasher | None = None
         self._token_service: TokenService | None = None
         self._auth_service: AuthService | None = None
+        self._node_registry: NodeRegistry | None = None
 
     @property
     def settings(self) -> Settings:
@@ -87,6 +90,20 @@ class Container:
         """Create a fresh unit of work bound to the session factory."""
 
         return SqlAlchemyUnitOfWork(self.session_factory)
+
+    @property
+    def node_registry(self) -> NodeRegistry:
+        """The catalogue of available node types.
+
+        Shared and built once: assembling it is pure and the result is read-only,
+        so there is nothing to isolate per request. Lazy for consistency with the
+        properties around it, though unlike them it needs neither a database nor
+        a signing key and could safely be built eagerly.
+        """
+
+        if self._node_registry is None:
+            self._node_registry = build_registry()
+        return self._node_registry
 
     @property
     def auth_service(self) -> AuthService:
