@@ -123,6 +123,7 @@ class WorkflowGraph:
 
         outgoing: dict[str, list[GraphEdge]] = {key: [] for key in by_key}
         incoming: dict[str, list[GraphEdge]] = {key: [] for key in by_key}
+        seen_edges: set[GraphEdge] = set()
         for edge in edges:
             # A dangling edge is not a workflow the user can fix by editing —
             # it is a payload that never described a graph.
@@ -130,6 +131,17 @@ class WorkflowGraph:
                 raise ValueError(f"Edge references unknown source node: {edge.source_key!r}")
             if edge.target_key not in by_key:
                 raise ValueError(f"Edge references unknown target node: {edge.target_key!r}")
+
+            # The same connection twice carries no information, and is not
+            # inert: handle validation counts inbound edges to check arity, and
+            # the engine counts them to decide readiness. A duplicate produces a
+            # spurious arity error on a correctly drawn graph, and makes a
+            # `join: all` handle wait forever for a second arrival that can
+            # never come. Parallel edges on *different* handles remain legal.
+            if edge in seen_edges:
+                raise ValueError(f"Duplicate edge: {edge}")
+            seen_edges.add(edge)
+
             outgoing[edge.source_key].append(edge)
             incoming[edge.target_key].append(edge)
 

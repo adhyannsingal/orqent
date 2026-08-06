@@ -189,6 +189,18 @@ def test_a_self_loop_is_structurally_valid() -> None:
     assert graph.outgoing("a") == (_edge("a", "a"),)
 
 
+def test_the_same_connection_drawn_twice_is_rejected() -> None:
+    # Not merely redundant: handle validation counts inbound edges to check
+    # arity and the engine counts them to decide readiness, so a duplicate
+    # would produce a spurious arity error and hang a `join: all` handle
+    # waiting for an arrival that can never come.
+    with pytest.raises(ValueError, match="Duplicate edge"):
+        WorkflowGraph(
+            nodes=[_node("a"), _node("b")],
+            edges=[_edge("a", "b"), _edge("a", "b")],
+        )
+
+
 def test_parallel_edges_between_two_nodes_are_allowed() -> None:
     # Different handles, so a legitimate shape once nodes have several sockets.
     graph = WorkflowGraph(

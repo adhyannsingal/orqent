@@ -786,11 +786,28 @@ logic in Phase 4 exhaustively testable with fixtures.
 
 ### 6.2 Structural integrity vs validation
 
-A distinction worth keeping sharp: **duplicate node keys and edges pointing at
-nonexistent nodes are constructor preconditions of `WorkflowGraph`, not
-validation issues.** They are impossible states, not invalid ones — the
-repository and the API layer both reject them before a graph object exists. This
-keeps the validators from defensively re-checking structure everywhere.
+A distinction worth keeping sharp: **duplicate node keys, edges pointing at
+nonexistent nodes, and duplicate edges are constructor preconditions of
+`WorkflowGraph`, not validation issues.** They are impossible states, not
+invalid ones — the repository and the API layer both reject them before a graph
+object exists. This keeps the validators from defensively re-checking structure
+everywhere.
+
+**Duplicate edges** (identical source key, source handle, target key, and target
+handle) were added to this list on 2026-08-06. Two arguments settled it. First,
+a duplicate is not inert: M6 counts inbound edges per handle to check arity, and
+the Phase 5 engine counts them to decide readiness, so a duplicate produces a
+spurious `ARITY_VIOLATION` on a correctly drawn graph and makes a `join: all`
+handle wait forever for a second arrival that can never come. Second, two
+identical edges render exactly on top of each other, so a validation issue would
+ask an end user to remove one of two connections they can only see as one — the
+party who can act is the client developer whose payload was malformed, and that
+is a 422. Note this does *not* affect parallel edges on **different** handles,
+which remain legal.
+
+Enforcement follows the pattern §8 already describes for `node_key`: the request
+schema, the constructor precondition, and the database's unique constraint on
+the quadruple.
 
 ### 6.3 Type compatibility (Phase 4)
 
@@ -1014,8 +1031,9 @@ Filtering: `?q=` case-insensitive name contains. Nothing else in Phase 4.
 ### `node_key` validation (§1.6k)
 
 Keys are supplied by the frontend and never rewritten by the server. The API
-rejects, with 422, any key failing `^[a-z][a-z0-9_]{0,63}$`, and any payload
-containing a duplicate key. Uniqueness is enforced three times over — by the
+rejects, with 422, any key failing `^[a-z][a-z0-9_]{0,63}$`, any payload
+containing a duplicate key, and any payload containing a **duplicate edge** —
+the same source handle connected to the same target handle twice (§6.2). Uniqueness is enforced three times over — by the
 request schema, by `WorkflowGraph`'s constructor precondition (§6.2), and by the
 database's unique constraint — because a silently de-duplicated key would
 corrupt the edge list that references it.
