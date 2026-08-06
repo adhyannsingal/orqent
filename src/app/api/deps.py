@@ -19,6 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.container import Container
 from app.core.config import Settings
+from app.domain.nodes.registry import NodeRegistry
 from app.services.auth_service import AuthService
 
 
@@ -39,6 +40,19 @@ def get_settings_dep(container: ContainerDep) -> Settings:
 
 
 SettingsDep = Annotated[Settings, Depends(get_settings_dep)]
+
+
+def get_node_registry(container: ContainerDep) -> NodeRegistry:
+    """Expose the node catalogue to routes.
+
+    Typed as the port: a route has no business knowing the catalogue is an
+    in-memory dictionary assembled from code.
+    """
+
+    return container.node_registry
+
+
+NodeRegistryDep = Annotated[NodeRegistry, Depends(get_node_registry)]
 
 
 def get_auth_service(container: ContainerDep) -> AuthService:
