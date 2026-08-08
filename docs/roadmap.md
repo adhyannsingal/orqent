@@ -1,18 +1,30 @@
 # Roadmap
 
-> ## ⚠️ Superseded for Phases 4+ (2026-07-29)
+> ## ⚠️ Superseded for Phases 4+ (2026-07-29) — retained for history only
 >
 > Orqent was redesigned from a chain-of-agents runtime into a **visual workflow
-> automation platform**. The phase table below still describes the agent-centric
-> plan and is **out of date from Phase 4 onward**.
+> automation platform**. **Everything below from Phase 4 onward describes a plan
+> that is no longer being executed** — the phase table, the mermaid diagram, the
+> technical-debt list, and the limitations. Do not read status from this file.
 >
-> Authoritative now: **ADR-018 … ADR-030** in [decisions.md](decisions.md) and
-> §11 of [project_status.md](project_status.md).
+> Authoritative now: **ADR-018 … ADR-032** in [decisions.md](decisions.md) and
+> **§§10–11 of [project_status.md](project_status.md)**.
 >
-> In short: Phase 4 = workflow authoring + node contract · 5 = durable execution
-> core · 6 = control flow · 7 = queue/workers · 8 = triggers · 9 = human-in-the-loop
-> · 10 = connections + I/O nodes · 11 = AI agent node · 12 = memory/RAG ·
-> 13 = observability. Phases 1–3 below remain accurate.
+> **Actual status (2026-08-08):**
+> Phase 1 ✅ · Phase 2 ✅ · Phase 3 ✅ · **Phase 4 ✅ complete (M1–M11:
+> workflow authoring, node contract, graph validation, persistence,
+> repositories, lifecycle service; migration `0004`)** · **Phase 5 — NOT
+> STARTED**.
+>
+> Phase 4 milestone **M12** (the workflow HTTP API) is specified in
+> [phase-4-implementation-spec.md](phase-4-implementation-spec.md) but **not
+> implemented**. There is no execution engine, no queue, no worker, no
+> scheduling, no LangChain, and no provider credentials anywhere in the
+> repository.
+>
+> Revised phase numbering: 5 = durable execution core · 6 = control flow ·
+> 7 = queue/workers · 8 = triggers · 9 = human-in-the-loop · 10 = connections +
+> I/O nodes · 11 = AI agent node · 12 = memory/RAG · 13 = observability.
 
 Phase-by-phase plan with current status. Each phase ends with a working, tested backend. Table creation per phase is in [database.md](database.md#3-planned-schema-by-phase); decisions in [decisions.md](decisions.md).
 
@@ -23,7 +35,7 @@ Phase-by-phase plan with current status. Each phase ends with a working, tested 
 ```mermaid
 flowchart LR
     P1["Phase 1<br/>Foundation ✅"] --> P2["Phase 2<br/>DB Infra ✅"]
-    P2 --> P3["Phase 3<br/>Auth ⬜"]
+    P2 --> P3["Phase 3<br/>Auth ✅"]
     P3 --> P4["Phase 4<br/>Agents+Providers+Prompts ⬜"]
     P4 --> P5["Phase 5<br/>Provider abstraction + mock ⬜"]
     P5 --> P6["Phase 6<br/>Workflows (linear) ⬜"]

@@ -1,13 +1,14 @@
 # Orqent — Project Status
 
 ```
-Project:        Orqent — Multi-Agent Orchestration Platform (backend)
+Project:        Orqent — Visual Workflow Automation Platform (backend)
 Version:        0.1.0
-Current Phase:  Phase 3 — Authentication & tenancy ✅ complete (3A + 3B)
-Last Updated:   2026-07-27
-Status:         Healthy — authentication fully working end to end, 292 tests passing,
-                all quality gates green, migrations 0001–0003 applied
-Next Milestone: Phase 4 (Workflow authoring + node contract) — see the v2 redesign
+Current Phase:  Phase 4 — Workflow authoring, node contract & graph validation ✅ complete (M1–M11)
+Last Updated:   2026-08-08
+Status:         Healthy — workflow authoring complete through the service layer, 848 tests
+                passing, all quality gates green, migrations 0001–0004 applied.
+                No HTTP API for workflows yet, and no execution of any kind.
+Next Milestone: Phase 5 (Durable execution core) — NOT STARTED
 ```
 
 This is the project's **living status document** — the single source of truth for
@@ -41,12 +42,18 @@ execution engine would not change.
 
 ### Current scope (V1)
 
-- Linear workflows only (A→B→C→D), on a schema that is already DAG-ready.
+> **Revised 2026-07-29** by the workflow-platform redesign; ADR-018 withdrew the
+> linear-workflow restriction that used to head this list (ADR-007, superseded).
+
+- Workflows are an **acyclic typed node graph**, authored and validated before
+  anything runs. Loops arrive as container scopes in Phase 6, never as back-edges.
 - One organization per user; email globally unique.
-- Async execution via a durable DB-backed in-process queue (no Celery yet).
-- Mock LLM providers first; real providers and LangChain arrive in later phases.
+- Async execution via a durable DB-backed queue — **designed, not built** (Phases
+  5 and 7).
+- AI is one built-in node type among many; real providers and LangChain arrive in
+  Phase 11.
 - MySQL as the system of record; ChromaDB strictly as a derived, rebuildable
-  vector index.
+  vector index (Phase 12, currently unused).
 
 ### Long-term roadmap (post-V1, direction agreed, not designed in detail)
 
@@ -101,10 +108,10 @@ behind **ports & adapters** (hexagonal architecture).
 | Layer | Package | Responsibility | Status |
 |-------|---------|----------------|--------|
 | API / Edge | `app.api` | HTTP↔app translation, routing, error mapping, correlation | Implemented |
-| Application / Services | `app.services` | One method per use case; owns the transaction; enforces ownership | Implemented (`AuthService`; more in Phase 4+) |
-| Domain | `app.domain` | Entities, value objects, **ports**, execution engine core — pure Python | Partly implemented (errors, 3 ports, 3 value objects) |
-| Infrastructure | `app.infrastructure` | Adapters: DB, repositories, LLM runner, vector store, queue, worker, security | Partly implemented (DB, repositories, security) |
-| Data | MySQL, ChromaDB | Relational source of truth; derived vector index | Partly implemented (MySQL, migrations 0001–0003) |
+| Application / Services | `app.services` | One method per use case; owns the transaction; enforces ownership | Implemented (`AuthService`, `WorkflowService`) |
+| Domain | `app.domain` | Value objects, **ports**, node contract, workflow graph + validation — pure Python | Partly implemented (errors, ports, value objects, `nodes/`, `graph/`; `engine/` is a stub) |
+| Infrastructure | `app.infrastructure` | Adapters: DB, repositories, node registry, security (LLM runner, vector store, queue, worker are stubs) | Partly implemented (DB, repositories, node registry, security) |
+| Data | MySQL, ChromaDB | Relational source of truth; derived vector index | Partly implemented (MySQL, migrations 0001–0004; Chroma unused) |
 | Cross-cutting | `app.core` | Config, logging, correlation, constants | Implemented |
 | Composition root | `app.container` | Wires abstractions to concretions | Implemented |
 
@@ -136,10 +143,11 @@ single-concern module. Anything that needs "and" to describe must be split.
 | `UnitOfWork` | Transaction boundary | `SqlAlchemyUnitOfWork` | **Implemented** |
 | `PasswordHasher` | Hash/verify passwords | `Argon2PasswordHasher` | **Implemented** |
 | `TokenService` | Issue/verify tokens | `JwtTokenService` (HS256) | **Implemented** |
-| `LLMProvider` | Raw model call, normalized | Mock → real providers | Planned (Phase 5) |
-| `AgentRunner` | Execute one agent step | Mock runner, `LangChainAgentRunner` | Planned (Phases 5, 9) |
+| `NodeRegistry` | Resolve `(type, version)` → descriptor / runner | `InMemoryNodeRegistry` | **Implemented** (Phase 4) |
+| `NodeRunner` | Execute one node | four built-in runners | **Implemented** (Phase 4; nothing calls them yet) |
+| `AgentRunner` | Execute one AI agent step | `LangChainAgentRunner` | Planned (Phase 11) |
 | `TaskQueue` | Durable async hand-off | DB-backed in-process → Celery | Planned (Phase 7) |
-| `VectorStore` | Vector upsert/query | Chroma adapter | Planned (Phase 10) |
+| `VectorStore` | Vector upsert/query | Chroma adapter | Planned (Phase 12) |
 
 ### Unit of Work & Repository pattern
 
@@ -260,7 +268,8 @@ orqent/
 ├── migrations/
 │   ├── env.py              # Async Alembic env; URL from Settings; models imported for autogenerate
 │   ├── script.py.mako
-│   └── versions/           # EMPTY — no migrations generated yet (Phase 2B)
+│   └── versions/           # 0001 foundation · 0002 refresh_tokens · 0003 seed_roles
+│                           # · 0004 workflows (all applied)
 ├── src/app/
 │   ├── main.py             # Application factory (create_app) + module-level app
 │   ├── container.py        # DI composition root (lazy engine/session factory, UoW factory)
@@ -269,30 +278,40 @@ orqent/
 │   ├── api/                # deps (Annotated aliases), middleware (correlation),
 │   │   │                   # errors (domain→ErrorResponse envelope),
 │   │   │                   # security (bearer scheme, get_current_user, require_roles)
-│   │   └── v1/             # api_v1_router; routes/{health,auth}.py
-│   ├── schemas/            # Pydantic request/response models (health, common, auth)
+│   │   └── v1/             # api_v1_router; routes/{health,auth,node_types}.py
+│   │                       # — NO workflow routes yet (Phase 4 M12, not started)
+│   ├── schemas/            # Pydantic request/response models (health, common, auth,
+│   │                       # node_types) — NO workflow schemas yet
 │   ├── domain/             # PURE: errors.py (exception hierarchy),
 │   │   │                   # ports/{unit_of_work,password_hasher,token_service},
-│   │   │                   # value_objects/{token,authenticated_user,token_pair};
-│   │   │                   # entities/, engine/ are docstring-only stubs
-│   ├── services/           # auth_service (register, login, refresh, logout)
+│   │   │                   # value_objects/{token,authenticated_user,token_pair},
+│   │   ├── nodes/          # node contract: handles (type lattice), descriptor,
+│   │   │                   # result (Completed/Suspended/Failed), runner, registry port
+│   │   ├── graph/          # model (GraphNode/GraphEdge/WorkflowGraph), issues,
+│   │   │                   # validation/{structure,handles,config,__init__}
+│   │   └── engine/         # docstring-only stub (Phase 5)
+│   ├── services/           # auth_service; workflow_service (lifecycle, publish)
 │   └── infrastructure/
 │       ├── db/             # base, naming, identifiers (ULID), engine, session,
 │       │   │               # mixins, unit_of_work
-│       │   └── models/     # organization, user, role, user_role, refresh_token
+│       │   └── models/     # organization, user, role, user_role, refresh_token,
+│       │                   # workflow, workflow_version, workflow_node, workflow_edge
 │       ├── security/       # password_hasher (Argon2id), token_service (JWT/HS256),
 │       │                   # token_hashing (SHA-256 at rest)
 │       │                   # — the ONLY permitted argon2 / jwt import site
-│       ├── repositories/   # user, organization, role, refresh_token
-│       ├── llm/            # stub   (Phases 5, 9 — the ONLY future LangChain import site)
-│       ├── vector/         # stub   (Phase 10)
+│       ├── nodes/          # InMemoryNodeRegistry + builtin/{trigger_manual,
+│       │                   # core_constant, core_noop, core_log}
+│       ├── repositories/   # user, organization, role, refresh_token,
+│       │                   # workflow, workflow_version
+│       ├── llm/            # stub   (Phase 11 — the ONLY future LangChain import site)
+│       ├── vector/         # stub   (Phase 12)
 │       ├── queue/          # stub   (Phase 7)
 │       ├── worker/         # stub   (Phase 7)
-│       └── tools/          # stub   (Phase 11)
+│       └── tools/          # stub   (future)
 └── tests/
     ├── conftest.py         # settings/app/client fixtures
-    ├── unit/               # 244 tests, no external services (see §9)
-    └── integration/        # 48 tests, opt-in: pytest -m integration (real MySQL)
+    ├── unit/               # 723 tests, no external services (see §9)
+    └── integration/        # 125 tests, opt-in: pytest -m integration (real MySQL)
 ```
 
 **Important:** the stub packages contain only docstrings describing future
@@ -539,6 +558,61 @@ vice versa; a ≥32-byte signing key enforced at construction.
 **Tests: 71 → 292.** 244 unit (no external services) and 48 opt-in MySQL
 integration, including four real-concurrency tests.
 
+### Phase 4 — Workflow authoring, node contract & graph validation ✅ (2026-08-08)
+
+Eleven milestones, each reviewed and committed separately. **No execution and no
+HTTP API for workflows** — both are deliberately out of scope (see §11).
+
+| Milestone | Delivered |
+|---|---|
+| **M1** | Pure node contract — closed type lattice (`Any`/`Text`/`Number`/`Boolean`/`Json`/`Record<T>`/`Binary`/`List<T>`), `InputHandle`/`OutputHandle` with `arity` and `join`, `NodeDescriptor`, `NodeResult` (`Completed`/`Suspended`/`Failed`), `NodeRunner`, `NodeRegistry` port |
+| **M2** | `InMemoryNodeRegistry` + four built-in node types (`trigger.manual@1`, `core.constant@1`, `core.noop@1`, `core.log@1`); container wiring; conformance suite over `registry.all()` |
+| **M3** | `GET /api/v1/node-types` — the catalog contract the future builder renders from |
+| **M4** | Graph domain — `GraphNode`, `GraphEdge`, `WorkflowGraph` with precomputed adjacency; duplicate keys, dangling edges and duplicate edges are **constructor preconditions**, not validation issues |
+| **M5** | Structural validation — iterative three-colour cycle detection reporting the full path, trigger rules (exactly one, no inbound edges), reachability (warning) |
+| **M6** | Handle and type validation — handle existence, the §6.3 compatibility lattice (nominal `Record`, recursive `List`, `Any`/`Json` widening), input arity, required inputs |
+| **M7** | Configuration validation — each node's config against its type's Pydantic model, with full nested `nodes.<key>.config.<path>` error paths |
+| **M8** | Validation pipeline — `validate_graph(graph, registry) → ValidationReport`; single-pass node-type resolution, `UNKNOWN_NODE_TYPE`/`DEPRECATED_NODE_TYPE`, cascade suppression, deterministic `(severity, node_key, code)` ordering |
+| **M9** | Persistence — `workflows`, `workflow_versions`, `workflow_nodes`, `workflow_edges` + migration `0004`; two generated columns move rules into the database |
+| **M10** | `WorkflowRepository` and `WorkflowVersionRepository` on the unit of work; tenant-scoped reads, `load_graph`, delete-then-insert `replace_graph`, SQL-side `bump_revision` |
+| **M11** | `WorkflowService` — eleven use cases, copy-on-write drafts, optimistic revision locking, publish with validation and resource-dependent authorization |
+
+**Capabilities now available:**
+
+- **Pure workflow graph domain** — `domain/graph` and `domain/nodes` import no
+  SQLAlchemy, FastAPI, driver, or infrastructure module; validation is testable
+  from fixtures alone.
+- **Node registry and descriptors** — the catalog is code (ADR-022), append-only,
+  with no `node_types` table and no FK from `workflow_nodes.node_type`.
+- **Graph validation** — structure, handles/types, and configuration, each a pure
+  function of `(graph, descriptors)`.
+- **Unknown and deprecated node handling** — an unresolved type yields exactly one
+  `UNKNOWN_NODE_TYPE`; a deprecated type still resolves, still validates
+  downstream, and warns without blocking publish.
+- **Cascade suppression** — an unresolved node produces no config, handle, arity,
+  required-input, or type issues, while genuine graph facts (cycles) are still
+  reported through it and its neighbours are validated in full.
+- **Deterministic validation reports** — `ValidationReport.is_valid` distinguishes
+  errors from warnings; issue order is stable for identical input.
+- **Workflow / version / node / edge persistence** — normalized tables with
+  per-node JSON config (ADR-023), one draft per workflow and per-organization name
+  uniqueness both enforced by generated columns rather than by service checks.
+- **Workflow repositories with tenant-scoped access** — every read takes
+  `organization_id` into the `WHERE` clause; soft-deleted rows are invisible.
+- **Draft copy-on-write** — the first edit after a publish copies the active
+  version's graph, preserving each node's `label`, `config`, and `ui_position`.
+- **Graph replacement** — whole-canvas delete-then-insert inside the caller's
+  transaction, with edges addressed by `node_key`.
+- **Optimistic revision handling** — every draft write states the revision it was
+  based on; a mismatch is refused rather than silently overwriting another editor.
+- **Workflow lifecycle service** — create, list, get, update metadata, soft delete,
+  draft creation/editing/validation, publishing and versioning, publish
+  authorization, and tenant isolation at every entry point.
+
+**Tests: 292 → 848.** 723 default (no external services) and 125 opt-in MySQL
+integration. Migration `0004` verified by upgrade → `alembic check` → downgrade →
+re-apply against real MySQL, with the emitted DDL hand-read against the spec.
+
 ---
 
 ## 7. Database
@@ -557,16 +631,37 @@ database design document.
 - `user_roles` — composite PK (`user_id` CASCADE, `role_id` RESTRICT);
   `created_at` only.
 
+### Workflow authoring tables (migrated in Phase 4, migration `0004`)
+
+- `workflows` — tenant-scoped; `public_id`, `name` + virtual generated
+  `name_active` carrying the unique index per organization, `description`,
+  nullable `active_version_id` (circular FK added by `ALTER`, `RESTRICT`),
+  `created_by_user_id` (`SET NULL`), `deleted_at`.
+- `workflow_versions` — `version_no` (NULL while DRAFT), `status`, virtual
+  generated `draft_key` whose unique index enforces **at most one draft per
+  workflow**, `revision` (optimistic lock), `notes`, `published_at`. No
+  `organization_id` — derivable through `workflow_id`.
+- `workflow_nodes` — `node_key` unique per version; `node_type` +
+  `node_type_version` with **no FK** (the registry is code, ADR-022); `config`
+  and `ui_position` JSON.
+- `workflow_edges` — `workflow_version_id` deliberately denormalized so a
+  version's edges load in one indexed query and the unique constraint on
+  `(version, source_node, source_handle, target_node, target_handle)` is
+  expressible.
+
 ### Future tables (by phase)
 
 - ~~Phase 3: `refresh_tokens`~~ — **done** (migration `0002`).
-- Phase 4: `provider_types`, `provider_configs` (nullable `api_key`),
-  `agents`, `agent_versions`, `prompt_templates`.
-- Phase 6: `workflows`, `workflow_versions`, `workflow_nodes`,
-  `workflow_edges` (with the two linearity unique constraints).
-- Phase 8: `executions`, `execution_steps`, `execution_logs`.
-- Phase 10: `memory_collections`, `documents`, `document_chunks`.
-- Phase 11: `tools`, `agent_tools`.
+- ~~Phase 4: `workflows`, `workflow_versions`, `workflow_nodes`,
+  `workflow_edges`~~ — **done** (migration `0004`).
+- Phase 5 (execution): `node_executions` and `run_events` are named by ADR-023
+  and `phase-4-implementation-spec.md` §6; the full set is designed in Phase 5,
+  not here.
+- Phase 7 (queue): `queue_tasks`, carrying `organization_id` for weighted
+  selection (ADR-030).
+- Phase 10 (connections): `connections`, under envelope encryption (ADR-027).
+- Later phases (AI node, memory) reuse the table names in the pre-redesign
+  roadmap; they are **not** re-planned here and none of them exists.
 
 ### Tenancy model
 
@@ -576,9 +671,11 @@ is Future via a `memberships` join table.
 
 ### Versioning strategy
 
-`agent_versions` / `workflow_versions` are **immutable** — edits create new
-versions; executions pin the version they ran. Circular FKs
-(`active_version_id`) are handled with `ALTER` back-fills in migrations.
+`workflow_versions` are **immutable once published** — a published version is
+never edited; the first edit after a publish creates a draft copy-on-write, and
+runs (from Phase 5) will pin the exact version they ran (ADR-026). Circular FKs
+(`active_version_id`) are handled with `ALTER` back-fills in migrations —
+migration `0004` does exactly this.
 
 ### Migration strategy
 
@@ -634,12 +731,13 @@ until Phase 3+).
 
 Three gates; all must pass before any commit, and every phase ends green.
 
-- **pytest** — two suites. The **default** run (`pytest`, 244 tests) needs no
-  external services and finishes in under a second. The **integration** suite
-  (`pytest -m integration`, 48 tests) needs a migrated MySQL and is deselected
-  by default; it covers what only a real database can answer — generated
-  columns, cascades, driver timezone behaviour, `FOR UPDATE` locking, and the
-  seeded role catalog. Full run: `pytest -m ""` (292).
+- **pytest** — two suites. The **default** run (`pytest`, 723 tests) needs no
+  external services and finishes in a couple of seconds. The **integration**
+  suite (`pytest -m integration`, 125 tests) needs a migrated MySQL and is
+  deselected by default; it covers what only a real database can answer —
+  generated columns, cascades, driver timezone behaviour, `FOR UPDATE` locking,
+  the seeded role catalog, tenant isolation, and the workflow lifecycle
+  end to end. Full run: `pytest -m ""` (848).
   The suite deliberately needs **no external services**: model metadata is
   asserted structurally (table set, constraint/index names, cascade rules,
   generated column, `CHAR(26)`), the Unit of Work runs against in-memory
@@ -663,82 +761,89 @@ execution engine (Phase 8) is tested against a **mock `AgentRunner`**.
 
 ## 10. Remaining Roadmap
 
-- [x] **Phase 2B — Initial migration** ✅ · generated, reviewed, and applied
-  migration `0001` for the four foundation tables; utf8mb4 pinned; schema-only;
-  downgrade corrected; schema verified via `SHOW CREATE TABLE`, clean
-  round-trip, and `alembic check`.
-- [x] **Phase 3A — Authentication foundation** ✅ · auth `Settings`, Argon2id +
-  JWT dependencies, `TokenClaims`/`AuthenticatedUser` value objects,
-  `PasswordHasher`/`TokenService` ports, `Argon2PasswordHasher`/
-  `JwtTokenService` adapters, container wiring, and the API security layer
-  (`get_current_user`, `require_roles`). 32-byte minimum signing key enforced.
-- [ ] **Phase 3B — Auth services, endpoints & tenancy** · *Objective:*
-  `refresh_tokens` table + migration, `AuthService`, user/role repositories,
-  register/login/refresh/logout endpoints, rotation with reuse detection,
-  role seeding, ownership plumbing, real MySQL readiness probe. *Depends on:*
-  3A. *Complexity:* **High** (security-critical).
-- [ ] **Phase 4 — Core CRUD** · *Objective:* agents, immutable agent
-  versions, providers (`provider_types`, `provider_configs` with nullable
-  `api_key`), prompt templates; first repositories + services. *Depends on:*
-  3. *Complexity:* **Medium-High** (establishes the service/repository
-  patterns everything else copies).
-- [ ] **Phase 5 — Provider abstraction (mock)** · *Objective:* `LLMProvider`
-  + `AgentRunner` ports, provider registry, mock adapters; no tables, no real
-  keys. *Depends on:* 4. *Complexity:* **Medium**.
-- [ ] **Phase 6 — Workflows (linear)** · *Objective:* workflow CRUD,
-  immutable versions, nodes/edges with DB-level linearity constraints
-  (ADR-007). *Depends on:* 4. *Complexity:* **Medium-High**.
-- [ ] **Phase 7 — Queue & worker** · *Objective:* `TaskQueue` port,
-  DB-backed durable queue, worker loop with atomic QUEUED→RUNNING claim,
-  heartbeat, reaper (ADR-015). *Depends on:* 6. *Complexity:* **High**
-  (concurrency correctness).
-- [ ] **Phase 8 — Execution engine** · *Objective:* framework-free sequential
-  engine over a mock runner; `executions`/`execution_steps`/`execution_logs`
-  with full history. *Depends on:* 7. *Complexity:* **High** (the core
-  product).
-- [ ] **Phase 9 — LangChain runner** · *Objective:* `LangChainAgentRunner`
-  behind `AgentRunner`; the single `langchain` import site (ADR-013).
-  *Depends on:* 8. *Complexity:* **Medium**.
-- [ ] **Phase 10 — Memory / ChromaDB** · *Objective:* upload → chunk → embed
-  → retrieve; `VectorStore`/`Embedder` ports + Chroma adapter;
-  `memory_collections`/`documents`/`document_chunks`. *Depends on:* 8.
-  *Complexity:* **Medium-High**.
-- [ ] **Phase 11 — Tools** · *Objective:* tool catalog, agent tool grants,
-  tool-calling in the engine. *Depends on:* 9, 10. *Complexity:* **Medium**.
-- [ ] **Phase 12 — Observability & production readiness** · *Objective:* log
-  redaction, audit logs, real readiness probes, metrics. *Depends on:* all
-  prior. *Complexity:* **Medium**.
+> **Renumbered 2026-07-29** by the workflow-platform redesign. The pre-redesign
+> phase list (agents → providers → prompts → linear workflows) is retained in
+> [roadmap.md](roadmap.md) for history and is **not** the plan being executed.
+> ADR-018 … ADR-032 are authoritative.
+
+- [x] **Phase 1 — Foundation** ✅
+- [x] **Phase 2 — Database infrastructure + migration `0001`** ✅
+- [x] **Phase 3 — Authentication & tenancy** ✅ (3A + 3B, migrations `0002`–`0003`)
+- [x] **Phase 4 — Workflow authoring, node contract & graph validation** ✅
+  (M1–M11, migration `0004`) · see §6
+- [ ] **Phase 5 — Durable execution core** · *Objective:* reentrant scheduler
+  over persisted state, run and node-execution state machines, event log,
+  sequential and in-process, **including suspension from day one** (ADR-019).
+  *Depends on:* 4. *Complexity:* **Highest**.
+- [ ] **Phase 6 — Control flow** · *Objective:* Condition, Merge, Loop scopes
+  (`for_each`/`while`), structural parallelism, branch pruning, join policies
+  (ADR-018, ADR-028). *Depends on:* 5. *Complexity:* **High**.
+- [ ] **Phase 7 — Queue & workers** · *Objective:* per-node dispatch, DB-backed
+  queue with `SKIP LOCKED`, reaper, concurrency limits, per-org fairness
+  (ADR-015, ADR-030). *Depends on:* 5. *Complexity:* **High**.
+- [ ] **Phase 8 — Triggers** · *Objective:* manual → webhook → schedule;
+  registration lifecycle tied to publish. *Depends on:* 5. *Complexity:*
+  **Medium**.
+- [ ] **Phase 9 — Human-in-the-loop** · *Objective:* approval node, inbox API,
+  authorization, timeouts/escalation. *Depends on:* 5. *Complexity:* **Medium**.
+- [ ] **Phase 10 — Connections + I/O nodes** · *Objective:* encrypted
+  connections (ADR-027); HTTP, Email, Database, File nodes behind the egress
+  policy (ADR-029). *Depends on:* 5. *Complexity:* **High (security)**.
+- [ ] **Phase 11 — AI Agent node** · *Objective:* `ai.agent@1` as an ordinary
+  data node; `AgentRunner` port + LangChain adapter (ADR-013); provider
+  configuration and credentials. *Depends on:* 5, 10. *Complexity:* **Medium**.
+- [ ] **Phase 12 — Memory / RAG** · *Objective:* Chroma-backed retrieval for
+  the agent node (ADR-003). *Depends on:* 11. *Complexity:* **Medium-High**.
+- [ ] **Phase 13 — Observability, quotas, retention** · *Objective:* metrics,
+  audit, purge jobs, SSE streaming. *Depends on:* all prior. *Complexity:*
+  **Medium**.
+
+**Still open inside Phase 4:** milestones **M12** (workflow HTTP API) and **M13**
+(documentation sign-off) from `phase-4-implementation-spec.md` have **not** been
+implemented. Phase 4's domain, persistence, and service layers are complete; its
+HTTP surface is not.
 
 ---
 
-## 11. Current Milestone: Phase 4 (Workflow authoring + node contract)
+## 11. Current Milestone: Phase 5 (Durable execution core) — NOT STARTED
 
-> **Redesigned 2026-07-29.** Orqent is now a visual workflow automation
-> platform. Phase 4 is no longer agents/providers/prompts CRUD — that work moves
-> to Phase 11. Phase 4 builds the **node contract, node registry, workflow /
-> version / node / edge model, draft-publish lifecycle, and graph validation**,
-> with no execution. ADR-018 … ADR-030 record the design; the roadmap table in
-> §10 below still lists the superseded phases and is corrected as each lands.
+**Nothing in Phase 5 exists.** No file under `src/app/` implements a scheduler,
+a run, a node execution, a worker, or a queue.
 
-### Superseded plan (retained for context)
+### What Phase 4 leaves ready to build on
 
-**Phase 3 is complete** (see §6). Authentication works end to end: a user can
-register, log in, call a protected endpoint, rotate their tokens, and log out.
-Migrations `0001`–`0003` are applied, all gates are green, and 292 tests pass.
+The node contract (`NodeDescriptor`, `NodeRunner`, and crucially the
+`Suspended` result, which ADR-019 requires to exist before the engine does); the
+node registry, which the engine will resolve runners through without importing a
+concrete node; `WorkflowGraph` plus a validation pipeline that guarantees a
+published version is structurally sound before anything runs; the workflow /
+version / node / edge tables with published versions immutable; and
+`WorkflowService`, which shows the transaction and authorization shape every
+later service copies.
 
-**What exists to build on:** the service-layer pattern (`AuthService` — one
-transaction per use case, driven by a unit-of-work factory, depending only on
-ports and repositories), the repository pattern with lazy UoW accessors, the
-transport-only schema + thin-route pattern, the domain-error → envelope
-mapping, and a two-tier test strategy (fast doubles plus an opt-in MySQL suite).
+### Explicitly NOT implemented (do not assume otherwise)
 
-**Next — Phase 4:** agents, immutable `agent_versions`, provider types and
-configs, and prompt templates; the first tenant-scoped CRUD. Every query must be
-scoped by `organization_id` (ADR-016) — `AuthenticatedUser` already carries it,
-and `require_roles` already exists for authorization.
+| Not built | Where it belongs |
+|---|---|
+| Workflow HTTP API (`POST/GET/PUT /workflows…`, validate, publish) | Phase 4 **M12** — spec written, not implemented |
+| Workflow request/response schemas | Phase 4 **M12** |
+| Workflow execution of any kind | Phase 5 |
+| Run / node-execution records and the event log | Phase 5 |
+| Queues, workers, dispatch | Phase 7 |
+| Scheduling and triggers | Phase 8 |
+| LangChain integration | Phase 11 (ADR-013) |
+| `AgentRunner` implementation | Phase 11 |
+| LLM / provider integrations | Phase 11 |
+| API keys and provider credentials | Phases 10–11 (ADR-027) |
+| Frontend workflow editor | Out of scope for this repository |
 
-**Carried into Phase 4 from Phase 3B:** no rate limiting on login or refresh
-(§12.15), and `email_verified_at` is still never set (§12.16).
+The `domain/engine` and `infrastructure/{llm,vector,queue,worker,tools}` packages
+contain **docstrings only**. They are intent, not implementation.
+
+### Carried forward
+
+No rate limiting on login or refresh (§12.15), and `email_verified_at` is still
+never set (§12.16).
 
 ---
 

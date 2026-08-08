@@ -152,15 +152,46 @@ The `UnitOfWork` port (`app.domain.ports.unit_of_work`) defines the transaction 
 
 ---
 
-## 10. Repository pattern **[Planned]**
+## 10. Repository pattern **[Implemented]**
 
-Repositories will be the **only** code that talks to MySQL, one per aggregate, returning ORM models (used as anemic data carriers, `ADR-008`) and scoping every query by `organization_id`. They attach to the Unit of Work. None exist yet — they arrive with the features that need them (Phase 4+). Rules in [coding-standards.md](coding-standards.md#repositories-planned).
+Repositories are the **only** code that talks to MySQL, one per aggregate, returning ORM models (used as anemic data carriers, `ADR-008`) and scoping every query by `organization_id`. They attach to the Unit of Work as lazy accessors. Implemented: `user`, `organization`, `role`, `refresh_token` (Phase 3) and `workflow`, `workflow_version` (Phase 4). They hold **no policy** — authorization is the service's job (`ADR-032`). Rules in [coding-standards.md](coding-standards.md#repositories-planned).
 
 ---
 
-## 11. Execution architecture **[Planned]**
+## 10a. Workflow authoring architecture **[Implemented — Phase 4]**
 
-Full detail in [execution-engine.md](execution-engine.md). In brief: an HTTP trigger creates an `Execution` row and enqueues its id (returning `202`); a worker dequeues, and the **framework-free execution engine** runs the workflow's nodes in order via the `AgentRunner` port, persisting each step. V1 is **linear** (`ADR-007`); DAG/branching is **[Future]**.
+The authoring stack as it exists today. Note the top layer: **there is no workflow HTTP API yet** (Phase 4 M12, specified but not implemented), so `WorkflowService` currently has no HTTP caller.
+
+```
+API layer                  [workflow routes NOT implemented]
+        |
+WorkflowService            lifecycle, publish, authorization   (Phase 4 M11)
+        |
+Repositories               Workflow / WorkflowVersion          (Phase 4 M10)
+        |
+SQLAlchemy / MySQL         workflows, workflow_versions,
+                           workflow_nodes, workflow_edges      (Phase 4 M9)
+```
+
+The graph and validation core sits beside that stack and depends on **none** of it — no session, no driver, no framework:
+
+```
+Workflow graph domain      GraphNode / GraphEdge / WorkflowGraph
+        |
+Node registry              (type, version) -> NodeDescriptor
+        |
+Validation pipeline        validate_graph(graph, registry) -> ValidationReport
+```
+
+`WorkflowService` is the only place the two meet: it loads a graph through a repository and hands it to `validate_graph`. Nothing in `app.domain.graph` or `app.domain.nodes` imports SQLAlchemy, FastAPI, a driver, or any other app layer.
+
+---
+
+## 11. Execution architecture **[Planned — nothing implemented]**
+
+**No execution code exists.** `app.domain.engine` is a docstring-only stub, and `infrastructure/{queue,worker}` likewise.
+
+The design (`ADR-019`): a **reentrant scheduler over persisted state**, not a program that runs a workflow to completion. Every state transition is committed before it is acted on; the unit of dispatch is the node execution, not the run; and a runner may return `Suspended(resume_token)` to park a run indefinitely at no cost. The `Suspended` result type already exists in `domain/nodes/result.py` precisely because retrofitting suspension later would mean rewriting the engine and every runner. Control flow (`ADR-018`, `ADR-028`) arrives in Phase 6; the queue (`ADR-015`) in Phase 7. `ADR-007`'s linear-workflow model is **superseded**.
 
 ---
 
@@ -180,9 +211,9 @@ flowchart LR
 
 ---
 
-## 13. Planned authentication flow **[Planned]**
+## 13. Authentication flow **[Implemented — Phase 3]**
 
-JWT access token + rotating refresh token with a server-side store (`ADR-010`; tables in [database.md](database.md)).
+JWT access token + rotating refresh token with a server-side store (`ADR-010`; tables in [database.md](database.md)). Working end to end since Phase 3B, including rotation with reuse detection and family revocation.
 
 ```mermaid
 sequenceDiagram

@@ -125,19 +125,19 @@ subdomain: nothing below grants it special treatment.
 **Why:** The platform's value is that a workflow can mix an LLM call, an HTTP request, and a human decision without the engine caring. Special-casing any node type — most tempting for AI — would put product knowledge inside the scheduler and make every future node a negotiation.
 **Consequences:** adding a node type touches no engine, schema, or API code. That property is testable and should be enforced by a conformance suite every node type must pass. Control nodes are not extensible, which is intended.
 
-## ADR-021 — Typed data flow over a small closed type lattice **[Planned]**
+## ADR-021 — Typed data flow over a small closed type lattice **[Implemented]** *(Phase 4)*
 **Decision:** Handles are typed from a closed set: `Any`, `Text`, `Number`, `Boolean`, `Json`, `Record<S>`, `Binary` (a blob reference), `List<T>`. Contracts are Pydantic models; JSON Schema is generated from them for the visual builder. Edge compatibility is checked at authoring time.
 **Why:** A visual builder lives or dies on whether it can say "you cannot connect this to that" instantly and comprehensibly. Arbitrary JSON Schema subsumption is effectively undecidable in the general case and produces errors no end user can act on.
 **Alternative rejected:** untyped `Json` everywhere (simpler, but moves every error to runtime) and full JSON Schema subtyping (expressive, but unexplainable).
 **Consequences:** richer type needs require extending the lattice deliberately rather than by accident. `Binary` never carries inline bytes (ADR-025).
 **Correction (2026-07-29):** this ADR originally specified one level of *structural* comparison for `Record<A> → Record<B>` — which is the very thing its own rationale rejects, one level shallower. **Phase 4 uses nominal compatibility**: the same model, or a target of `Json`/`Any`. Structural comparison is deferred until a real node needs it, at which point it slots into the same `compatible()` function with no caller change. See `phase-4-implementation-spec.md` §1.1(c) and §6.3.
 
-## ADR-022 — Node registry is code; built-in catalog only **[Planned]**
+## ADR-022 — Node registry is code; built-in catalog only **[Implemented]** *(Phase 4)*
 **Decision:** The node catalog ships with the application. The registry is an in-process map `(type, version) → descriptor`, populated at import. **No user-supplied code is ever executed**, and there is no `node_types` table.
 **Why:** Executing untrusted user code is the single largest security and operational commitment a workflow platform can make — it demands process isolation, resource limits, egress control, and a dependency story. Declining it removes an entire threat class and is fully reversible later.
 **Consequences:** `workflow_nodes.node_type` is a validated string with no FK; a startup/CI check asserts every node type referenced by a published version still exists. Extensibility means writing a module, not installing a plugin. A sandboxed code node and a plugin SDK remain possible without redesign.
 
-## ADR-023 — Normalized graph storage with per-node JSON config **[Planned]**
+## ADR-023 — Normalized graph storage with per-node JSON config **[Implemented]** *(Phase 4, migration 0004)*
 **Decision:** `workflow_nodes` and `workflow_edges` are relational tables. Each node's `config` is a JSON column validated against its node type's schema at authoring time.
 **Why:** `node_executions` needs a real foreign key to a node, and impact analysis ("which workflows use this connection, or this node type?") is a product feature, not a report. Config is genuinely polymorphic, so JSON is the honest representation there.
 **Alternative rejected:** the whole graph as one JSON document on `workflow_versions` — atomic and cheap to load, but it forfeits referential integrity and turns impact analysis into a scan.
@@ -153,7 +153,7 @@ subdomain: nothing below grants it special treatment.
 **Why:** File generation, PDF output, and HTTP responses make large payloads routine. Blobs in MySQL destroy backup, replication, and query performance, and run payloads are already the bulk of the platform's data growth.
 **Consequences:** a `BlobStore` port with a local-filesystem adapter first; retention and purge apply to blobs as well as rows; run payloads must be fetched through an authorized endpoint, never served directly.
 
-## ADR-026 — Draft/published version lifecycle **[Planned]**
+## ADR-026 — Draft/published version lifecycle **[Implemented]** *(Phase 4)*
 **Decision:** `workflow_versions.status ∈ {DRAFT, PUBLISHED, ARCHIVED}`, with at most one draft per workflow (partial uniqueness emulated per ADR-005). Editing mutates the draft; publishing validates and freezes it and assigns `version_no`. **Runs may only reference published versions**, and pin the exact version they ran.
 **Why:** A visual builder saves continuously, so immutable-only versions are unusable — but an execution whose definition can change underneath it is unauditable. Splitting the two resolves the conflict.
 **Consequences:** validation is a first-class API operation returning node-anchored errors, not a side effect of publishing; a run's behaviour never changes retroactively.
@@ -183,7 +183,7 @@ subdomain: nothing below grants it special treatment.
 **Why:** Until now `app.domain` has been stdlib-only, so this is a deliberate first exception rather than a drift. Node types must declare a configuration shape that is validated at authoring time *and* published as JSON Schema for the visual builder; Pydantic does both, is already the project's canonical data-shape library, and is a pure in-process library with no I/O, no network, and no vendor coupling. The alternative — hand-rolling schema description, validation, and JSON Schema emission — is strictly worse code for the same result.
 **Consequences:** the dependency rule is now "no frameworks, no I/O, no swappable vendors" rather than "no third-party imports at all"; the import-purity test asserts the narrower rule by name, so a future SQLAlchemy or FastAPI import in the domain still fails. Node config models live with their node in `app.infrastructure.nodes`; only the *type reference* is in the domain.
 
-## ADR-032 — Resource-dependent authorization lives in the service layer **[Planned]**
+## ADR-032 — Resource-dependent authorization lives in the service layer **[Implemented]** *(Phase 4)*
 **Decision:** Authorization answerable from the token alone stays at the API edge via `require_roles`. Authorization that depends on the resource — "the workflow's creator may publish it" — is enforced inside the service, which raises `AuthorizationError`.
 **Why:** `require_roles` reads `AuthenticatedUser.roles` and never touches storage, which is exactly why it cannot express a creator check: that needs the row loaded. Putting `require_roles("owner", "admin")` on the publish route would be actively wrong — it would lock out the creator, the opposite of the intent. Deciding this once is cheaper than rediscovering it for every resource in Phase 5 (who may cancel a run, who may decide a human task).
 **Consequences:** service methods that enforce such a rule take the `AuthenticatedUser` as a parameter; repositories that feed them eager-load what the rule reads (`WorkflowRepository.get_by_public_id` loads the creator, so the comparison costs no extra query); the rule is unit-tested as a permission matrix, so a route-level shortcut that bypasses the service fails those tests. Repositories remain free of authorization.
