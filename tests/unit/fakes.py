@@ -20,6 +20,7 @@ from typing import Self
 from sqlalchemy.exc import IntegrityError
 
 from app.domain.errors import AuthenticationError
+from app.domain.graph.model import GraphEdge, GraphNode, WorkflowGraph
 from app.domain.ports.password_hasher import PasswordHasher
 from app.domain.ports.token_service import TokenService
 from app.domain.value_objects.authenticated_user import AuthenticatedUser
@@ -30,6 +31,9 @@ from app.infrastructure.db.models.refresh_token import RefreshToken
 from app.infrastructure.db.models.role import Role
 from app.infrastructure.db.models.user import User
 from app.infrastructure.db.models.user_role import UserRole
+from app.infrastructure.db.models.workflow import Workflow
+from app.infrastructure.db.models.workflow_node import WorkflowNode
+from app.infrastructure.db.models.workflow_version import WorkflowVersion
 
 
 def integrity_error(message: str) -> IntegrityError:
@@ -55,11 +59,17 @@ class FakeDatabase:
     roles: list[Role] = field(default_factory=list)
     user_roles: list[UserRole] = field(default_factory=list)
     refresh_tokens: list[RefreshToken] = field(default_factory=list)
+    workflows: list[Workflow] = field(default_factory=list)
+    workflow_versions: list[WorkflowVersion] = field(default_factory=list)
+    # Graph rows, keyed by version id. Replaced wholesale, like the real one.
+    graphs: dict[int, tuple[list[WorkflowNode], list[GraphEdge]]] = field(default_factory=dict)
 
     pending_organizations: list[Organization] = field(default_factory=list)
     pending_users: list[User] = field(default_factory=list)
     pending_user_roles: list[UserRole] = field(default_factory=list)
     pending_refresh_tokens: list[RefreshToken] = field(default_factory=list)
+    pending_workflows: list[Workflow] = field(default_factory=list)
+    pending_workflow_versions: list[WorkflowVersion] = field(default_factory=list)
 
     _next_id: int = 1
 
@@ -86,11 +96,21 @@ class FakeDatabase:
     def visible_refresh_tokens(self) -> list[RefreshToken]:
         return [*self.refresh_tokens, *self.pending_refresh_tokens]
 
+    @property
+    def visible_workflows(self) -> list[Workflow]:
+        return [*self.workflows, *self.pending_workflows]
+
+    @property
+    def visible_workflow_versions(self) -> list[WorkflowVersion]:
+        return [*self.workflow_versions, *self.pending_workflow_versions]
+
     def commit(self) -> None:
         self.organizations.extend(self.pending_organizations)
         self.users.extend(self.pending_users)
         self.user_roles.extend(self.pending_user_roles)
         self.refresh_tokens.extend(self.pending_refresh_tokens)
+        self.workflows.extend(self.pending_workflows)
+        self.workflow_versions.extend(self.pending_workflow_versions)
         self.clear_pending()
 
     def rollback(self) -> None:
@@ -101,6 +121,8 @@ class FakeDatabase:
         self.pending_users.clear()
         self.pending_user_roles.clear()
         self.pending_refresh_tokens.clear()
+        self.pending_workflows.clear()
+        self.pending_workflow_versions.clear()
 
 
 # --- Repositories -----------------------------------------------------------
@@ -147,6 +169,16 @@ class FakeUserRepository:
     async def get_by_email(self, email: str) -> User | None:
         return next(
             (u for u in self._db.visible_users if u.email == email and u.deleted_at is None),
+            None,
+        )
+
+    async def get_by_public_id(self, public_id: str) -> User | None:
+        return next(
+            (
+                u
+                for u in self._db.visible_users
+                if u.public_id == public_id and u.deleted_at is None
+            ),
             None,
         )
 
@@ -209,6 +241,146 @@ class FakeRefreshTokenRepository:
 # --- Unit of work -----------------------------------------------------------
 
 
+class FakeWorkflowRepository:
+    """Mirrors the real one: org-scoped, soft-delete aware, name unique per org."""
+
+    def __init__(self, db: FakeDatabase) -> None:
+        self._db = db
+
+    def _live(self, organization_id: int) -> list[Workflow]:
+        return [
+            w
+            for w in self._db.visible_workflows
+            if w.organization_id == organization_id and w.deleted_at is None
+        ]
+
+    async def add(self, workflow: Workflow) -> Workflow:
+        workflow.id = self._db.next_id()
+        workflow.public_id = workflow.public_id or new_public_id()
+        self._db.pending_workflows.append(workflow)
+        return workflow
+
+    async def get_by_public_id(self, public_id: str, organization_id: int) -> Workflow | None:
+        workflow = next(
+            (w for w in self._live(organization_id) if w.public_id == public_id),
+            None,
+        )
+        if workflow is not None:
+            # The real repository eager-loads this (joinedload), and publish
+            # authorization depends on it. A fake that left it unset would let
+            # the creator rule pass here and fail against MySQL.
+            workflow.creator = next(
+                (u for u in self._db.visible_users if u.id == workflow.created_by_user_id),
+                None,
+            )
+        return workflow
+
+    async def list_for_org(
+        self,
+        organization_id: int,
+        *,
+        limit: int,
+        offset: int,
+        query: str | None = None,
+    ) -> list[Workflow]:
+        found = sorted(self._live(organization_id), key=lambda w: (w.name.lower(), w.id))
+        if query:
+            found = [w for w in found if query.lower() in w.name.lower()]
+        return found[offset : offset + limit]
+
+    async def count_for_org(self, organization_id: int, *, query: str | None = None) -> int:
+        found = self._live(organization_id)
+        if query:
+            found = [w for w in found if query.lower() in w.name.lower()]
+        return len(found)
+
+    async def name_exists(self, organization_id: int, name: str) -> bool:
+        # Mirrors uq_workflows_organization_id_name_active: live rows only.
+        return any(w.name == name for w in self._live(organization_id))
+
+
+class FakeWorkflowVersionRepository:
+    """Mirrors the real one, including one-draft-per-workflow and key-addressed edges."""
+
+    def __init__(self, db: FakeDatabase) -> None:
+        self._db = db
+
+    async def add(self, version: WorkflowVersion) -> WorkflowVersion:
+        if version.status == "DRAFT" and any(
+            v.workflow_id == version.workflow_id and v.status == "DRAFT"
+            for v in self._db.visible_workflow_versions
+        ):
+            raise integrity_error("uq_workflow_versions_draft_key")
+        version.id = self._db.next_id()
+        if version.revision is None:
+            version.revision = 1
+        self._db.pending_workflow_versions.append(version)
+        self._db.graphs.setdefault(version.id, ([], []))
+        return version
+
+    async def get_draft(self, workflow_id: int) -> WorkflowVersion | None:
+        return next(
+            (
+                v
+                for v in self._db.visible_workflow_versions
+                if v.workflow_id == workflow_id and v.status == "DRAFT"
+            ),
+            None,
+        )
+
+    async def get_by_version_no(self, workflow_id: int, version_no: int) -> WorkflowVersion | None:
+        return next(
+            (
+                v
+                for v in self._db.visible_workflow_versions
+                if v.workflow_id == workflow_id and v.version_no == version_no
+            ),
+            None,
+        )
+
+    async def list_for_workflow(self, workflow_id: int) -> list[WorkflowVersion]:
+        return sorted(
+            (v for v in self._db.visible_workflow_versions if v.workflow_id == workflow_id),
+            key=lambda v: v.id,
+            reverse=True,
+        )
+
+    async def list_nodes(self, version_id: int) -> list[WorkflowNode]:
+        return list(self._db.graphs.get(version_id, ([], []))[0])
+
+    async def load_graph(self, version_id: int) -> WorkflowGraph:
+        nodes, edges = self._db.graphs.get(version_id, ([], []))
+        return WorkflowGraph(
+            nodes=tuple(
+                GraphNode(
+                    key=n.node_key,
+                    node_type=n.node_type,
+                    version=n.node_type_version,
+                    config=n.config,
+                    label=n.label,
+                )
+                for n in nodes
+            ),
+            edges=tuple(edges),
+        )
+
+    async def replace_graph(
+        self,
+        version_id: int,
+        nodes: list[WorkflowNode],
+        edges: list[GraphEdge],
+    ) -> None:
+        for node in nodes:
+            node.workflow_version_id = version_id
+            node.id = self._db.next_id()
+        self._db.graphs[version_id] = (list(nodes), list(edges))
+
+    async def bump_revision(self, version_id: int) -> int:
+        version = next(v for v in self._db.visible_workflow_versions if v.id == version_id)
+        version.revision += 1
+        return version.revision
+
+
 class FakeUnitOfWork:
     """Mirrors ``SqlAlchemyUnitOfWork``: exit rolls back what was not committed."""
 
@@ -218,6 +390,8 @@ class FakeUnitOfWork:
         self.users = user_repository or FakeUserRepository(db)
         self.roles = FakeRoleRepository(db)
         self.refresh_tokens = FakeRefreshTokenRepository(db)
+        self.workflows = FakeWorkflowRepository(db)
+        self.workflow_versions = FakeWorkflowVersionRepository(db)
         self.commit_calls = 0
         self.rollback_calls = 0
         self.entered = 0

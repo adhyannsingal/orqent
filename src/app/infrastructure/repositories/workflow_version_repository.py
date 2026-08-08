@@ -105,6 +105,23 @@ class WorkflowVersionRepository:
         )
         return result.scalar_one()
 
+    async def list_nodes(self, version_id: int) -> Sequence[WorkflowNode]:
+        """The version's node **rows**, ordered by id.
+
+        Distinct from :meth:`load_graph` on purpose. That returns the validator's
+        view, which has no ``ui_position`` because canvas coordinates are not a
+        thing any rule reasons about. Copying a draft from a published version
+        does need them — a user who publishes and then edits must not find their
+        layout reset — and so does rendering the builder.
+        """
+
+        result = await self._session.execute(
+            select(WorkflowNode)
+            .where(WorkflowNode.workflow_version_id == version_id)
+            .order_by(WorkflowNode.id)
+        )
+        return result.scalars().all()
+
     async def load_graph(self, version_id: int) -> WorkflowGraph:
         """Reconstruct this version's graph as the pure domain object.
 

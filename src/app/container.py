@@ -24,6 +24,7 @@ from app.infrastructure.nodes import build_registry
 from app.infrastructure.security.password_hasher import Argon2PasswordHasher
 from app.infrastructure.security.token_service import JwtTokenService
 from app.services.auth_service import AuthService
+from app.services.workflow_service import WorkflowService
 
 
 class Container:
@@ -37,6 +38,7 @@ class Container:
         self._token_service: TokenService | None = None
         self._auth_service: AuthService | None = None
         self._node_registry: NodeRegistry | None = None
+        self._workflow_service: WorkflowService | None = None
 
     @property
     def settings(self) -> Settings:
@@ -122,6 +124,19 @@ class Container:
                 self.token_service,
             )
         return self._auth_service
+
+    @property
+    def workflow_service(self) -> WorkflowService:
+        """The application's workflow authoring service.
+
+        Shared for the same reasons as ``auth_service``: it holds no mutable
+        state and receives ``unit_of_work`` as a *factory*, so every call it
+        serves opens its own transaction.
+        """
+
+        if self._workflow_service is None:
+            self._workflow_service = WorkflowService(self.unit_of_work, self.node_registry)
+        return self._workflow_service
 
     async def dispose(self) -> None:
         """Release the connection pool. Safe to call if never initialised."""

@@ -52,6 +52,26 @@ class UserRepository:
         )
         return result.unique().scalar_one_or_none()
 
+    async def get_by_public_id(self, public_id: str) -> User | None:
+        """Return the live user with this public ID.
+
+        The bridge between an authenticated caller and the internal ids the
+        schema uses: ``AuthenticatedUser`` carries ULIDs (ADR-004), while
+        ``workflows.created_by_user_id`` and ``workflows.organization_id`` are
+        BIGINTs. One indexed lookup answers both, because ``users`` already
+        carries ``organization_id`` — no join is needed to learn the caller's
+        tenant.
+
+        Organization and roles are deliberately not loaded: this is not the
+        authentication path, and the caller's roles already arrived on the
+        token.
+        """
+
+        result = await self._session.execute(
+            select(User).where(User.public_id == public_id, User.deleted_at.is_(None))
+        )
+        return result.scalar_one_or_none()
+
     async def get_by_id(self, user_id: int) -> User | None:
         """Return the live user with internal id ``user_id``, org and roles loaded.
 
