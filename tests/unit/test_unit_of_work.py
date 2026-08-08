@@ -18,12 +18,18 @@ from app.infrastructure.repositories.organization_repository import Organization
 from app.infrastructure.repositories.refresh_token_repository import RefreshTokenRepository
 from app.infrastructure.repositories.role_repository import RoleRepository
 from app.infrastructure.repositories.user_repository import UserRepository
+from app.infrastructure.repositories.workflow_repository import WorkflowRepository
+from app.infrastructure.repositories.workflow_version_repository import (
+    WorkflowVersionRepository,
+)
 
 REPOSITORIES = {
     "organizations": OrganizationRepository,
     "users": UserRepository,
     "roles": RoleRepository,
     "refresh_tokens": RefreshTokenRepository,
+    "workflows": WorkflowRepository,
+    "workflow_versions": WorkflowVersionRepository,
 }
 
 

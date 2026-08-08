@@ -25,6 +25,10 @@ from app.infrastructure.repositories.organization_repository import Organization
 from app.infrastructure.repositories.refresh_token_repository import RefreshTokenRepository
 from app.infrastructure.repositories.role_repository import RoleRepository
 from app.infrastructure.repositories.user_repository import UserRepository
+from app.infrastructure.repositories.workflow_repository import WorkflowRepository
+from app.infrastructure.repositories.workflow_version_repository import (
+    WorkflowVersionRepository,
+)
 
 
 class SqlAlchemyUnitOfWork(UnitOfWork):
@@ -37,6 +41,8 @@ class SqlAlchemyUnitOfWork(UnitOfWork):
         self._users: UserRepository | None = None
         self._roles: RoleRepository | None = None
         self._refresh_tokens: RefreshTokenRepository | None = None
+        self._workflows: WorkflowRepository | None = None
+        self._workflow_versions: WorkflowVersionRepository | None = None
 
     @property
     def session(self) -> AsyncSession:
@@ -77,6 +83,18 @@ class SqlAlchemyUnitOfWork(UnitOfWork):
             self._refresh_tokens = RefreshTokenRepository(self.session)
         return self._refresh_tokens
 
+    @property
+    def workflows(self) -> WorkflowRepository:
+        if self._workflows is None:
+            self._workflows = WorkflowRepository(self.session)
+        return self._workflows
+
+    @property
+    def workflow_versions(self) -> WorkflowVersionRepository:
+        if self._workflow_versions is None:
+            self._workflow_versions = WorkflowVersionRepository(self.session)
+        return self._workflow_versions
+
     # --- Lifecycle ----------------------------------------------------------
 
     async def __aenter__(self) -> Self:
@@ -102,6 +120,8 @@ class SqlAlchemyUnitOfWork(UnitOfWork):
             self._users = None
             self._roles = None
             self._refresh_tokens = None
+            self._workflows = None
+            self._workflow_versions = None
 
     async def commit(self) -> None:
         await self.session.commit()
