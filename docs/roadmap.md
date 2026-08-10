@@ -59,7 +59,7 @@ foundations. Phase 5 ends with a complete, tested, documented authoring API.
 | **M1** | API contracts & schemas | ✅ `3649719` |
 | **M2** | Workflow authoring HTTP API | ✅ `01f0e3e` |
 | **M3** | API boundary hardening | ✅ `e3c1cbb` |
-| **M4** | API contract & consistency review | not started |
+| **M4** | API contract & consistency review | ✅ (2026-08-10) |
 | **M5** | API architecture & production hardening | not started |
 | **M6** | Phase 5 final verification & documentation | not started |
 
@@ -92,14 +92,15 @@ resolution and raised `KeyError`, so a malformed request arrived as an unhandled
 sibling preconditions §6.2 already places there. Regression coverage at schema,
 route, and integration level; `architecture.md`'s stale diagram corrected.
 
-### M4 — API contract & consistency review — not started
+### M4 — API contract & consistency review ✅ (2026-08-10)
 
-**Primarily a review, testing, and contract-alignment milestone.** Add
-functionality only where the contract is genuinely unmet; where the
-implementation already satisfies it, add only the tests or documentation that
-prove it.
+**Reviewed and closed.** Every checklist item below was audited against the
+frozen contracts. Eleven of the twelve were already correct and gained
+regression tests rather than code; the twelfth — the generated OpenAPI schema —
+documented only the success code and `422`, so the 401/403/404/409 responses
+§8 defines are now declared. No behaviour changed.
 
-Review against the frozen contracts and the actual architecture:
+Reviewed against the frozen contracts and the actual architecture:
 
 - HTTP success and error semantics; 200 / 201 / 204 correctness
 - validation-endpoint semantics (200 even when the graph is invalid)
@@ -112,6 +113,12 @@ Review against the frozen contracts and the actual architecture:
 - draft and version behaviour
 - how the authenticated caller is represented
 - the generated OpenAPI schema
+
+**Outcome.** The only contract gap was the OpenAPI schema; everything else held.
+Twenty-six regression tests were added, the most important being that
+`can_publish` agrees with what `publish` actually does — the flag and the rule
+were previously asserted in different files against different fixtures, so they
+could have drifted apart without a single test failing.
 
 ### M5 — API architecture & production hardening — not started
 

@@ -37,7 +37,7 @@ from app.domain.graph.validation import ValidationReport
 from app.domain.value_objects.authenticated_user import AuthenticatedUser
 from app.infrastructure.db.models.workflow_node import WorkflowNode
 from app.infrastructure.db.models.workflow_version import WorkflowVersion
-from app.schemas.common import PageResponse
+from app.schemas.common import ErrorResponse, PageResponse
 from app.schemas.workflows import (
     CreateWorkflowRequest,
     GraphEdgeResponse,
@@ -57,6 +57,34 @@ from app.schemas.workflows import (
 from app.services.workflow_service import GraphView, WorkflowSummaryView, WorkflowView
 
 router = APIRouter(tags=["workflows"])
+
+# Every failure this API can produce, declared so the generated OpenAPI schema
+# says what §8's error table says. FastAPI infers only the success code and the
+# 422 it raises itself, so without these a client generated from the spec would
+# not know a 404 or a 409 is possible — and 409 is not an edge case here: it is
+# how a stale draft save and a duplicate name are reported.
+#
+# Declaration only. The handler in `app.api.errors` already renders every
+# `AppError` into this envelope; nothing here changes behaviour.
+_AUTHENTICATED: dict[int | str, dict[str, object]] = {
+    401: {"model": ErrorResponse, "description": "Authentication credentials missing or invalid"},
+}
+_TENANT_SCOPED: dict[int | str, dict[str, object]] = {
+    **_AUTHENTICATED,
+    404: {
+        "model": ErrorResponse,
+        "description": "No such workflow in the caller's organization. Another "
+        "organization's workflow reports 404, never 403.",
+    },
+}
+_ROLE_GUARDED: dict[int | str, dict[str, object]] = {
+    **_AUTHENTICATED,
+    403: {"model": ErrorResponse, "description": "The caller's role does not permit this"},
+}
+_ROLE_GUARDED_RESOURCE: dict[int | str, dict[str, object]] = {**_ROLE_GUARDED, **_TENANT_SCOPED}
+_CONFLICTING: dict[int | str, dict[str, object]] = {
+    409: {"model": ErrorResponse, "description": "Conflicts with the current state"},
+}
 
 # Editing a workflow is ordinary member work; deleting one is not, because a
 # soft delete hides every version and run history behind it (§8).
@@ -185,6 +213,7 @@ def _to_report(report: ValidationReport) -> ValidationReportResponse:
     response_model=WorkflowResponse,
     status_code=status.HTTP_201_CREATED,
     summary="Create an empty workflow",
+    responses={**_ROLE_GUARDED, **_CONFLICTING},
 )
 async def create_workflow(
     payload: CreateWorkflowRequest,
@@ -199,6 +228,7 @@ async def create_workflow(
     "",
     response_model=PageResponse[WorkflowSummaryResponse],
     summary="List the organization's workflows",
+    responses={**_AUTHENTICATED},
 )
 async def list_workflows(
     current_user: CurrentUserDep,
@@ -222,6 +252,7 @@ async def list_workflows(
     "/{workflow_id}",
     response_model=WorkflowResponse,
     summary="Read one workflow",
+    responses={**_TENANT_SCOPED},
 )
 async def get_workflow(
     workflow_id: str,
@@ -235,6 +266,7 @@ async def get_workflow(
     "/{workflow_id}",
     response_model=WorkflowResponse,
     summary="Rename a workflow or change its description",
+    responses={**_ROLE_GUARDED_RESOURCE, **_CONFLICTING},
 )
 async def update_workflow(
     workflow_id: str,
@@ -252,6 +284,7 @@ async def update_workflow(
     "/{workflow_id}",
     status_code=status.HTTP_204_NO_CONTENT,
     summary="Soft delete a workflow",
+    responses={**_ROLE_GUARDED_RESOURCE},
 )
 async def delete_workflow(
     workflow_id: str,
@@ -268,6 +301,7 @@ async def delete_workflow(
     "/{workflow_id}/draft",
     response_model=GraphResponse,
     summary="Read the draft graph, creating it if the workflow has none",
+    responses={**_TENANT_SCOPED},
 )
 async def get_draft(
     workflow_id: str,
@@ -283,6 +317,7 @@ async def get_draft(
     "/{workflow_id}/draft",
     response_model=GraphResponse,
     summary="Replace the draft graph",
+    responses={**_ROLE_GUARDED_RESOURCE, **_CONFLICTING},
 )
 async def replace_draft(
     workflow_id: str,
@@ -322,6 +357,7 @@ async def replace_draft(
     "/{workflow_id}/draft/validate",
     response_model=ValidationReportResponse,
     summary="Validate the draft without changing it",
+    responses={**_TENANT_SCOPED},
 )
 async def validate_draft(
     workflow_id: str,
@@ -341,6 +377,7 @@ async def validate_draft(
     response_model=VersionResponse,
     status_code=status.HTTP_201_CREATED,
     summary="Publish the draft as a new version",
+    responses={**_ROLE_GUARDED_RESOURCE, **_CONFLICTING},
 )
 async def publish_workflow(
     workflow_id: str,
@@ -358,6 +395,7 @@ async def publish_workflow(
     "/{workflow_id}/versions",
     response_model=PageResponse[VersionResponse],
     summary="List a workflow's versions, newest first",
+    responses={**_TENANT_SCOPED},
 )
 async def list_versions(
     workflow_id: str,
@@ -382,6 +420,7 @@ async def list_versions(
     "/{workflow_id}/versions/{version_no}",
     response_model=GraphResponse,
     summary="Read one published version and the graph it froze",
+    responses={**_TENANT_SCOPED},
 )
 async def get_version(
     workflow_id: str,

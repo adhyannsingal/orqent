@@ -766,3 +766,88 @@ def test_a_non_numeric_version_is_422(client: TestClient, member: dict[str, str]
         client.get(f"/api/v1/workflows/{WORKFLOW_ID}/versions/abc", headers=member).status_code
         == 422
     )
+
+
+# --- OpenAPI contract (M4) ---------------------------------------------------
+
+
+def _spec(client: TestClient) -> dict:
+    return dict(client.get("/openapi.json").json())
+
+
+def test_the_spec_declares_every_status_code_the_api_can_return(
+    client: TestClient,
+) -> None:
+    """§8's error table, visible to anyone generating a client from the spec.
+
+    FastAPI infers only the success code and the 422 it raises itself. Without
+    explicit declarations a generated SDK would not know a 404 or a 409 is
+    possible — and 409 is not exotic here: it is how a stale draft save and a
+    duplicate name are reported.
+    """
+
+    paths = _spec(client)["paths"]
+
+    def codes(path: str, method: str) -> set[str]:
+        return set(paths[f"/api/v1/workflows{path}"][method]["responses"])
+
+    assert {"401", "403", "409", "422"} <= codes("", "post")
+    assert {"401", "404"} <= codes("/{workflow_id}", "get")
+    assert {"401", "403", "404", "409"} <= codes("/{workflow_id}", "patch")
+    assert {"401", "403", "404"} <= codes("/{workflow_id}", "delete")
+    assert {"401", "403", "404", "409"} <= codes("/{workflow_id}/draft", "put")
+    assert {"401", "403", "404", "409"} <= codes("/{workflow_id}/publish", "post")
+
+
+def test_declared_error_responses_use_the_standard_envelope(
+    client: TestClient,
+) -> None:
+    """One documented error shape, matching what the handlers actually emit."""
+
+    responses = _spec(client)["paths"]["/api/v1/workflows/{workflow_id}"]["get"]["responses"]
+    schema = responses["404"]["content"]["application/json"]["schema"]
+
+    assert schema["$ref"].endswith("/ErrorResponse")
+
+
+def test_the_success_codes_match_the_frozen_table(client: TestClient) -> None:
+    paths = _spec(client)["paths"]
+    expected = {
+        ("", "post"): "201",
+        ("", "get"): "200",
+        ("/{workflow_id}", "get"): "200",
+        ("/{workflow_id}", "patch"): "200",
+        ("/{workflow_id}", "delete"): "204",
+        ("/{workflow_id}/draft", "get"): "200",
+        ("/{workflow_id}/draft", "put"): "200",
+        ("/{workflow_id}/draft/validate", "post"): "200",
+        ("/{workflow_id}/publish", "post"): "201",
+        ("/{workflow_id}/versions", "get"): "200",
+        ("/{workflow_id}/versions/{version_no}", "get"): "200",
+    }
+
+    for (path, method), code in expected.items():
+        declared = set(paths[f"/api/v1/workflows{path}"][method]["responses"])
+        assert code in declared, (path, method)
+
+
+def test_no_response_model_exposes_an_internal_identifier(client: TestClient) -> None:
+    """ADR-004, asserted against the generated schema rather than by review."""
+
+    schemas = _spec(client)["components"]["schemas"]
+    banned = {
+        "id",
+        "organization_id",
+        "workflow_id",
+        "active_version_id",
+        "created_by_user_id",
+        "workflow_version_id",
+        "source_node_id",
+        "target_node_id",
+    }
+
+    for name, schema in schemas.items():
+        if not name.startswith(("Workflow", "Graph", "Version", "Page", "Ui", "Validation")):
+            continue
+        leaked = set(schema.get("properties", {})) & banned
+        assert not leaked, f"{name} exposes {leaked}"

@@ -6,9 +6,9 @@ Version:        0.1.0
 Current Phase:  Phase 5 — Workflow authoring API ✅ M1–M3 complete
 Last Updated:   2026-08-10
 Status:         Healthy — the workflow authoring API is usable over HTTP end to end,
-                995 tests passing, all quality gates green, migrations 0001–0004
+                1020 tests passing, all quality gates green, migrations 0001–0004
                 applied (Phase 5 has needed none). Still no execution of any kind.
-Next Milestone: Phase 5 M4 — API contract & consistency review
+Next Milestone: Phase 5 M5 — API architecture & production hardening
 ```
 
 This is the project's **living status document** — the single source of truth for
@@ -730,13 +730,13 @@ until Phase 3+).
 
 Three gates; all must pass before any commit, and every phase ends green.
 
-- **pytest** — two suites. The **default** run (`pytest`, 849 tests) needs no
+- **pytest** — two suites. The **default** run (`pytest`, 853 tests) needs no
   external services and finishes in a couple of seconds. The **integration**
-  suite (`pytest -m integration`, 146 tests) needs a migrated MySQL and is
+  suite (`pytest -m integration`, 167 tests) needs a migrated MySQL and is
   deselected by default; it covers what only a real database can answer —
   generated columns, cascades, driver timezone behaviour, `FOR UPDATE` locking,
   the seeded role catalog, tenant isolation, and the workflow lifecycle
-  end to end. Full run: `pytest -m ""` (995).
+  end to end. Full run: `pytest -m ""` (1020).
   The suite deliberately needs **no external services**: model metadata is
   asserted structurally (table set, constraint/index names, cascade rules,
   generated column, `CHAR(26)`), the Unit of Work runs against in-memory
@@ -804,7 +804,7 @@ worker, queue, trigger, connection, or provider integration is present in
 
 ---
 
-## 11. Current Milestone: Phase 5 M4 — API contract & consistency review
+## 11. Current Milestone: Phase 5 M5 — API architecture & production hardening
 
 **Phase 5 — Workflow Authoring API.** Complete and harden the HTTP layer over
 the Phase 4 foundations. Phase 5 ends with a complete, tested, documented
@@ -816,8 +816,8 @@ live in [roadmap.md](roadmap.md) §2; this section records where they stand.
 | M1 | API contracts & schemas | ✅ `3649719` |
 | M2 | Workflow authoring HTTP API | ✅ `01f0e3e` |
 | M3 | API boundary hardening | ✅ `e3c1cbb` |
-| **M4** | **API contract & consistency review** | **← current, not started** |
-| M5 | API architecture & production hardening | not started |
+| M4 | API contract & consistency review | ✅ `2026-08-10` |
+| **M5** | **API architecture & production hardening** | **← current, not started** |
 | M6 | Phase 5 final verification & documentation | not started |
 
 Phase 5 began by closing the HTTP gap Phase 4 deliberately left open, rather than
@@ -845,16 +845,17 @@ by starting the execution engine.
   foreign keys guarantee it, but the only producer of a dangling edge is an HTTP
   payload. Also corrected `architecture.md`, whose diagram still claimed the
   workflow routes did not exist.
+- **M4 ✅ (2026-08-10)** — contract review. Eleven of twelve checklist items were
+  already correct and gained regression tests rather than code. The twelfth was
+  a real gap: the generated OpenAPI schema declared only the success code and
+  `422`, so a client generated from it could not know a 404 or 409 was possible;
+  the responses §8 defines are now declared. Twenty-six tests added, the most
+  important being that **`can_publish` agrees with what `publish` actually
+  does** — the flag and the rule had been asserted in separate files against
+  separate fixtures, so they could have drifted apart silently.
 
 ### What remains in Phase 5
 
-- **M4 — API contract & consistency review.** Review the whole authoring API
-  against the frozen contracts: status-code semantics, required versus optional
-  fields, `None` versus omitted, pagination bounds, revision and version
-  handling, wire representation, internal-id leakage, list versus detail shape,
-  draft and version behaviour, and the generated OpenAPI schema. **Primarily
-  review and tests** — add functionality only where the contract is genuinely
-  unmet.
 - **M5 — API architecture & production hardening.** Make
   `routes → dependencies → WorkflowService → repositories/domain` enforceable
   rather than merely observed, and decide on evidence whether an automated
