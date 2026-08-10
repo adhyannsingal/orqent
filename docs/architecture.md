@@ -190,11 +190,11 @@ Validation pipeline        validate_graph(graph, registry) -> ValidationReport
 
 ---
 
-## 11. Execution architecture **[Planned — nothing implemented]**
+## 11. Execution architecture **[Planned — Phase 6, nothing implemented]**
 
 **No execution code exists.** `app.domain.engine` is a docstring-only stub, and `infrastructure/{queue,worker}` likewise.
 
-The design (`ADR-019`): a **reentrant scheduler over persisted state**, not a program that runs a workflow to completion. Every state transition is committed before it is acted on; the unit of dispatch is the node execution, not the run; and a runner may return `Suspended(resume_token)` to park a run indefinitely at no cost. The `Suspended` result type already exists in `domain/nodes/result.py` precisely because retrofitting suspension later would mean rewriting the engine and every runner. Control flow (`ADR-018`, `ADR-028`) arrives in Phase 6; the queue (`ADR-015`) in Phase 7. `ADR-007`'s linear-workflow model is **superseded**.
+The design (`ADR-019`): a **reentrant scheduler over persisted state**, not a program that runs a workflow to completion. Every state transition is committed before it is acted on; the unit of dispatch is the node execution, not the run; and a runner may return `Suspended(resume_token)` to park a run indefinitely at no cost. The `Suspended` result type already exists in `domain/nodes/result.py` precisely because retrofitting suspension later would mean rewriting the engine and every runner. Control flow (`ADR-018`, `ADR-028`) arrives in Phase 7; the queue (`ADR-015`) in Phase 8. (Those ADRs say 6 and 7 — they predate the 2026-08-10 renumbering; see [roadmap.md](roadmap.md) §1.) `ADR-007`'s linear-workflow model is **superseded**.
 
 ---
 

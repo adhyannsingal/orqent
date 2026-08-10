@@ -8,7 +8,7 @@ Last Updated:   2026-08-10
 Status:         Healthy — the workflow authoring API is usable over HTTP end to end,
                 995 tests passing, all quality gates green, migrations 0001–0004
                 applied (Phase 5 has needed none). Still no execution of any kind.
-Next Milestone: Phase 5 M4 — not yet scoped
+Next Milestone: Phase 5 M4 — API contract & consistency review
 ```
 
 This is the project's **living status document** — the single source of truth for
@@ -653,12 +653,12 @@ database design document.
 - ~~Phase 3: `refresh_tokens`~~ — **done** (migration `0002`).
 - ~~Phase 4: `workflows`, `workflow_versions`, `workflow_nodes`,
   `workflow_edges`~~ — **done** (migration `0004`).
-- Phase 5 (execution): `node_executions` and `run_events` are named by ADR-023
+- Phase 6 (execution): `node_executions` and `run_events` are named by ADR-023
   and `phase-4-implementation-spec.md` §6; the full set is designed in Phase 5,
   not here.
-- Phase 7 (queue): `queue_tasks`, carrying `organization_id` for weighted
+- Phase 8 (queue): `queue_tasks`, carrying `organization_id` for weighted
   selection (ADR-030).
-- Phase 10 (connections): `connections`, under envelope encryption (ADR-027).
+- Phase 11 (connections): `connections`, under envelope encryption (ADR-027).
 - Later phases (AI node, memory) reuse the table names in the pre-redesign
   roadmap; they are **not** re-planned here and none of them exists.
 
@@ -760,51 +760,65 @@ execution engine (Phase 8) is tested against a **mock `AgentRunner`**.
 
 ## 10. Remaining Roadmap
 
-> **Renumbered 2026-07-29** by the workflow-platform redesign. The pre-redesign
-> phase list (agents → providers → prompts → linear workflows) is retained in
-> [roadmap.md](roadmap.md) for history and is **not** the plan being executed.
-> ADR-018 … ADR-032 are authoritative.
+> **Renumbered twice.** The 2026-07-29 redesign replaced the agent-centric plan
+> (retained in [roadmap.md](roadmap.md) §4 for history). On **2026-08-10** the
+> workflow authoring API became Phase 5 in its own right, shifting what were
+> Phases 5–13 up by one. **ADRs and the frozen Phase 4 specification predate
+> that shift and have not been rewritten** — where they name a phase from 5
+> upward, add one. See the renumbering note in [roadmap.md](roadmap.md) §1.
+>
+> [roadmap.md](roadmap.md) §§1–3 is the authoritative forward-looking plan,
+> including the Phase 5 milestone breakdown. This section records status.
 
 - [x] **Phase 1 — Foundation** ✅
 - [x] **Phase 2 — Database infrastructure + migration `0001`** ✅
 - [x] **Phase 3 — Authentication & tenancy** ✅ (3A + 3B, migrations `0002`–`0003`)
-- [x] **Phase 4 — Workflow authoring, node contract & graph validation** ✅
-  (M1–M11, migration `0004`) · see §6
-- [ ] **Phase 5 — Durable execution core** · *Objective:* reentrant scheduler
+- [x] **Phase 4 — Workflow authoring core** ✅ (M1–M11, migration `0004`) · see §6
+- [ ] **Phase 5 — Workflow Authoring API** · **in progress.** The HTTP layer over
+  the Phase 4 foundations. **M1–M3 complete** (`3649719`, `01f0e3e`, `e3c1cbb`);
+  **M4–M6 open** — contract review, architecture hardening, final verification.
+  Milestone detail in [roadmap.md](roadmap.md) §2.
+- [ ] **Phase 6 — Durable execution core** *(was Phase 5)* · reentrant scheduler
   over persisted state, run and node-execution state machines, event log,
-  sequential and in-process, **including suspension from day one** (ADR-019).
-  *Depends on:* 4. *Complexity:* **Highest**.
-- [ ] **Phase 6 — Control flow** · *Objective:* Condition, Merge, Loop scopes
-  (`for_each`/`while`), structural parallelism, branch pruning, join policies
-  (ADR-018, ADR-028). *Depends on:* 5. *Complexity:* **High**.
-- [ ] **Phase 7 — Queue & workers** · *Objective:* per-node dispatch, DB-backed
-  queue with `SKIP LOCKED`, reaper, concurrency limits, per-org fairness
-  (ADR-015, ADR-030). *Depends on:* 5. *Complexity:* **High**.
-- [ ] **Phase 8 — Triggers** · *Objective:* manual → webhook → schedule;
-  registration lifecycle tied to publish. *Depends on:* 5. *Complexity:*
-  **Medium**.
-- [ ] **Phase 9 — Human-in-the-loop** · *Objective:* approval node, inbox API,
-  authorization, timeouts/escalation. *Depends on:* 5. *Complexity:* **Medium**.
-- [ ] **Phase 10 — Connections + I/O nodes** · *Objective:* encrypted
-  connections (ADR-027); HTTP, Email, Database, File nodes behind the egress
-  policy (ADR-029). *Depends on:* 5. *Complexity:* **High (security)**.
-- [ ] **Phase 11 — AI Agent node** · *Objective:* `ai.agent@1` as an ordinary
-  data node; `AgentRunner` port + LangChain adapter (ADR-013); provider
-  configuration and credentials. *Depends on:* 5, 10. *Complexity:* **Medium**.
-- [ ] **Phase 12 — Memory / RAG** · *Objective:* Chroma-backed retrieval for
-  the agent node (ADR-003). *Depends on:* 11. *Complexity:* **Medium-High**.
-- [ ] **Phase 13 — Observability, quotas, retention** · *Objective:* metrics,
-  audit, purge jobs, SSE streaming. *Depends on:* all prior. *Complexity:*
-  **Medium**.
+  **including suspension from day one** (ADR-019). *Complexity:* **Highest**.
+- [ ] **Phase 7 — Control flow** *(was 6)* · Condition, Merge, Loop scopes,
+  structural parallelism, branch pruning, join policies (ADR-018, ADR-028).
+- [ ] **Phase 8 — Queue & workers** *(was 7)* · per-node dispatch, DB-backed
+  queue with `SKIP LOCKED`, reaper, per-org fairness (ADR-015, ADR-030).
+- [ ] **Phase 9 — Triggers** *(was 8)* · manual → webhook → schedule;
+  registration lifecycle tied to publish.
+- [ ] **Phase 10 — Human-in-the-loop** *(was 9)* · approval node, inbox API,
+  timeouts and escalation.
+- [ ] **Phase 11 — Connections + I/O nodes** *(was 10)* · encrypted connections
+  (ADR-027); HTTP, Email, Database, File nodes behind the egress policy
+  (ADR-029).
+- [ ] **Phase 12 — AI Agent node** *(was 11)* · `ai.agent@1` as an ordinary data
+  node; `AgentRunner` port + LangChain adapter (ADR-013); provider credentials.
+- [ ] **Phase 13 — Memory / RAG** *(was 12)* · Chroma-backed retrieval (ADR-003).
+- [ ] **Phase 14 — Observability, quotas, retention** *(was 13)* · metrics,
+  audit, purge jobs, SSE streaming.
 
-**Still open inside Phase 4:** milestones **M12** (workflow HTTP API) and **M13**
-(documentation sign-off) from `phase-4-implementation-spec.md` have **not** been
-implemented. Phase 4's domain, persistence, and service layers are complete; its
-HTTP surface is not.
+**Nothing from Phase 6 onward exists.** No scheduler, run, node execution,
+worker, queue, trigger, connection, or provider integration is present in
+`src/app/`.
 
 ---
 
-## 11. Current Milestone: Phase 5 — Workflow authoring API (M1–M3 complete)
+## 11. Current Milestone: Phase 5 M4 — API contract & consistency review
+
+**Phase 5 — Workflow Authoring API.** Complete and harden the HTTP layer over
+the Phase 4 foundations. Phase 5 ends with a complete, tested, documented
+authoring API and **does not implement execution**. Full milestone definitions
+live in [roadmap.md](roadmap.md) §2; this section records where they stand.
+
+| Milestone | | Status |
+|---|---|---|
+| M1 | API contracts & schemas | ✅ `3649719` |
+| M2 | Workflow authoring HTTP API | ✅ `01f0e3e` |
+| M3 | API boundary hardening | ✅ `e3c1cbb` |
+| **M4** | **API contract & consistency review** | **← current, not started** |
+| M5 | API architecture & production hardening | not started |
+| M6 | Phase 5 final verification & documentation | not started |
 
 Phase 5 began by closing the HTTP gap Phase 4 deliberately left open, rather than
 by starting the execution engine.
@@ -832,7 +846,23 @@ by starting the execution engine.
   payload. Also corrected `architecture.md`, whose diagram still claimed the
   workflow routes did not exist.
 
-**Still nothing in the execution phase exists.** No file under `src/app/`
+### What remains in Phase 5
+
+- **M4 — API contract & consistency review.** Review the whole authoring API
+  against the frozen contracts: status-code semantics, required versus optional
+  fields, `None` versus omitted, pagination bounds, revision and version
+  handling, wire representation, internal-id leakage, list versus detail shape,
+  draft and version behaviour, and the generated OpenAPI schema. **Primarily
+  review and tests** — add functionality only where the contract is genuinely
+  unmet.
+- **M5 — API architecture & production hardening.** Make
+  `routes → dependencies → WorkflowService → repositories/domain` enforceable
+  rather than merely observed, and decide on evidence whether an automated
+  architecture or import-linter check is justified.
+- **M6 — Phase 5 final verification & documentation.** All gates, both suites,
+  OpenAPI, migration verification; declare Phase 5 complete only once green.
+
+**Still nothing from Phase 6 onward exists.** No file under `src/app/`
 implements a scheduler, a run, a node execution, a worker, or a queue.
 
 ### What the authoring stack leaves ready to build on
@@ -850,14 +880,14 @@ later service copies.
 
 | Not built | Where it belongs |
 |---|---|
-| Workflow execution of any kind | Phase 5 |
-| Run / node-execution records and the event log | Phase 5 |
-| Queues, workers, dispatch | Phase 7 |
-| Scheduling and triggers | Phase 8 |
-| LangChain integration | Phase 11 (ADR-013) |
-| `AgentRunner` implementation | Phase 11 |
-| LLM / provider integrations | Phase 11 |
-| API keys and provider credentials | Phases 10–11 (ADR-027) |
+| Workflow execution of any kind | Phase 6 |
+| Run / node-execution records and the event log | Phase 6 |
+| Queues, workers, dispatch | Phase 8 |
+| Scheduling and triggers | Phase 9 |
+| LangChain integration | Phase 12 (ADR-013) |
+| `AgentRunner` implementation | Phase 12 |
+| LLM / provider integrations | Phase 12 |
+| API keys and provider credentials | Phases 11–12 (ADR-027) |
 | Frontend workflow editor | Out of scope for this repository |
 
 The `domain/engine` and `infrastructure/{llm,vector,queue,worker,tools}` packages
