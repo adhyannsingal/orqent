@@ -257,6 +257,66 @@ async def test_a_stale_save_leaves_the_stored_graph_intact(client: AsyncClient) 
     assert [n["key"] for n in nodes] == ["trigger_1", "noop_1", "log_1"]
 
 
+async def test_a_dangling_edge_is_422_not_500(client: AsyncClient) -> None:
+    """The M3 regression.
+
+    M1 deliberately let the schema pass an edge naming an undeclared node, and
+    M2 then wired a path where nothing else caught it: ``replace_graph``
+    resolved node keys to ids, missed, and raised ``KeyError`` — a malformed
+    client payload arriving as an unhandled 500. It is now refused at the edge.
+    """
+
+    workflow_id = await _create(client)
+    revision = (await client.get(f"/api/v1/workflows/{workflow_id}/draft")).json()["revision"]
+
+    response = await client.put(
+        f"/api/v1/workflows/{workflow_id}/draft",
+        json={
+            "revision": revision,
+            "nodes": [_node("trigger_1", "trigger.manual", x=0, y=0)],
+            "edges": [
+                {
+                    "source": "trigger_1",
+                    "source_handle": "main",
+                    "target": "nowhere",
+                    "target_handle": "main",
+                }
+            ],
+        },
+    )
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "validation_error"
+
+
+async def test_a_rejected_dangling_edge_leaves_the_draft_untouched(
+    client: AsyncClient,
+) -> None:
+    workflow_id = await _create(client)
+    revision = (await client.get(f"/api/v1/workflows/{workflow_id}/draft")).json()["revision"]
+    await client.put(f"/api/v1/workflows/{workflow_id}/draft", json=_valid_graph(revision))
+
+    await client.put(
+        f"/api/v1/workflows/{workflow_id}/draft",
+        json={
+            "revision": revision + 1,
+            "nodes": [_node("a", "core.noop", x=0, y=0)],
+            "edges": [
+                {
+                    "source": "a",
+                    "source_handle": "main",
+                    "target": "ghost",
+                    "target_handle": "main",
+                }
+            ],
+        },
+    )
+
+    draft = (await client.get(f"/api/v1/workflows/{workflow_id}/draft")).json()
+    assert [n["key"] for n in draft["nodes"]] == ["trigger_1", "noop_1", "log_1"]
+    assert draft["revision"] == revision + 1
+
+
 async def test_a_duplicate_name_is_409(client: AsyncClient) -> None:
     await _create(client, "Nightly report")
 

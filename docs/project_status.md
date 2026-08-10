@@ -3,12 +3,12 @@
 ```
 Project:        Orqent — Visual Workflow Automation Platform (backend)
 Version:        0.1.0
-Current Phase:  Phase 5 — Workflow authoring API ✅ M1–M2 complete
+Current Phase:  Phase 5 — Workflow authoring API ✅ M1–M3 complete
 Last Updated:   2026-08-10
 Status:         Healthy — the workflow authoring API is usable over HTTP end to end,
-                988 tests passing, all quality gates green, migrations 0001–0004
-                applied (M2 needed none). Still no execution of any kind.
-Next Milestone: Phase 5 M3 — not yet scoped
+                995 tests passing, all quality gates green, migrations 0001–0004
+                applied (Phase 5 has needed none). Still no execution of any kind.
+Next Milestone: Phase 5 M4 — not yet scoped
 ```
 
 This is the project's **living status document** — the single source of truth for
@@ -730,13 +730,13 @@ until Phase 3+).
 
 Three gates; all must pass before any commit, and every phase ends green.
 
-- **pytest** — two suites. The **default** run (`pytest`, 844 tests) needs no
+- **pytest** — two suites. The **default** run (`pytest`, 849 tests) needs no
   external services and finishes in a couple of seconds. The **integration**
-  suite (`pytest -m integration`, 144 tests) needs a migrated MySQL and is
+  suite (`pytest -m integration`, 146 tests) needs a migrated MySQL and is
   deselected by default; it covers what only a real database can answer —
   generated columns, cascades, driver timezone behaviour, `FOR UPDATE` locking,
   the seeded role catalog, tenant isolation, and the workflow lifecycle
-  end to end. Full run: `pytest -m ""` (988).
+  end to end. Full run: `pytest -m ""` (995).
   The suite deliberately needs **no external services**: model metadata is
   asserted structurally (table set, constraint/index names, cascade rules,
   generated column, `CHAR(26)`), the Unit of Work runs against in-memory
@@ -804,7 +804,7 @@ HTTP surface is not.
 
 ---
 
-## 11. Current Milestone: Phase 5 — Workflow authoring API (M1–M2 complete)
+## 11. Current Milestone: Phase 5 — Workflow authoring API (M1–M3 complete)
 
 Phase 5 began by closing the HTTP gap Phase 4 deliberately left open, rather than
 by starting the execution engine.
@@ -822,6 +822,15 @@ by starting the execution engine.
   of workflows costs three queries rather than one per row. `nodes[].ui` is read
   through `list_nodes`, the path M11 added for it; `can_publish` is the service's
   own answer to §1.6i, stated once and shared by the check and the flag.
+- **M3 ✅ (2026-08-10)** — hardening. An edge naming a node the payload does not
+  declare reached `replace_graph`'s key resolution and raised `KeyError`, so a
+  malformed request arrived as an unhandled **500**; it is now refused by the
+  request schema as **422**, beside the two sibling preconditions §6.2 already
+  puts there. This reversed an M1 decision that had left the rule to
+  `WorkflowGraph` alone — correct for graphs loaded from the database, where
+  foreign keys guarantee it, but the only producer of a dangling edge is an HTTP
+  payload. Also corrected `architecture.md`, whose diagram still claimed the
+  workflow routes did not exist.
 
 **Still nothing in the execution phase exists.** No file under `src/app/`
 implements a scheduler, a run, a node execution, a worker, or a queue.

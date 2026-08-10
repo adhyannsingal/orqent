@@ -158,13 +158,14 @@ Repositories are the **only** code that talks to MySQL, one per aggregate, retur
 
 ---
 
-## 10a. Workflow authoring architecture **[Implemented — Phase 4]**
+## 10a. Workflow authoring architecture **[Implemented — Phase 4 + Phase 5 M1–M3]**
 
-The authoring stack as it exists today. Note the top layer: **there is no workflow HTTP API yet** (Phase 4 M12, specified but not implemented), so `WorkflowService` currently has no HTTP caller.
+The authoring stack as it exists today, complete from HTTP down to MySQL.
 
 ```
-API layer                  [workflow routes NOT implemented]
-        |
+API layer                  11 endpoints under /api/v1/workflows (Phase 5 M2)
+        |                  thin: no SQL, no policy, no error handling —
+        |                  AppError -> status is centralised
 WorkflowService            lifecycle, publish, authorization   (Phase 4 M11)
         |
 Repositories               Workflow / WorkflowVersion          (Phase 4 M10)
@@ -184,6 +185,8 @@ Validation pipeline        validate_graph(graph, registry) -> ValidationReport
 ```
 
 `WorkflowService` is the only place the two meet: it loads a graph through a repository and hands it to `validate_graph`. Nothing in `app.domain.graph` or `app.domain.nodes` imports SQLAlchemy, FastAPI, a driver, or any other app layer.
+
+**Where a bad payload is refused.** The three states that could never describe a graph — a repeated node key, a repeated connection, and an edge naming a node the payload does not declare — are rejected by the request schema, before any transaction opens (§6.2). `WorkflowGraph`'s constructor states the same rules for anything built inside the domain, and the database's unique indexes state two of them again. Everything a graph must satisfy *beyond* being well-formed — types, arity, required inputs, configuration, structure — is the validation pipeline's, and surfaces as issues a user can act on rather than as a refused request.
 
 ---
 

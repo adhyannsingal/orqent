@@ -515,6 +515,19 @@ def test_a_stale_revision_is_409(
         ({"revision": 0}, "revision below one"),
         ({"nodes": [{**GRAPH_PAYLOAD["nodes"][0], "key": "Bad-Key"}]}, "bad node key"),  # type: ignore[index]
         ({"nodes": list(GRAPH_PAYLOAD["nodes"]) * 2}, "duplicate node key"),
+        (
+            {
+                "edges": [
+                    {
+                        "source": "trigger_1",
+                        "source_handle": "main",
+                        "target": "nowhere",
+                        "target_handle": "main",
+                    }
+                ]
+            },
+            "edge naming an undeclared node",
+        ),
     ],
 )
 def test_an_invalid_graph_payload_is_422(
@@ -527,6 +540,32 @@ def test_an_invalid_graph_payload_is_422(
     )
 
     assert response.status_code == 422
+
+
+def test_a_dangling_edge_never_reaches_the_service(
+    client: TestClient, member: dict[str, str], service: FakeWorkflowService
+) -> None:
+    """It is refused at the edge, so no transaction is opened for it."""
+
+    response = client.put(
+        f"/api/v1/workflows/{WORKFLOW_ID}/draft",
+        json=GRAPH_PAYLOAD
+        | {
+            "edges": [
+                {
+                    "source": "trigger_1",
+                    "source_handle": "main",
+                    "target": "nowhere",
+                    "target_handle": "main",
+                }
+            ]
+        },
+        headers=member,
+    )
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "validation_error"
+    assert service.calls == []
 
 
 def test_a_member_may_edit_but_not_delete(client: TestClient, member: dict[str, str]) -> None:

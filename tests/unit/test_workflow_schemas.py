@@ -426,15 +426,48 @@ def test_parallel_edges_on_different_handles_are_accepted() -> None:
     assert len(request.edges) == 2
 
 
-def test_an_edge_naming_an_undeclared_node_is_not_refused_here() -> None:
-    """Deliberate: that is `WorkflowGraph`'s constructor precondition, not the
-    schema's, and re-checking it here would put the rule in two places."""
+def test_an_edge_naming_an_undeclared_target_is_refused() -> None:
+    """Reversed in M3, and the reversal is the point.
+
+    M1 left this to ``WorkflowGraph``'s constructor. But a graph loaded from the
+    database cannot break the rule — foreign keys already guarantee it — so the
+    only producer of a dangling edge is an HTTP payload, and nothing downstream
+    caught it: ``replace_graph`` raised ``KeyError`` and the request became a
+    500. §6.2 assigns the rejection to the API layer for exactly this reason.
+    """
+
+    with pytest.raises(ValidationError, match="not a node in this graph"):
+        GraphRequest.model_validate(
+            {"revision": 1, "nodes": [_node("a")], "edges": [_edge("a", "nowhere")]}
+        )
+
+
+def test_an_edge_naming_an_undeclared_source_is_refused() -> None:
+    with pytest.raises(ValidationError, match="not a node in this graph"):
+        GraphRequest.model_validate(
+            {"revision": 1, "nodes": [_node("b")], "edges": [_edge("nowhere", "b")]}
+        )
+
+
+def test_the_offending_endpoint_is_named_in_the_error() -> None:
+    with pytest.raises(ValidationError, match="'ghost'"):
+        GraphRequest.model_validate(
+            {"revision": 1, "nodes": [_node("a")], "edges": [_edge("a", "ghost")]}
+        )
+
+
+def test_edges_between_declared_nodes_are_still_accepted() -> None:
+    """The guard must not reject a graph that is merely large or self-joined."""
 
     request = GraphRequest.model_validate(
-        {"revision": 1, "nodes": [_node("a")], "edges": [_edge("a", "nowhere")]}
+        {
+            "revision": 1,
+            "nodes": [_node("a"), _node("b")],
+            "edges": [_edge("a", "b"), _edge("b", "a", source_handle="back")],
+        }
     )
 
-    assert request.edges[0].target == "nowhere"
+    assert len(request.edges) == 2
 
 
 # --- Graph response -----------------------------------------------------------

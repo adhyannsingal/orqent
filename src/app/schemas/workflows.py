@@ -207,15 +207,27 @@ class GraphRequest(BaseModel):
     edges: list[GraphEdgeRequest] = Field(default_factory=list)
 
     @model_validator(mode="after")
-    def _reject_duplicates(self) -> GraphRequest:
-        """Refuse repeated node keys and repeated connections.
+    def _reject_impossible_graphs(self) -> GraphRequest:
+        """Refuse the three payloads that could never describe a graph (§6.2).
 
-        Both are enforced three times over — here, by ``WorkflowGraph``'s
-        constructor, and by a unique index — because a silently de-duplicated
-        key would corrupt the edge list that references it, and a duplicated
-        edge is not inert: it inflates the inbound count a handle's arity is
-        checked against, and would make a ``join: all`` handle wait forever for
-        a second arrival that can never come (§6.2).
+        Repeated node keys, repeated connections, and edges naming a node the
+        payload does not declare. These are **impossible states rather than
+        invalid workflows**: no amount of editing the canvas produces them, and
+        none of them is something a validation issue could ask a user to fix.
+        They are refused here, before any database work, and reported as 422.
+
+        A duplicate key would corrupt the edge list that references it. A
+        duplicated edge is not inert — it inflates the inbound count a handle's
+        arity is checked against, and would make a ``join: all`` handle wait
+        forever for a second arrival that can never come.
+
+        The dangling edge is the reason this validator is named for graphs
+        rather than duplicates. ``WorkflowGraph``'s constructor states the same
+        rule, but a graph loaded from the database cannot break it — foreign
+        keys already guarantee it — so the only producer of a dangling edge is
+        an HTTP payload, and §6.2 puts the rejection here for exactly that
+        reason. Without it the key resolution inside ``replace_graph`` raises a
+        ``KeyError`` and a malformed request becomes a 500.
         """
 
         keys = [node.key for node in self.nodes]
@@ -231,6 +243,16 @@ class GraphRequest(BaseModel):
             raise ValueError(
                 f"Duplicate edge: {source}.{source_handle} -> {target}.{target_handle}"
             )
+
+        declared = set(keys)
+        for edge in self.edges:
+            for end, key in (("source", edge.source), ("target", edge.target)):
+                if key not in declared:
+                    raise ValueError(
+                        f"Edge {end} {key!r} is not a node in this graph: "
+                        f"{edge.source}.{edge.source_handle} -> "
+                        f"{edge.target}.{edge.target_handle}"
+                    )
         return self
 
 
