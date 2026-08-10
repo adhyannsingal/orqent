@@ -3,13 +3,20 @@
 ```
 Project:        Orqent — Visual Workflow Automation Platform (backend)
 Version:        0.1.0
-Current Phase:  Phase 4 — Workflow authoring, node contract & graph validation ✅ complete (M1–M11)
-Last Updated:   2026-08-08
-Status:         Healthy — workflow authoring complete through the service layer, 848 tests
-                passing, all quality gates green, migrations 0001–0004 applied.
-                No HTTP API for workflows yet, and no execution of any kind.
-Next Milestone: Phase 5 (Durable execution core) — NOT STARTED
+Current Phase:  Phase 5 — Workflow Authoring API 🟡 in progress (M1–M3 complete, M4–M6 not started)
+Last Updated:   2026-08-10
+Status:         Healthy — Phase 4 complete (authoring domain, persistence, service layer,
+                migrations 0001–0004 applied). Phase 5 has shipped the workflow HTTP API
+                through M3 on the `phase-5` branch, not yet merged to `main`.
+                No execution of any kind exists.
+Next Milestone: Phase 5 M4 — API contract & consistency review — NOT STARTED
 ```
+
+> **Phase renumbering (2026-08-10).** Phase 5 is the **Workflow Authoring API**;
+> execution begins at **Phase 6**. Where a document written before this date
+> names a phase number 5 or higher, add one. ADR prose and the frozen Phase 4
+> specification are deliberately left unedited — see
+> [roadmap.md §1](roadmap.md#mapping-note) for the mapping rule and the reasoning.
 
 This is the project's **living status document** — the single source of truth for
 where the project stands. It must be updated after every completed phase. It
@@ -46,14 +53,14 @@ execution engine would not change.
 > linear-workflow restriction that used to head this list (ADR-007, superseded).
 
 - Workflows are an **acyclic typed node graph**, authored and validated before
-  anything runs. Loops arrive as container scopes in Phase 6, never as back-edges.
+  anything runs. Loops arrive as container scopes in Phase 7, never as back-edges.
 - One organization per user; email globally unique.
 - Async execution via a durable DB-backed queue — **designed, not built** (Phases
-  5 and 7).
+  6 and 8).
 - AI is one built-in node type among many; real providers and LangChain arrive in
-  Phase 11.
+  Phase 12.
 - MySQL as the system of record; ChromaDB strictly as a derived, rebuildable
-  vector index (Phase 12, currently unused).
+  vector index (Phase 13, currently unused).
 
 ### Long-term roadmap (post-V1, direction agreed, not designed in detail)
 
@@ -145,9 +152,9 @@ single-concern module. Anything that needs "and" to describe must be split.
 | `TokenService` | Issue/verify tokens | `JwtTokenService` (HS256) | **Implemented** |
 | `NodeRegistry` | Resolve `(type, version)` → descriptor / runner | `InMemoryNodeRegistry` | **Implemented** (Phase 4) |
 | `NodeRunner` | Execute one node | four built-in runners | **Implemented** (Phase 4; nothing calls them yet) |
-| `AgentRunner` | Execute one AI agent step | `LangChainAgentRunner` | Planned (Phase 11) |
-| `TaskQueue` | Durable async hand-off | DB-backed in-process → Celery | Planned (Phase 7) |
-| `VectorStore` | Vector upsert/query | Chroma adapter | Planned (Phase 12) |
+| `AgentRunner` | Execute one AI agent step | `LangChainAgentRunner` | Planned (Phase 12) |
+| `TaskQueue` | Durable async hand-off | DB-backed in-process → Celery | Planned (Phase 8) |
+| `VectorStore` | Vector upsert/query | Chroma adapter | Planned (Phase 13) |
 
 ### Unit of Work & Repository pattern
 
@@ -279,9 +286,11 @@ orqent/
 │   │   │                   # errors (domain→ErrorResponse envelope),
 │   │   │                   # security (bearer scheme, get_current_user, require_roles)
 │   │   └── v1/             # api_v1_router; routes/{health,auth,node_types}.py
-│   │                       # — NO workflow routes yet (Phase 4 M12, not started)
+│   │                       # — routes/workflows.py exists on the `phase-5` branch
+│   │                       #   (Phase 5 M2), not yet merged to `main`
 │   ├── schemas/            # Pydantic request/response models (health, common, auth,
-│   │                       # node_types) — NO workflow schemas yet
+│   │                       # node_types) — schemas/workflows.py likewise lands
+│   │                       # with Phase 5 M1 on the `phase-5` branch
 │   ├── domain/             # PURE: errors.py (exception hierarchy),
 │   │   │                   # ports/{unit_of_work,password_hasher,token_service},
 │   │   │                   # value_objects/{token,authenticated_user,token_pair},
@@ -289,7 +298,7 @@ orqent/
 │   │   │                   # result (Completed/Suspended/Failed), runner, registry port
 │   │   ├── graph/          # model (GraphNode/GraphEdge/WorkflowGraph), issues,
 │   │   │                   # validation/{structure,handles,config,__init__}
-│   │   └── engine/         # docstring-only stub (Phase 5)
+│   │   └── engine/         # docstring-only stub (Phase 6)
 │   ├── services/           # auth_service; workflow_service (lifecycle, publish)
 │   └── infrastructure/
 │       ├── db/             # base, naming, identifiers (ULID), engine, session,
@@ -303,10 +312,10 @@ orqent/
 │       │                   # core_constant, core_noop, core_log}
 │       ├── repositories/   # user, organization, role, refresh_token,
 │       │                   # workflow, workflow_version
-│       ├── llm/            # stub   (Phase 11 — the ONLY future LangChain import site)
-│       ├── vector/         # stub   (Phase 12)
-│       ├── queue/          # stub   (Phase 7)
-│       ├── worker/         # stub   (Phase 7)
+│       ├── llm/            # stub   (Phase 12 — the ONLY future LangChain import site)
+│       ├── vector/         # stub   (Phase 13)
+│       ├── queue/          # stub   (Phase 8)
+│       ├── worker/         # stub   (Phase 8)
 │       └── tools/          # stub   (future)
 └── tests/
     ├── conftest.py         # settings/app/client fixtures
@@ -654,12 +663,13 @@ database design document.
 - ~~Phase 3: `refresh_tokens`~~ — **done** (migration `0002`).
 - ~~Phase 4: `workflows`, `workflow_versions`, `workflow_nodes`,
   `workflow_edges`~~ — **done** (migration `0004`).
-- Phase 5 (execution): `node_executions` and `run_events` are named by ADR-023
-  and `phase-4-implementation-spec.md` §6; the full set is designed in Phase 5,
-  not here.
-- Phase 7 (queue): `queue_tasks`, carrying `organization_id` for weighted
+- Phase 6 (execution): `node_executions` and `run_events` are named by ADR-023
+  and `phase-4-implementation-spec.md` §6; the full set is designed in Phase 6,
+  not here. **Phase 5 adds no tables** — the authoring API is HTTP over the
+  Phase 4 schema.
+- Phase 8 (queue): `queue_tasks`, carrying `organization_id` for weighted
   selection (ADR-030).
-- Phase 10 (connections): `connections`, under envelope encryption (ADR-027).
+- Phase 11 (connections): `connections`, under envelope encryption (ADR-027).
 - Later phases (AI node, memory) reuse the table names in the pre-redesign
   roadmap; they are **not** re-planned here and none of them exists.
 
@@ -673,7 +683,7 @@ is Future via a `memberships` join table.
 
 `workflow_versions` are **immutable once published** — a published version is
 never edited; the first edit after a publish creates a draft copy-on-write, and
-runs (from Phase 5) will pin the exact version they ran (ADR-026). Circular FKs
+runs (from Phase 6) will pin the exact version they ran (ADR-026). Circular FKs
 (`active_version_id`) are handled with `ALTER` back-fills in migrations —
 migration `0004` does exactly this.
 
@@ -694,7 +704,7 @@ Charset/collation (`utf8mb4`) must be pinned explicitly in migration `0001`.
 |---------|-------|-------|---------|
 | `api` | built from `Dockerfile` | 8000→8000 | FastAPI app (uvicorn, non-root `appuser`) |
 | `mysql` | `mysql:8.0` | 3306→3306 | System of record; db/user/password `app`, volume `mysql_data` |
-| `chroma` | `chromadb/chroma:latest` | **8001**→8000 | Vector store (provisioned early; unused until Phase 10), volume `chroma_data` |
+| `chroma` | `chromadb/chroma:latest` | **8001**→8000 | Vector store (provisioned early; unused until Phase 13), volume `chroma_data` |
 
 Networking is compose-default: services address each other by name
 (`mysql:3306`, `chroma:8000`); the API receives
@@ -755,60 +765,107 @@ Run locally from the project venv: `.venv/bin/pytest`, `.venv/bin/mypy src`,
 
 Testing policy for future phases: new models get metadata tests; services and
 repositories get behaviour tests against a test DB with faked ports; the
-execution engine (Phase 8) is tested against a **mock `AgentRunner`**.
+execution engine (Phase 6) is tested against a **mock `AgentRunner`**.
 
 ---
 
 ## 10. Remaining Roadmap
 
-> **Renumbered 2026-07-29** by the workflow-platform redesign. The pre-redesign
+> **Renumbered 2026-07-29** by the workflow-platform redesign, and **again on
+> 2026-08-10** to seat the Workflow Authoring API at Phase 5. The pre-redesign
 > phase list (agents → providers → prompts → linear workflows) is retained in
 > [roadmap.md](roadmap.md) for history and is **not** the plan being executed.
-> ADR-018 … ADR-032 are authoritative.
+> ADR-018 … ADR-032 are authoritative; read their phase numbers through the
+> [mapping rule](roadmap.md#mapping-note) (≥ 5 → add one).
 
 - [x] **Phase 1 — Foundation** ✅
 - [x] **Phase 2 — Database infrastructure + migration `0001`** ✅
 - [x] **Phase 3 — Authentication & tenancy** ✅ (3A + 3B, migrations `0002`–`0003`)
 - [x] **Phase 4 — Workflow authoring, node contract & graph validation** ✅
   (M1–M11, migration `0004`) · see §6
-- [ ] **Phase 5 — Durable execution core** · *Objective:* reentrant scheduler
+- [ ] **Phase 5 — Workflow Authoring API** 🟡 *in progress* · *Objective:*
+  complete and harden the HTTP authoring layer over Phase 4; ends with a
+  complete, tested, documented authoring API and **no execution**. M1–M3
+  complete, M4–M6 not started — see §11 and
+  [roadmap.md §3](roadmap.md#3-phase-5--workflow-authoring-api).
+  *Depends on:* 4. *Complexity:* **Medium**.
+- [ ] **Phase 6 — Durable execution core** · *Objective:* reentrant scheduler
   over persisted state, run and node-execution state machines, event log,
   sequential and in-process, **including suspension from day one** (ADR-019).
-  *Depends on:* 4. *Complexity:* **Highest**.
-- [ ] **Phase 6 — Control flow** · *Objective:* Condition, Merge, Loop scopes
+  *Depends on:* 5. *Complexity:* **Highest**.
+- [ ] **Phase 7 — Control flow** · *Objective:* Condition, Merge, Loop scopes
   (`for_each`/`while`), structural parallelism, branch pruning, join policies
-  (ADR-018, ADR-028). *Depends on:* 5. *Complexity:* **High**.
-- [ ] **Phase 7 — Queue & workers** · *Objective:* per-node dispatch, DB-backed
+  (ADR-018, ADR-028). *Depends on:* 6. *Complexity:* **High**.
+- [ ] **Phase 8 — Queue & workers** · *Objective:* per-node dispatch, DB-backed
   queue with `SKIP LOCKED`, reaper, concurrency limits, per-org fairness
-  (ADR-015, ADR-030). *Depends on:* 5. *Complexity:* **High**.
-- [ ] **Phase 8 — Triggers** · *Objective:* manual → webhook → schedule;
-  registration lifecycle tied to publish. *Depends on:* 5. *Complexity:*
+  (ADR-015, ADR-030). *Depends on:* 6. *Complexity:* **High**.
+- [ ] **Phase 9 — Triggers** · *Objective:* manual → webhook → schedule;
+  registration lifecycle tied to publish. *Depends on:* 6. *Complexity:*
   **Medium**.
-- [ ] **Phase 9 — Human-in-the-loop** · *Objective:* approval node, inbox API,
-  authorization, timeouts/escalation. *Depends on:* 5. *Complexity:* **Medium**.
-- [ ] **Phase 10 — Connections + I/O nodes** · *Objective:* encrypted
+- [ ] **Phase 10 — Human-in-the-loop** · *Objective:* approval node, inbox API,
+  authorization, timeouts/escalation. *Depends on:* 6. *Complexity:* **Medium**.
+- [ ] **Phase 11 — Connections + I/O nodes** · *Objective:* encrypted
   connections (ADR-027); HTTP, Email, Database, File nodes behind the egress
-  policy (ADR-029). *Depends on:* 5. *Complexity:* **High (security)**.
-- [ ] **Phase 11 — AI Agent node** · *Objective:* `ai.agent@1` as an ordinary
+  policy (ADR-029). *Depends on:* 6. *Complexity:* **High (security)**.
+- [ ] **Phase 12 — AI Agent node** · *Objective:* `ai.agent@1` as an ordinary
   data node; `AgentRunner` port + LangChain adapter (ADR-013); provider
-  configuration and credentials. *Depends on:* 5, 10. *Complexity:* **Medium**.
-- [ ] **Phase 12 — Memory / RAG** · *Objective:* Chroma-backed retrieval for
-  the agent node (ADR-003). *Depends on:* 11. *Complexity:* **Medium-High**.
-- [ ] **Phase 13 — Observability, quotas, retention** · *Objective:* metrics,
+  configuration and credentials. *Depends on:* 6, 11. *Complexity:* **Medium**.
+- [ ] **Phase 13 — Memory / RAG** · *Objective:* Chroma-backed retrieval for
+  the agent node (ADR-003). *Depends on:* 12. *Complexity:* **Medium-High**.
+- [ ] **Phase 14 — Observability, quotas, retention** · *Objective:* metrics,
   audit, purge jobs, SSE streaming. *Depends on:* all prior. *Complexity:*
   **Medium**.
 
-**Still open inside Phase 4:** milestones **M12** (workflow HTTP API) and **M13**
-(documentation sign-off) from `phase-4-implementation-spec.md` have **not** been
-implemented. Phase 4's domain, persistence, and service layers are complete; its
-HTTP surface is not.
+**On Phase 4's M12 and M13.** `phase-4-implementation-spec.md` (FROZEN) ends with
+**M12** (workflow HTTP API) and **M13** (documentation sign-off). Neither was
+implemented as part of Phase 4; Phase 4 closed at the service layer with M11. The
+HTTP API specified as M12 was built afterwards as **Phase 5 M1–M2**, and the
+documentation gate is now **Phase 5 M6**. The spec is not rewritten to say so —
+it is a frozen record — so treat its M12/M13 as delivered under Phase 5 numbering.
 
 ---
 
-## 11. Current Milestone: Phase 5 (Durable execution core) — NOT STARTED
+## 11. Current Milestone: Phase 5 — Workflow Authoring API 🟡 IN PROGRESS
 
-**Nothing in Phase 5 exists.** No file under `src/app/` implements a scheduler,
-a run, a node execution, a worker, or a queue.
+**Goal.** Complete and harden the HTTP authoring layer over the Phase 4
+foundations. Phase 5 ends with a **complete, tested, documented workflow
+authoring API**. **It does not implement execution.**
+
+| Milestone | Scope | Status | Commit |
+|---|---|---|---|
+| **M1** | API contracts & schemas | ✅ **COMPLETE** | `3649719` |
+| **M2** | Workflow authoring HTTP API | ✅ **COMPLETE** | `01f0e3e` |
+| **M3** | API boundary hardening | ✅ **COMPLETE** | `e3c1cbb` |
+| **M4** | API contract & consistency review | ⬜ **NOT STARTED** | — |
+| **M5** | API architecture & production hardening | ⬜ **NOT STARTED** | — |
+| **M6** | Phase 5 final verification & documentation | ⬜ **NOT STARTED** | — |
+
+**Branch state.** M1–M3 are committed on the **`phase-5` branch and are not yet
+merged into `main`**. `main` carries this plan (from 2026-08-10) but not the code:
+`main`'s `src/app/api/v1/routes/` holds `health`, `auth`, and `node_types` only.
+Both facts hold simultaneously — check out `phase-5` to see the API.
+
+M1 froze the request/response contract; M2 added the eleven routes under
+`/api/v1/workflows` (create, list, get, update, soft-delete, read draft, replace
+draft, validate draft, publish, list versions, get version) over the existing
+`WorkflowService`; M3 closed a boundary gap by rejecting dangling edges before
+they reach the service.
+
+**M4** is primarily **review and tests** — prove the shipped surface conforms to
+the frozen M1 contract, and add functionality *only* where that contract is
+genuinely unmet. **M5** covers API boundary/architecture hardening and
+production-readiness concerns **actually justified by the existing architecture
+and contracts**, not a generic checklist. **M6** is the closing verification and
+documentation gate.
+
+### What is NOT Phase 5
+
+Not Phase 5 work, and not to be pulled in as a "logical next step": the
+execution engine · runs · node execution records · execution events · queues ·
+workers · scheduling · retries/state machines · LangChain execution ·
+`AgentRunner` execution · LLM providers · provider configuration · API keys ·
+runtime tool execution · execution WebSockets · execution observability. These
+are Phases 6+ (§10). The no-scaffolding rule applies to every one of them.
 
 ### What Phase 4 leaves ready to build on
 
@@ -825,17 +882,24 @@ later service copies.
 
 | Not built | Where it belongs |
 |---|---|
-| Workflow HTTP API (`POST/GET/PUT /workflows…`, validate, publish) | Phase 4 **M12** — spec written, not implemented |
-| Workflow request/response schemas | Phase 4 **M12** |
-| Workflow execution of any kind | Phase 5 |
-| Run / node-execution records and the event log | Phase 5 |
-| Queues, workers, dispatch | Phase 7 |
-| Scheduling and triggers | Phase 8 |
-| LangChain integration | Phase 11 (ADR-013) |
-| `AgentRunner` implementation | Phase 11 |
-| LLM / provider integrations | Phase 11 |
-| API keys and provider credentials | Phases 10–11 (ADR-027) |
+| Workflow execution of any kind | Phase 6 |
+| Run / node-execution records and the event log | Phase 6 |
+| Control flow (Condition, Merge, Loop scopes) | Phase 7 |
+| Queues, workers, dispatch | Phase 8 |
+| Scheduling and triggers | Phase 9 |
+| Human-in-the-loop / approval | Phase 10 |
+| Connections and secrets | Phase 11 (ADR-027) |
+| LangChain integration | Phase 12 (ADR-013) |
+| `AgentRunner` implementation | Phase 12 |
+| LLM / provider integrations, provider configuration, API keys | Phase 12 |
+| Memory / RAG | Phase 13 (ADR-003) |
+| Execution observability, quotas, retention | Phase 14 |
 | Frontend workflow editor | Out of scope for this repository |
+
+The **workflow HTTP API and its schemas are built** (Phase 5 M1–M3) but live on
+the `phase-5` branch, not on `main` — the one entry that is neither "implemented
+on `main`" nor "not built". Everything else in the table above genuinely does not
+exist on any branch.
 
 The `domain/engine` and `infrastructure/{llm,vector,queue,worker,tools}` packages
 contain **docstrings only**. They are intent, not implementation.
@@ -853,7 +917,7 @@ Deliberate, tracked compromises:
 
 1. ~~**`/health/ready` is a stub**~~ — **RESOLVED in Phase 3B:** it now runs
    `SELECT 1` against MySQL and returns 503 when the database is unreachable.
-   Chroma and the queue join the component list in Phases 10/7.
+   Chroma and the queue join the component list in Phases 13/8.
 2. ~~**Charset/collation not pinned in model DDL**~~ — **RESOLVED in Phase 2B:**
    migration `0001` pins `utf8mb4`/`utf8mb4_0900_ai_ci` per table. (The ORM
    models still omit it, so any future table added by a new migration must pin

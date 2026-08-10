@@ -27,17 +27,41 @@ Full picture: [docs/architecture.md](docs/architecture.md).
   - **Persistence**: `workflows`, `workflow_versions`, `workflow_nodes`, `workflow_edges` + **migration `0004`**; one-draft-per-workflow and per-org name uniqueness enforced by generated columns.
   - **Repositories**: `WorkflowRepository`, `WorkflowVersionRepository` on the unit of work; every read tenant-scoped.
   - **`WorkflowService`**: create/list/get/update/soft-delete, draft copy-on-write, graph replacement, optimistic revision locking, validate, publish with resource-dependent authorization (ADR-032).
-- **Still [Planned] — do not describe any of these as existing:** the **workflow HTTP API and its request/response schemas** (Phase 4 M12, spec written but not implemented), workflow **execution** of any kind, run/node-execution records, control flow, queue/worker, scheduling and triggers, human-in-the-loop, connections and secrets, the AI agent node, LangChain, `AgentRunner`, LLM/provider integrations, API keys or provider credentials, and memory/RAG.
+- **[In progress] Phase 5 — Workflow Authoring API (M1–M3 complete, M4–M6 not started).** See the scope section below. **M1–M3 are committed on the `phase-5` branch and are not yet merged into `main`:** `main`'s `src/app/api/v1/routes/` contains `health`, `auth`, and `node_types` only, and `main` has no `schemas/workflows.py`. If you are working on `main`, the workflow API is *documented but absent*; check out `phase-5` to see it.
+- **Still [Planned] — do not describe any of these as existing:** workflow **execution** of any kind, run/node-execution records, execution events, control flow, queue/worker, scheduling and triggers, human-in-the-loop, connections and secrets, the AI agent node, LangChain, `AgentRunner`, LLM/provider integrations, API keys or provider credentials, and memory/RAG.
 - Remaining placeholder packages (`domain/engine`, `infrastructure/{llm,vector,queue,worker,tools}`) are empty or contain only a docstring describing future intent — **do not treat them as implemented.**
-- **Migrations `0001`–`0004` are applied.** Tests: **723 default + 125 integration = 848**.
+- **Migrations `0001`–`0004` are applied.** Phase 5 adds **no migrations** — it is HTTP over the Phase 4 schema. Tests on `main`: **723 default + 125 integration = 848**.
 
 Always distinguish **[Implemented] / [Planned] / [Future]** (defined in [docs/glossary.md](docs/glossary.md)). Do not describe planned features as if they exist.
 
 ---
 
+## Phase 5 — Workflow Authoring API (current phase)
+
+**Goal:** complete and harden the HTTP authoring layer over the Phase 4 foundations. Phase 5 ends with a **complete, tested, documented workflow authoring API**. **It does not implement execution.**
+
+| Milestone | Scope | Status | Commit |
+|---|---|---|---|
+| M1 | API contracts & schemas | ✅ COMPLETE | `3649719` |
+| M2 | Workflow authoring HTTP API (11 routes under `/api/v1/workflows`) | ✅ COMPLETE | `01f0e3e` |
+| M3 | API boundary hardening (dangling edges rejected at the boundary) | ✅ COMPLETE | `e3c1cbb` |
+| M4 | API contract & consistency review | ⬜ NOT STARTED | — |
+| M5 | API architecture & production hardening | ⬜ NOT STARTED | — |
+| M6 | Phase 5 final verification & documentation | ⬜ NOT STARTED | — |
+
+**M4** is primarily **review and tests**: prove the shipped surface conforms to the frozen M1 contract, and add functionality *only* where that contract is genuinely unmet — M4 is not a place to extend the API. **M5** is API boundary/architecture hardening and production-readiness work **actually justified by the existing architecture and contracts**, not a generic hardening checklist. **M6** is the closing verification/documentation gate.
+
+**What is NOT Phase 5 — do not pull any of these in merely because it is the logical next step:** execution engine · runs · node execution records · execution events · queues · workers · scheduling · retries/state machines · LangChain execution · `AgentRunner` execution · LLM providers · provider configuration · API keys · runtime tool execution · execution WebSockets · execution observability. These are Phases 6+. The standing no-scaffolding rule applies to every item: an empty `runs` table or a `TaskQueue` stub added "while we're in here" is a scope violation regardless of size.
+
+**Phase numbering (mapping note, 2026-08-10).** Phase 5 is the Workflow Authoring API; **execution begins at Phase 6**. Where a document written before 2026-08-10 names a phase number 5 or higher, **add one** — ADR-018's "Phase 6" scopes are Phase 7, ADR-032's "Phase 5" is Phase 6, and `phase-4-implementation-spec.md` is offset from §5 upward. Those documents are **deliberately not rewritten**; they record decisions taken at a point in time. Full reasoning: [docs/roadmap.md §1](docs/roadmap.md#mapping-note).
+
+The workflow HTTP API was specified as Phase 4 **M12** in the frozen Phase 4 spec, but Phase 4 closed at the service layer (M11). M12 shipped as Phase 5 M1–M2, and M13's documentation sign-off is now Phase 5 M6.
+
+---
+
 ## Architecture (summary)
 
-Layered + hexagonal (ports & adapters). Layers: **API** (`app.api`) → **Services** (`app.services`, Planned) → **Domain** (`app.domain`, pure) ← **Infrastructure** (`app.infrastructure`, adapters). Cross-cutting **core** (`app.core`) and composition root (`app.container`).
+Layered + hexagonal (ports & adapters). Layers: **API** (`app.api`) → **Services** (`app.services` — `auth_service`, `workflow_service`) → **Domain** (`app.domain`, pure) ← **Infrastructure** (`app.infrastructure`, adapters). Cross-cutting **core** (`app.core`) and composition root (`app.container`).
 
 - **Ports** (domain abstractions): `UnitOfWork`, `PasswordHasher`, `TokenService` [Implemented]; `AgentRunner`, `LLMProvider`, `TaskQueue`, `VectorStore` [Planned].
 - **Adapters** (infrastructure): `SqlAlchemyUnitOfWork`, `Argon2PasswordHasher`, `JwtTokenService` [Implemented]; mock/LangChain runners, Chroma, queue/worker [Planned].
@@ -100,7 +124,7 @@ One module = one concern; one class = one purpose; one service method = one use 
 
 - **Two suites.** The default (`pytest`) needs **no external services** — metadata is asserted structurally, the UoW runs on in-memory SQLite, and services are tested against in-memory doubles. Tests that genuinely need MySQL are marked `integration` and deselected by default; run them with `pytest -m integration` against a migrated database.
 - Anything the schema decides — generated columns, cascades, `FOR UPDATE` locking, driver timezone behaviour — belongs in the integration suite. SQLite cannot stand in: `users.email_active` uses MySQL's `IF()`, and the models use `BIGINT UNSIGNED` / `DATETIME(fsp=6)`.
-- New models get metadata tests; new services/repositories get behaviour tests with faked ports plus a small integration pass proving the fakes are honest; the execution engine (Phase 8) is tested against a **mock `AgentRunner`**.
+- New models get metadata tests; new services/repositories get behaviour tests with faked ports plus a small integration pass proving the fakes are honest; the execution engine (Phase 6) is tested against a **mock `AgentRunner`**.
 - Philosophy: [docs/coding-standards.md](docs/coding-standards.md#testing-philosophy); how-to: [docs/development-guide.md](docs/development-guide.md#testing).
 
 ---

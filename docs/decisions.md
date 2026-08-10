@@ -2,6 +2,21 @@
 
 Architectural decisions with their rationale. Other docs cite these as `ADR-n`. Status: **Accepted** unless noted. See [glossary.md](glossary.md) for terms and [architecture.md](architecture.md) for how they fit together.
 
+> **Phase-number mapping note (2026-08-10) — read before acting on any phase number below.**
+>
+> The roadmap was renumbered on 2026-08-10 to seat the **Workflow Authoring API at
+> Phase 5**; execution now begins at **Phase 6**. **Where an ADR below names a phase
+> number 5 or higher, add one.** ADR-018's phasing note says scopes arrive in
+> "Phase 6" — that is now Phase 7. ADR-032 refers to authorization shapes needed in
+> "Phase 5" — that is now Phase 6.
+>
+> **No ADR text has been edited for this.** An ADR records a decision as it was taken;
+> rewriting its prose to match a later numbering would make it appear to have said
+> something it did not, and the rationale — not the phase label — is what a future
+> reader needs. Every decision here stands unchanged: the renumbering is a labelling
+> correction, not an architectural one. Current numbering and reasoning:
+> [roadmap.md §1](roadmap.md#mapping-note).
+
 ---
 
 ## ADR-001 — Async SQLAlchemy **[Implemented]**

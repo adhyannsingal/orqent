@@ -26,8 +26,8 @@ flowchart TB
         R[Routers] --> D[Deps]
         MW[Correlation middleware] --- EH[Exception handlers]
     end
-    subgraph APP["Application / Services  [Planned]"]
-        SVC[Use-case services]
+    subgraph APP["Application / Services  [Implemented]"]
+        SVC[Use-case services: auth, workflow]
     end
     subgraph DOM["Domain — pure  [partly Implemented]"]
         ENT[Entities / Value Objects]
@@ -35,7 +35,7 @@ flowchart TB
         ENG[Execution Engine core - Planned]
     end
     subgraph INFRA["Infrastructure — adapters"]
-        REPO[Repositories - Planned]
+        REPO[Repositories - Implemented]
         UOW[SqlAlchemyUnitOfWork - Implemented]
         LLM[Mock provider / LangChain runner - Planned]
         VEC[Chroma adapter - Planned]
@@ -64,7 +64,7 @@ Each layer has one responsibility and a strict set of allowed dependencies. The 
 | Layer | Package | Responsibility | Status |
 |-------|---------|----------------|--------|
 | API / Edge | `app.api` | HTTP↔app translation, routing, auth entry, error mapping, correlation | **[Implemented]** |
-| Application / Services | `app.services` | One method per use case; owns the transaction; enforces ownership | **[Planned]** (Phase 4+) |
+| Application / Services | `app.services` | One method per use case; owns the transaction; enforces ownership | **[Implemented]** (`auth_service` Phase 3, `workflow_service` Phase 4) |
 | Domain | `app.domain` | Entities, value objects, **ports**, execution engine core — pure Python | **[Partly Implemented]** (errors, UnitOfWork port) |
 | Infrastructure | `app.infrastructure` | Adapters: repositories, DB, LLM/agent runner, vector store, queue, worker, security | **[Partly Implemented]** (DB infra) |
 | Data | MySQL, ChromaDB | Source-of-truth relational state; derived vector index | **[Partly Implemented]** (MySQL models) |
@@ -118,14 +118,15 @@ The HTTP edge is deliberately thin.
 - **Dependencies** (`app.api.deps`) are the seam to the container: `ContainerDep`, `SettingsDep`, and `SessionDep` are `Annotated[..., Depends(...)]` aliases; routers declare them and stay ignorant of construction.
 - **Correlation middleware** (`app.api.middleware.CorrelationIdMiddleware`) honours an inbound `X-Correlation-ID` or mints one, binds it to the logging context, and echoes it on the response.
 - **Exception handlers** (`app.api.errors`) map the domain error hierarchy to a single `ErrorResponse` envelope. See [coding-standards.md](coding-standards.md#error-handling-philosophy).
-- **Routers** — health (`/health/live`, `/health/ready`) is mounted unversioned at the root for orchestrator probes; the versioned business API mounts at `settings.api_v1_prefix` (`/api/v1`) via `app.api.v1.router.api_v1_router` (currently an empty aggregation point awaiting feature routers).
+- **Routers** — health (`/health/live`, `/health/ready`) is mounted unversioned at the root for orchestrator probes; the versioned business API mounts at `settings.api_v1_prefix` (`/api/v1`) via `app.api.v1.router.api_v1_router`, which aggregates `auth` (Phase 3B) and `node-types` (Phase 4 M3). The `workflows` router (Phase 5 M2) is on the `phase-5` branch and not yet merged to `main`.
 
 ### Request flow (synchronous, current)
 ```
-HTTP → Router → Deps (settings/session) → [Service → UnitOfWork → Repository]  (Planned)
+HTTP → Router → Deps (settings/session/service) → Service → UnitOfWork → Repository
      → response model → JSON
 ```
-The bracketed section is Planned; today only health routes exist.
+This is the real path today, exercised by the auth endpoints and — on the
+`phase-5` branch — by the workflow authoring endpoints.
 
 ---
 
@@ -158,20 +159,25 @@ Repositories are the **only** code that talks to MySQL, one per aggregate, retur
 
 ---
 
-## 10a. Workflow authoring architecture **[Implemented — Phase 4]**
+## 10a. Workflow authoring architecture **[Implemented — Phase 4 + Phase 5 M1–M3]**
 
-The authoring stack as it exists today. Note the top layer: **there is no workflow HTTP API yet** (Phase 4 M12, specified but not implemented), so `WorkflowService` currently has no HTTP caller.
+The full authoring stack. The HTTP layer arrived in **Phase 5** (M1 contracts, M2 routes, M3 boundary hardening) and is **committed on the `phase-5` branch, not yet merged to `main`** — on `main`, `WorkflowService` still has no HTTP caller.
 
 ```
-API layer                  [workflow routes NOT implemented]
+API layer                  11 routes under /api/v1/workflows     (Phase 5 M1–M3)
+        |                  [on branch phase-5, not yet on main]
+WorkflowService            lifecycle, publish, authorization     (Phase 4 M11)
         |
-WorkflowService            lifecycle, publish, authorization   (Phase 4 M11)
-        |
-Repositories               Workflow / WorkflowVersion          (Phase 4 M10)
+Repositories               Workflow / WorkflowVersion            (Phase 4 M10)
         |
 SQLAlchemy / MySQL         workflows, workflow_versions,
-                           workflow_nodes, workflow_edges      (Phase 4 M9)
+                           workflow_nodes, workflow_edges        (Phase 4 M9)
 ```
+
+The routes are transport only: they map the frozen M1 schemas to and from
+`WorkflowService` calls and hold no lifecycle policy. Authorization stays in the
+service where a loaded row can be inspected (`ADR-032`); the router declares role
+dependencies but never decides who owns a workflow.
 
 The graph and validation core sits beside that stack and depends on **none** of it — no session, no driver, no framework:
 
@@ -191,7 +197,9 @@ Validation pipeline        validate_graph(graph, registry) -> ValidationReport
 
 **No execution code exists.** `app.domain.engine` is a docstring-only stub, and `infrastructure/{queue,worker}` likewise.
 
-The design (`ADR-019`): a **reentrant scheduler over persisted state**, not a program that runs a workflow to completion. Every state transition is committed before it is acted on; the unit of dispatch is the node execution, not the run; and a runner may return `Suspended(resume_token)` to park a run indefinitely at no cost. The `Suspended` result type already exists in `domain/nodes/result.py` precisely because retrofitting suspension later would mean rewriting the engine and every runner. Control flow (`ADR-018`, `ADR-028`) arrives in Phase 6; the queue (`ADR-015`) in Phase 7. `ADR-007`'s linear-workflow model is **superseded**.
+The design (`ADR-019`): a **reentrant scheduler over persisted state**, not a program that runs a workflow to completion. Every state transition is committed before it is acted on; the unit of dispatch is the node execution, not the run; and a runner may return `Suspended(resume_token)` to park a run indefinitely at no cost. The `Suspended` result type already exists in `domain/nodes/result.py` precisely because retrofitting suspension later would mean rewriting the engine and every runner. The engine itself is **Phase 6**; control flow (`ADR-018`, `ADR-028`) arrives in Phase 7; the queue (`ADR-015`) in Phase 8. `ADR-007`'s linear-workflow model is **superseded**.
+
+> Phase numbers here follow the **2026-08-10 numbering** (Phase 5 = Workflow Authoring API, execution from Phase 6). ADR prose still uses the earlier numbering; see the [mapping rule](roadmap.md#mapping-note).
 
 ---
 

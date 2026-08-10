@@ -1,30 +1,179 @@
 # Roadmap
 
-> ## ⚠️ Superseded for Phases 4+ (2026-07-29) — retained for history only
+**This file has two halves.** Sections 1–4 below are the **authoritative plan
+being executed**, current as of **2026-08-10**. Everything from
+[§5 Historical plan](#5-historical-plan-pre-redesign--retained-for-history-only)
+onward is the pre-redesign plan, kept for history and **not** a status source.
+
+---
+
+## 1. Phase numbering and the 2026-08-10 mapping note
+
+<a name="mapping-note"></a>
+
+Phase 5 is the **Workflow Authoring API**. Execution begins at **Phase 6**.
+
+The 2026-07-29 redesign wrote a numbering in which Phase 5 was the *durable
+execution core*, and the workflow HTTP API was the last milestone of Phase 4
+(M12). That is not what happened: Phase 4 shipped M1–M11 and stopped at the
+service layer, and the HTTP API was built afterwards as a phase of its own. The
+numbering was corrected on 2026-08-10 to match what was built rather than
+renaming the work to fit the old table.
+
+**Mapping rule — where any document written before 2026-08-10 names a phase
+number 5 or higher, add one.** ADR-018's phasing note says scopes arrive in
+"Phase 6"; that is Phase 7 under this numbering. ADR-032 mentions deciding
+authorization shapes for "Phase 5"; that is Phase 6. `phase-4-implementation-spec.md`
+is likewise offset from §5 upward. **These documents are deliberately not
+rewritten.** They record decisions taken at a point in time, and editing their
+prose to match a later numbering would make them appear to have said something
+they did not. Read them through this mapping rule instead.
+
+Nothing architectural changed with the renumbering. No ADR is withdrawn,
+amended, or reordered; only the position of the authoring API in the sequence.
+
+---
+
+## 2. Phase status
+
+| Phase | Scope | Status |
+|------:|-------|--------|
+| 1 | Foundation — app factory, `Settings`, structured logging, correlation, error envelope, DI container, health probes, Docker, CI | ✅ **Implemented** |
+| 2 | Database infrastructure — async SQLAlchemy, mixins, Unit of Work, Alembic; foundation models; migration `0001` | ✅ **Implemented** |
+| 3 | Authentication & tenancy — Argon2id + JWT behind ports, `AuthService`, refresh rotation with reuse detection, RBAC; migrations `0002`–`0003` | ✅ **Implemented** |
+| 4 | Workflow authoring, node contract & graph validation — M1–M11: node contract, registry, `WorkflowGraph`, validation pipeline, authoring tables, repositories, `WorkflowService`; migration `0004` | ✅ **Implemented** |
+| **5** | **Workflow Authoring API** — the HTTP authoring layer over Phase 4 (§3) | 🟡 **In progress — M1–M3 complete, M4–M6 not started** |
+| 6 | Durable execution core — reentrant scheduler over persisted state, run and node-execution state machines, event log, sequential and in-process, **suspension from day one** (ADR-019) | ⬜ Not started |
+| 7 | Control flow — Condition, Merge, Loop scopes, structural parallelism, branch pruning, join policies (ADR-018, ADR-028) | ⬜ Not started |
+| 8 | Queue & workers — per-node dispatch, DB-backed queue with `SKIP LOCKED`, reaper, concurrency limits, per-org fairness (ADR-015, ADR-030) | ⬜ Not started |
+| 9 | Triggers — manual → webhook → schedule; registration lifecycle tied to publish | ⬜ Not started |
+| 10 | Human-in-the-loop — approval node, inbox API, authorization, timeouts/escalation | ⬜ Not started |
+| 11 | Connections + I/O nodes — encrypted connections (ADR-027); HTTP, Email, Database, File nodes behind the egress policy (ADR-029) | ⬜ Not started |
+| 12 | AI Agent node — `ai.agent@1` as an ordinary data node; `AgentRunner` port + LangChain adapter (ADR-013); provider configuration and credentials | ⬜ Not started |
+| 13 | Memory / RAG — Chroma-backed retrieval for the agent node (ADR-003) | ⬜ Not started |
+| 14 | Observability, quotas, retention — metrics, audit, purge jobs, SSE streaming | ⬜ Not started |
+
+Phases 6–14 are **objectives, not specifications**. Each is designed in detail
+only when it starts; the ordering and dependencies are inherited from
+§10 of [project_status.md](project_status.md) and ADR-018 … ADR-032.
+
+---
+
+## 3. Phase 5 — Workflow Authoring API
+
+### Goal
+
+Complete and harden the HTTP authoring layer over the Phase 4 foundations.
+Phase 5 ends with a **complete, tested, documented workflow authoring API**.
+**It does not implement execution.**
+
+Phase 4 left `WorkflowService` with no HTTP caller — a full lifecycle
+(create, draft copy-on-write, graph replacement, validate, publish, version
+history) reachable only from tests. Phase 5 exposes that lifecycle over HTTP and
+then hardens the boundary, and nothing more.
+
+### Milestones
+
+| Milestone | Scope | Status | Commit |
+|---|---|---|---|
+| **M1** | API contracts & schemas — the frozen request/response contract for workflows, drafts, graphs, versions, and validation reports | ✅ **COMPLETE** | `3649719` |
+| **M2** | Workflow authoring HTTP API — the eleven routes over `WorkflowService` | ✅ **COMPLETE** | `01f0e3e` |
+| **M3** | API boundary hardening — dangling edges rejected at the boundary | ✅ **COMPLETE** | `e3c1cbb` |
+| **M4** | API contract & consistency review | ⬜ **NOT STARTED** | — |
+| **M5** | API architecture & production hardening | ⬜ **NOT STARTED** | — |
+| **M6** | Phase 5 final verification & documentation | ⬜ **NOT STARTED** | — |
+
+**M1–M3 live on the `phase-5` branch and are not yet merged into `main`.** The
+milestone plan is authoritative on `main` from 2026-08-10; the code is not on
+`main` yet. Do not read `main`'s `src/app/api/v1/routes/` and conclude the API
+was never built, and do not read this table and conclude `main` serves workflow
+routes. Both statements are true at once until the branch merges.
+
+The routes delivered by M2, all under `/api/v1/workflows`:
+
+```
+POST   /workflows                              create                     201
+GET    /workflows                              list
+GET    /workflows/{workflow_id}                get
+PATCH  /workflows/{workflow_id}                update
+DELETE /workflows/{workflow_id}                soft delete                204
+GET    /workflows/{workflow_id}/draft          read the draft graph
+PUT    /workflows/{workflow_id}/draft          replace the draft graph
+POST   /workflows/{workflow_id}/draft/validate validate without publishing
+POST   /workflows/{workflow_id}/publish        freeze the draft            201
+GET    /workflows/{workflow_id}/versions       version history
+GET    /workflows/{workflow_id}/versions/{version_no}  one version
+```
+
+### Scope of the remaining milestones
+
+- **M4 — API contract & consistency review.** Primarily **review and tests**.
+  Read the shipped surface against the frozen M1 contract and prove conformance;
+  add functionality **only where the frozen contract is genuinely unmet**. M4 is
+  not a place to extend the API.
+- **M5 — API architecture & production hardening.** Boundary/architecture
+  hardening and production-readiness concerns that are **actually justified by
+  the existing architecture and contracts** — not a generic hardening checklist,
+  and not anything that presupposes a runtime.
+- **M6 — Phase 5 final verification & documentation.** The closing gate: full
+  quality gates green, documentation reconciled, phase signed off.
+
+### What is NOT Phase 5
+
+None of the following is Phase 5 work, and none of it may be pulled in merely
+because it is the logical next step:
+
+- the execution engine
+- runs
+- node execution records
+- execution events
+- queues
+- workers
+- scheduling
+- retries / state machines
+- LangChain execution
+- `AgentRunner` execution
+- LLM providers
+- provider configuration
+- API keys
+- runtime tool execution
+- execution WebSockets
+- execution observability
+
+These belong to Phases 6 and later (§2). The standing rule against scaffolding
+future phases ([CLAUDE.md](CLAUDE.md)) applies to every item on this list: an
+empty `runs` table, a `TaskQueue` stub, or a provider-credentials column added
+"while we're in here" is a Phase 5 scope violation regardless of how small it is.
+
+---
+
+## 4. Cross-references (authoritative set)
+
+- Where the project stands: [project_status.md](project_status.md) §§10–11
+- Durable context for AI sessions: [CLAUDE.md](CLAUDE.md)
+- System shape: [architecture.md](architecture.md)
+- Decisions and rationale: [decisions.md](decisions.md) (ADR-018 … ADR-032 for
+  the workflow platform)
+- Phase 4's frozen specification: [phase-4-implementation-spec.md](phase-4-implementation-spec.md)
+  — read through the §1 mapping note
+
+---
+
+## 5. Historical plan (pre-redesign) — retained for history only
+
+<a name="5-historical-plan-pre-redesign--retained-for-history-only"></a>
+
+> ## ⚠️ Superseded for Phases 4+ (2026-07-29)
 >
 > Orqent was redesigned from a chain-of-agents runtime into a **visual workflow
 > automation platform**. **Everything below from Phase 4 onward describes a plan
 > that is no longer being executed** — the phase table, the mermaid diagram, the
-> technical-debt list, and the limitations. Do not read status from this file.
+> technical-debt list, and the limitations. Do not read status from this section;
+> read §§1–3 above.
 >
-> Authoritative now: **ADR-018 … ADR-032** in [decisions.md](decisions.md) and
-> **§§10–11 of [project_status.md](project_status.md)**.
->
-> **Actual status (2026-08-08):**
-> Phase 1 ✅ · Phase 2 ✅ · Phase 3 ✅ · **Phase 4 ✅ complete (M1–M11:
-> workflow authoring, node contract, graph validation, persistence,
-> repositories, lifecycle service; migration `0004`)** · **Phase 5 — NOT
-> STARTED**.
->
-> Phase 4 milestone **M12** (the workflow HTTP API) is specified in
-> [phase-4-implementation-spec.md](phase-4-implementation-spec.md) but **not
-> implemented**. There is no execution engine, no queue, no worker, no
-> scheduling, no LangChain, and no provider credentials anywhere in the
-> repository.
->
-> Revised phase numbering: 5 = durable execution core · 6 = control flow ·
-> 7 = queue/workers · 8 = triggers · 9 = human-in-the-loop · 10 = connections +
-> I/O nodes · 11 = AI agent node · 12 = memory/RAG · 13 = observability.
+> The revised numbering this banner originally carried (5 = durable execution
+> core, 6 = control flow, and so on) was itself corrected on 2026-08-10. See
+> [§1](#mapping-note) for the current numbering and the mapping rule.
 
 Phase-by-phase plan with current status. Each phase ends with a working, tested backend. Table creation per phase is in [database.md](database.md#3-planned-schema-by-phase); decisions in [decisions.md](decisions.md).
 

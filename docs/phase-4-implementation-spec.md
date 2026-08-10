@@ -8,6 +8,24 @@ Derives from the v2 architecture redesign (ADR-018 … ADR-030).
 > decisions (§1.6). This specification is settled: implementation begins at
 > Milestone 1 (§12). Changes from here require an explicit amendment.
 
+> ## Mapping note (2026-08-10) — this document is frozen; read it through these two corrections
+>
+> **1. Phase 4 delivered M1–M11 only.** Milestones **M12** (workflow HTTP API) and
+> **M13** (documentation sign-off) specified below were *not* implemented as part of
+> Phase 4 — Phase 4 closed at the service layer. The HTTP API specified as M12 was
+> built afterwards as **Phase 5 M1–M2** (commits `3649719`, `01f0e3e`), with an
+> additional boundary-hardening milestone **Phase 5 M3** (`e3c1cbb`) that this spec
+> does not describe. M13's documentation gate is now **Phase 5 M6**.
+>
+> **2. Phase numbers 5 and higher in this document are off by one.** The roadmap was
+> renumbered on 2026-08-10 to seat the Workflow Authoring API at Phase 5; execution
+> begins at Phase 6. So "Phase 5" below (the engine, `run_events`, `node_executions`)
+> means Phase 6, and "Phase 6" (scopes and `Loop`) means Phase 7.
+>
+> **Nothing below has been rewritten.** This is the frozen record of what Phase 4 was
+> specified to be, and its value is the reasoning — including the rejected
+> alternatives. Current plan: [roadmap.md](roadmap.md) §§1–3.
+
 ---
 
 ## 1. Validating the architecture
