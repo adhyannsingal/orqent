@@ -3,12 +3,12 @@
 ```
 Project:        Orqent — Visual Workflow Automation Platform (backend)
 Version:        0.1.0
-Current Phase:  Phase 4 — Workflow authoring, node contract & graph validation ✅ complete (M1–M11)
-Last Updated:   2026-08-08
-Status:         Healthy — workflow authoring complete through the service layer, 848 tests
-                passing, all quality gates green, migrations 0001–0004 applied.
-                No HTTP API for workflows yet, and no execution of any kind.
-Next Milestone: Phase 5 (Durable execution core) — NOT STARTED
+Current Phase:  Phase 5 — Workflow authoring API ✅ M1–M2 complete
+Last Updated:   2026-08-10
+Status:         Healthy — the workflow authoring API is usable over HTTP end to end,
+                988 tests passing, all quality gates green, migrations 0001–0004
+                applied (M2 needed none). Still no execution of any kind.
+Next Milestone: Phase 5 M3 — not yet scoped
 ```
 
 This is the project's **living status document** — the single source of truth for
@@ -278,10 +278,9 @@ orqent/
 │   ├── api/                # deps (Annotated aliases), middleware (correlation),
 │   │   │                   # errors (domain→ErrorResponse envelope),
 │   │   │                   # security (bearer scheme, get_current_user, require_roles)
-│   │   └── v1/             # api_v1_router; routes/{health,auth,node_types}.py
-│   │                       # — NO workflow routes yet (Phase 4 M12, not started)
+│   │   └── v1/             # api_v1_router; routes/{health,auth,node_types,workflows}.py
 │   ├── schemas/            # Pydantic request/response models (health, common, auth,
-│   │                       # node_types) — NO workflow schemas yet
+│   │                       # node_types, workflows)
 │   ├── domain/             # PURE: errors.py (exception hierarchy),
 │   │   │                   # ports/{unit_of_work,password_hasher,token_service},
 │   │   │                   # value_objects/{token,authenticated_user,token_pair},
@@ -731,13 +730,13 @@ until Phase 3+).
 
 Three gates; all must pass before any commit, and every phase ends green.
 
-- **pytest** — two suites. The **default** run (`pytest`, 723 tests) needs no
+- **pytest** — two suites. The **default** run (`pytest`, 844 tests) needs no
   external services and finishes in a couple of seconds. The **integration**
-  suite (`pytest -m integration`, 125 tests) needs a migrated MySQL and is
+  suite (`pytest -m integration`, 144 tests) needs a migrated MySQL and is
   deselected by default; it covers what only a real database can answer —
   generated columns, cascades, driver timezone behaviour, `FOR UPDATE` locking,
   the seeded role catalog, tenant isolation, and the workflow lifecycle
-  end to end. Full run: `pytest -m ""` (848).
+  end to end. Full run: `pytest -m ""` (988).
   The suite deliberately needs **no external services**: model metadata is
   asserted structurally (table set, constraint/index names, cascade rules,
   generated column, `CHAR(26)`), the Unit of Work runs against in-memory
@@ -805,12 +804,29 @@ HTTP surface is not.
 
 ---
 
-## 11. Current Milestone: Phase 5 (Durable execution core) — NOT STARTED
+## 11. Current Milestone: Phase 5 — Workflow authoring API (M1–M2 complete)
 
-**Nothing in Phase 5 exists.** No file under `src/app/` implements a scheduler,
-a run, a node execution, a worker, or a queue.
+Phase 5 began by closing the HTTP gap Phase 4 deliberately left open, rather than
+by starting the execution engine.
 
-### What Phase 4 leaves ready to build on
+- **M1 ✅ (2026-08-09, `3649719`)** — the frozen §8/§9 transport contracts:
+  `CreateWorkflowRequest`, `UpdateWorkflowRequest`, `WorkflowSummaryResponse`,
+  `WorkflowResponse`, `UiPosition`, the graph request/response models,
+  `ValidationReportResponse`, `PublishRequest`, `VersionResponse`, and a generic
+  `PageResponse[T]`. Schemas only, no routes.
+- **M2 ✅ (2026-08-10)** — the eleven authoring endpoints under
+  `/api/v1/workflows`, wired to the existing `WorkflowService`. M1 had recorded
+  five response fields the service could not supply; M2 closed all five by
+  giving the service three small view types (`WorkflowSummaryView`,
+  `WorkflowView`, `GraphView`) and the repository two batched reads, so a page
+  of workflows costs three queries rather than one per row. `nodes[].ui` is read
+  through `list_nodes`, the path M11 added for it; `can_publish` is the service's
+  own answer to §1.6i, stated once and shared by the check and the flag.
+
+**Still nothing in the execution phase exists.** No file under `src/app/`
+implements a scheduler, a run, a node execution, a worker, or a queue.
+
+### What the authoring stack leaves ready to build on
 
 The node contract (`NodeDescriptor`, `NodeRunner`, and crucially the
 `Suspended` result, which ADR-019 requires to exist before the engine does); the
@@ -825,8 +841,6 @@ later service copies.
 
 | Not built | Where it belongs |
 |---|---|
-| Workflow HTTP API (`POST/GET/PUT /workflows…`, validate, publish) | Phase 4 **M12** — spec written, not implemented |
-| Workflow request/response schemas | Phase 4 **M12** |
 | Workflow execution of any kind | Phase 5 |
 | Run / node-execution records and the event log | Phase 5 |
 | Queues, workers, dispatch | Phase 7 |
