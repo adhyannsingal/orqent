@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 
-from sqlalchemy import delete, select, update
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.domain.graph.model import GraphEdge, GraphNode, WorkflowGraph
@@ -70,20 +70,86 @@ class WorkflowVersionRepository:
         )
         return result.scalar_one_or_none()
 
-    async def list_for_workflow(self, workflow_id: int) -> Sequence[WorkflowVersion]:
-        """Every version of a workflow, newest first.
+    async def list_for_workflow(
+        self,
+        workflow_id: int,
+        *,
+        limit: int | None = None,
+        offset: int = 0,
+    ) -> Sequence[WorkflowVersion]:
+        """A workflow's versions, newest first.
 
         Ordered by ``id`` descending rather than ``version_no``: the draft has
         no number, and sorting by a nullable column would put it somewhere
         arbitrary instead of at the top where it belongs.
+
+        ``limit`` defaults to ``None`` — unbounded — because the caller that
+        assigns the next version number needs every row, not a page. Passing a
+        limit is what the paginated read does.
         """
 
-        result = await self._session.execute(
+        statement = (
             select(WorkflowVersion)
             .where(WorkflowVersion.workflow_id == workflow_id)
             .order_by(WorkflowVersion.id.desc())
         )
+        if limit is not None:
+            statement = statement.limit(limit).offset(offset)
+        result = await self._session.execute(statement)
         return result.scalars().all()
+
+    async def count_for_workflow(self, workflow_id: int) -> int:
+        """How many versions a workflow has — the ``total`` beside a page."""
+
+        result = await self._session.execute(
+            select(func.count())
+            .select_from(WorkflowVersion)
+            .where(WorkflowVersion.workflow_id == workflow_id)
+        )
+        return result.scalar_one()
+
+    async def version_numbers(self, version_ids: Sequence[int]) -> Mapping[int, int]:
+        """Map version id to ``version_no``, for the ids given.
+
+        Batched so listing a page of workflows costs one query rather than one
+        per row. ``workflows.active_version_id`` is an internal id and the wire
+        carries a version *number* (ADR-004), so something has to translate;
+        doing it per workflow would be the N+1 this exists to avoid.
+
+        Rows without a number — a draft — are omitted rather than mapped to
+        ``None``, because a workflow's active version is always published.
+        """
+
+        if not version_ids:
+            return {}
+
+        result = await self._session.execute(
+            select(WorkflowVersion.id, WorkflowVersion.version_no).where(
+                WorkflowVersion.id.in_(version_ids),
+                WorkflowVersion.version_no.is_not(None),
+            )
+        )
+        return dict(result.all())  # type: ignore[arg-type]
+
+    async def workflow_ids_with_drafts(self, workflow_ids: Sequence[int]) -> frozenset[int]:
+        """Which of these workflows currently hold a draft.
+
+        Batched for the same reason as :meth:`version_numbers`. "Has a draft" is
+        what the API reports as unpublished changes, and it is derived from the
+        existing lifecycle rather than from a new flag — publishing promotes the
+        draft in place, so the row simply stops being one.
+        """
+
+        if not workflow_ids:
+            return frozenset()
+
+        result = await self._session.execute(
+            select(WorkflowVersion.workflow_id).where(
+                WorkflowVersion.workflow_id.in_(workflow_ids),
+                WorkflowVersion.status == DRAFT,
+            )
+        )
+        return frozenset(result.scalars())
 
     async def bump_revision(self, version_id: int) -> int:
         """Increment the optimistic lock and return its new value.

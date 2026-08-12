@@ -38,3 +38,23 @@ class DataResponse[T](BaseModel):
     """Generic success envelope for endpoints that want one."""
 
     data: T
+
+
+class PageResponse[T](BaseModel):
+    """One page of a collection, plus what it took to ask for it.
+
+    ``total`` counts the whole filtered set, not the page, so a client can render
+    "showing 1 to 20 of 137" and size a pager without a second request. ``limit``
+    and ``offset`` are echoed back because a caller that omitted them still needs
+    to know what the server chose.
+
+    Offset/limit rather than a cursor: workflow counts per organization are
+    small, and offset is what a name-sorted, jump-to-page list needs. Runs, in a
+    later phase, are a different collection with different growth and will want
+    cursors instead.
+    """
+
+    items: list[T]
+    total: int
+    limit: int
+    offset: int

@@ -21,6 +21,7 @@ from app.container import Container
 from app.core.config import Settings
 from app.domain.nodes.registry import NodeRegistry
 from app.services.auth_service import AuthService
+from app.services.workflow_service import WorkflowService
 
 
 def get_container(request: Request) -> Container:
@@ -62,6 +63,15 @@ def get_auth_service(container: ContainerDep) -> AuthService:
 
 
 AuthServiceDep = Annotated[AuthService, Depends(get_auth_service)]
+
+
+def get_workflow_service(container: ContainerDep) -> WorkflowService:
+    """Expose the workflow authoring service to routes."""
+
+    return container.workflow_service
+
+
+WorkflowServiceDep = Annotated[WorkflowService, Depends(get_workflow_service)]
 
 
 async def get_session(container: ContainerDep) -> AsyncIterator[AsyncSession]:

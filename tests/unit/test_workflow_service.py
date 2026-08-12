@@ -8,7 +8,10 @@ database questions are left to the integration suite.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 import pytest
+from sqlalchemy.exc import IntegrityError
 
 from app.domain.errors import (
     AuthenticationError,
@@ -21,12 +24,41 @@ from app.domain.value_objects.authenticated_user import AuthenticatedUser
 from app.infrastructure.db.identifiers import new_public_id
 from app.infrastructure.db.models.organization import Organization
 from app.infrastructure.db.models.user import User
+from app.infrastructure.db.models.workflow import Workflow
 from app.infrastructure.db.models.workflow_node import WorkflowNode
+from app.infrastructure.db.models.workflow_version import WorkflowVersion
 from app.infrastructure.nodes import build_registry
-from app.services.workflow_service import WorkflowService
+from app.services.workflow_service import (
+    _NAME_CONSTRAINT,
+    GraphView,
+    WorkflowService,
+    _is_duplicate_name,
+)
 from tests.unit.fakes import FakeDatabase, FakeUnitOfWorkFactory
 
 REGISTRY = build_registry()
+
+
+def _version(view: GraphView) -> WorkflowVersion:
+    """The version row out of a graph view."""
+
+    return view.version
+
+
+def _graph(view: GraphView) -> Sequence[WorkflowNode]:
+    """The node **rows** out of a graph view.
+
+    Rows rather than domain nodes: the view carries ``ui_position``, which is
+    the whole reason the API reads a graph through ``list_nodes``.
+    """
+
+    return view.nodes
+
+
+def _split(view: GraphView) -> tuple[WorkflowVersion, Sequence[WorkflowNode]]:
+    """Version and node rows together, for tests that assert on both."""
+
+    return view.version, view.nodes
 
 
 @pytest.fixture
@@ -98,9 +130,9 @@ def _valid_graph() -> tuple[list[WorkflowNode], list[GraphEdge]]:
 async def _published(service: WorkflowService, caller: AuthenticatedUser, name: str = "W"):  # type: ignore[no-untyped-def]
     """Create a workflow, fill its draft with a valid graph, and publish it."""
 
-    workflow = await service.create(caller, name=name)
+    workflow = (await service.create(caller, name=name)).workflow
     nodes, edges = _valid_graph()
-    draft, _ = await service.get_draft(caller, workflow.public_id)
+    draft = _version(await service.get_draft(caller, workflow.public_id))
     await service.replace_draft(
         caller, workflow.public_id, revision=draft.revision, nodes=nodes, edges=edges
     )
@@ -116,7 +148,9 @@ async def test_create_returns_a_workflow_with_a_public_id(
 ) -> None:
     caller = _member(db)
 
-    workflow = await service.create(caller, name="Nightly report", description="Runs at 2am")
+    workflow = (
+        await service.create(caller, name="Nightly report", description="Runs at 2am")
+    ).workflow
 
     assert workflow.name == "Nightly report"
     assert workflow.description == "Runs at 2am"
@@ -128,7 +162,7 @@ async def test_create_records_the_caller_as_creator_and_scopes_the_org(
 ) -> None:
     caller = _member(db)
 
-    workflow = await service.create(caller, name="W")
+    workflow = (await service.create(caller, name="W")).workflow
 
     assert workflow.created_by_user_id == db.users[0].id
     assert workflow.organization_id == db.organizations[0].id
@@ -191,9 +225,9 @@ async def test_an_unknown_caller_is_an_authentication_error(
 
 async def test_get_returns_the_workflow(service: WorkflowService, db: FakeDatabase) -> None:
     caller = _member(db)
-    created = await service.create(caller, name="W")
+    created = (await service.create(caller, name="W")).workflow
 
-    assert (await service.get(caller, created.public_id)).id == created.id
+    assert (await service.get(caller, created.public_id)).workflow.id == created.id
 
 
 async def test_an_unknown_public_id_is_not_found(
@@ -212,7 +246,7 @@ async def test_another_organization_gets_not_found_rather_than_forbidden(
 
     owner = _member(db)
     intruder = _member(db)
-    workflow = await service.create(owner, name="Theirs")
+    workflow = (await service.create(owner, name="Theirs")).workflow
 
     with pytest.raises(NotFoundError):
         await service.get(intruder, workflow.public_id)
@@ -240,7 +274,7 @@ async def test_listing_returns_the_page_and_the_unpaginated_total(
 
     items, total = await service.list(caller, limit=2, offset=0)
 
-    assert [w.name for w in items] == ["a", "b"]
+    assert [v.workflow.name for v in items] == ["a", "b"]
     assert total == 3
 
 
@@ -251,7 +285,7 @@ async def test_listing_filters_by_query(service: WorkflowService, db: FakeDataba
 
     items, total = await service.list(caller, limit=50, offset=0, query="report")
 
-    assert [w.name for w in items] == ["Nightly report"]
+    assert [v.workflow.name for v in items] == ["Nightly report"]
     assert total == 1
 
 
@@ -260,9 +294,9 @@ async def test_listing_filters_by_query(service: WorkflowService, db: FakeDataba
 
 async def test_update_metadata_renames(service: WorkflowService, db: FakeDatabase) -> None:
     caller = _member(db)
-    workflow = await service.create(caller, name="Old")
+    workflow = (await service.create(caller, name="Old")).workflow
 
-    updated = await service.update_metadata(caller, workflow.public_id, name="New")
+    updated = (await service.update_metadata(caller, workflow.public_id, name="New")).workflow
 
     assert updated.name == "New"
 
@@ -273,9 +307,9 @@ async def test_renaming_to_its_own_name_is_not_a_conflict(
     """The row that 'already uses' the name is this one."""
 
     caller = _member(db)
-    workflow = await service.create(caller, name="Same")
+    workflow = (await service.create(caller, name="Same")).workflow
 
-    updated = await service.update_metadata(caller, workflow.public_id, name="Same")
+    updated = (await service.update_metadata(caller, workflow.public_id, name="Same")).workflow
 
     assert updated.name == "Same"
 
@@ -285,7 +319,7 @@ async def test_renaming_onto_another_workflow_is_a_conflict(
 ) -> None:
     caller = _member(db)
     await service.create(caller, name="Taken")
-    workflow = await service.create(caller, name="Mine")
+    workflow = (await service.create(caller, name="Mine")).workflow
 
     with pytest.raises(ConflictError):
         await service.update_metadata(caller, workflow.public_id, name="Taken")
@@ -293,9 +327,9 @@ async def test_renaming_onto_another_workflow_is_a_conflict(
 
 async def test_omitting_a_field_leaves_it_alone(service: WorkflowService, db: FakeDatabase) -> None:
     caller = _member(db)
-    workflow = await service.create(caller, name="W", description="Original")
+    workflow = (await service.create(caller, name="W", description="Original")).workflow
 
-    updated = await service.update_metadata(caller, workflow.public_id, name="Renamed")
+    updated = (await service.update_metadata(caller, workflow.public_id, name="Renamed")).workflow
 
     assert updated.description == "Original"
 
@@ -305,7 +339,7 @@ async def test_update_is_scoped_to_the_organization(
 ) -> None:
     owner = _member(db)
     intruder = _member(db)
-    workflow = await service.create(owner, name="Theirs")
+    workflow = (await service.create(owner, name="Theirs")).workflow
 
     with pytest.raises(NotFoundError):
         await service.update_metadata(intruder, workflow.public_id, name="Hijacked")
@@ -313,7 +347,7 @@ async def test_update_is_scoped_to_the_organization(
 
 async def test_soft_delete_hides_the_workflow(service: WorkflowService, db: FakeDatabase) -> None:
     caller = _member(db)
-    workflow = await service.create(caller, name="W")
+    workflow = (await service.create(caller, name="W")).workflow
 
     await service.soft_delete(caller, workflow.public_id)
 
@@ -325,10 +359,10 @@ async def test_a_name_is_reusable_after_a_soft_delete(
     service: WorkflowService, db: FakeDatabase
 ) -> None:
     caller = _member(db)
-    workflow = await service.create(caller, name="W")
+    workflow = (await service.create(caller, name="W")).workflow
     await service.soft_delete(caller, workflow.public_id)
 
-    replacement = await service.create(caller, name="W")
+    replacement = (await service.create(caller, name="W")).workflow
 
     assert replacement.id != workflow.id
 
@@ -338,7 +372,7 @@ async def test_soft_delete_is_scoped_to_the_organization(
 ) -> None:
     owner = _member(db)
     intruder = _member(db)
-    workflow = await service.create(owner, name="Theirs")
+    workflow = (await service.create(owner, name="Theirs")).workflow
 
     with pytest.raises(NotFoundError):
         await service.soft_delete(intruder, workflow.public_id)
@@ -353,9 +387,9 @@ async def test_get_draft_creates_one_on_first_read(
     """The client should never have to handle 'there is no draft yet'."""
 
     caller = _member(db)
-    workflow = await service.create(caller, name="W")
+    workflow = (await service.create(caller, name="W")).workflow
 
-    draft, graph = await service.get_draft(caller, workflow.public_id)
+    draft, graph = _split(await service.get_draft(caller, workflow.public_id))
 
     assert draft.status == "DRAFT"
     assert draft.revision == 1
@@ -364,10 +398,10 @@ async def test_get_draft_creates_one_on_first_read(
 
 async def test_get_draft_is_idempotent(service: WorkflowService, db: FakeDatabase) -> None:
     caller = _member(db)
-    workflow = await service.create(caller, name="W")
+    workflow = (await service.create(caller, name="W")).workflow
 
-    first, _ = await service.get_draft(caller, workflow.public_id)
-    second, _ = await service.get_draft(caller, workflow.public_id)
+    first = _version(await service.get_draft(caller, workflow.public_id))
+    second = _version(await service.get_draft(caller, workflow.public_id))
 
     assert first.id == second.id
     assert len(db.workflow_versions) == 1
@@ -379,12 +413,13 @@ async def test_a_draft_after_publishing_copies_the_active_version(
     caller = _member(db, roles=("owner",))
     workflow, published = await _published(service, caller)
 
-    draft, graph = await service.get_draft(caller, workflow.public_id)
+    view = await service.get_draft(caller, workflow.public_id)
+    draft, graph = view.version, view.nodes
 
     assert draft.id != published.id
     assert draft.status == "DRAFT"
-    assert [n.key for n in graph.nodes] == ["trigger_1", "noop_1", "log_1"]
-    assert len(graph.edges) == 2
+    assert [n.node_key for n in graph] == ["trigger_1", "noop_1", "log_1"]
+    assert len(view.edges) == 2
 
 
 async def test_copy_on_write_preserves_ui_position(
@@ -395,7 +430,7 @@ async def test_copy_on_write_preserves_ui_position(
     caller = _member(db, roles=("owner",))
     workflow, _ = await _published(service, caller)
 
-    draft, _ = await service.get_draft(caller, workflow.public_id)
+    draft = _version(await service.get_draft(caller, workflow.public_id))
 
     copied = db.graphs[draft.id][0]
     assert [n.ui_position["x"] for n in copied] == [0, 100, 200]
@@ -408,7 +443,7 @@ async def test_copy_on_write_does_not_share_config_with_the_published_version(
 
     caller = _member(db, roles=("owner",))
     workflow, published = await _published(service, caller)
-    draft, _ = await service.get_draft(caller, workflow.public_id)
+    draft = _version(await service.get_draft(caller, workflow.public_id))
 
     db.graphs[draft.id][0][2].config["level"] = "debug"
 
@@ -420,7 +455,7 @@ async def test_editing_a_draft_leaves_the_published_graph_alone(
 ) -> None:
     caller = _member(db, roles=("owner",))
     workflow, published = await _published(service, caller)
-    draft, _ = await service.get_draft(caller, workflow.public_id)
+    draft = _version(await service.get_draft(caller, workflow.public_id))
 
     await service.replace_draft(
         caller,
@@ -430,8 +465,8 @@ async def test_editing_a_draft_leaves_the_published_graph_alone(
         edges=[],
     )
 
-    frozen = await service.get_version(caller, workflow.public_id, published.version_no)
-    assert [n.key for n in frozen[1].nodes] == ["trigger_1", "noop_1", "log_1"]
+    frozen = _split(await service.get_version(caller, workflow.public_id, published.version_no))
+    assert [n.node_key for n in frozen[1]] == ["trigger_1", "noop_1", "log_1"]
 
 
 # --- replace_draft and the optimistic lock ------------------------------------
@@ -441,23 +476,23 @@ async def test_replace_draft_stores_the_graph_and_bumps_the_revision(
     service: WorkflowService, db: FakeDatabase
 ) -> None:
     caller = _member(db)
-    workflow = await service.create(caller, name="W")
-    draft, _ = await service.get_draft(caller, workflow.public_id)
+    workflow = (await service.create(caller, name="W")).workflow
+    draft = _version(await service.get_draft(caller, workflow.public_id))
     nodes, edges = _valid_graph()
 
     updated = await service.replace_draft(
         caller, workflow.public_id, revision=draft.revision, nodes=nodes, edges=edges
     )
 
-    assert updated.revision == 2
-    _, graph = await service.get_draft(caller, workflow.public_id)
-    assert [n.key for n in graph.nodes] == ["trigger_1", "noop_1", "log_1"]
+    assert updated.version.revision == 2
+    graph = _graph(await service.get_draft(caller, workflow.public_id))
+    assert [n.node_key for n in graph] == ["trigger_1", "noop_1", "log_1"]
 
 
 async def test_a_stale_revision_is_refused(service: WorkflowService, db: FakeDatabase) -> None:
     caller = _member(db)
-    workflow = await service.create(caller, name="W")
-    draft, _ = await service.get_draft(caller, workflow.public_id)
+    workflow = (await service.create(caller, name="W")).workflow
+    draft = _version(await service.get_draft(caller, workflow.public_id))
     # The number the client read, captured before the save that invalidates it.
     stale = draft.revision
     await service.replace_draft(caller, workflow.public_id, revision=stale, nodes=[], edges=[])
@@ -472,8 +507,8 @@ async def test_a_refused_save_does_not_change_the_graph(
     """A stale save must not partially apply."""
 
     caller = _member(db)
-    workflow = await service.create(caller, name="W")
-    draft, _ = await service.get_draft(caller, workflow.public_id)
+    workflow = (await service.create(caller, name="W")).workflow
+    draft = _version(await service.get_draft(caller, workflow.public_id))
     stale = draft.revision
     nodes, edges = _valid_graph()
     await service.replace_draft(
@@ -489,8 +524,8 @@ async def test_a_refused_save_does_not_change_the_graph(
             edges=[],
         )
 
-    _, graph = await service.get_draft(caller, workflow.public_id)
-    assert [n.key for n in graph.nodes] == ["trigger_1", "noop_1", "log_1"]
+    graph = _graph(await service.get_draft(caller, workflow.public_id))
+    assert [n.node_key for n in graph] == ["trigger_1", "noop_1", "log_1"]
 
 
 async def test_the_second_of_two_concurrent_editors_is_refused(
@@ -499,8 +534,8 @@ async def test_the_second_of_two_concurrent_editors_is_refused(
     """Both read revision 1; only one may win."""
 
     caller = _member(db)
-    workflow = await service.create(caller, name="W")
-    first_read, _ = await service.get_draft(caller, workflow.public_id)
+    workflow = (await service.create(caller, name="W")).workflow
+    first_read = _version(await service.get_draft(caller, workflow.public_id))
     shared = first_read.revision
 
     await service.replace_draft(
@@ -519,18 +554,18 @@ async def test_a_fresh_revision_succeeds_after_a_conflict(
     """The client reloads rather than retrying, and the reload works."""
 
     caller = _member(db)
-    workflow = await service.create(caller, name="W")
-    draft, _ = await service.get_draft(caller, workflow.public_id)
+    workflow = (await service.create(caller, name="W")).workflow
+    draft = _version(await service.get_draft(caller, workflow.public_id))
     await service.replace_draft(
         caller, workflow.public_id, revision=draft.revision, nodes=[], edges=[]
     )
 
-    reloaded, _ = await service.get_draft(caller, workflow.public_id)
+    reloaded = _version(await service.get_draft(caller, workflow.public_id))
     updated = await service.replace_draft(
         caller, workflow.public_id, revision=reloaded.revision, nodes=[], edges=[]
     )
 
-    assert updated.revision == 3
+    assert updated.version.revision == 3
 
 
 async def test_replace_draft_is_scoped_to_the_organization(
@@ -538,7 +573,7 @@ async def test_replace_draft_is_scoped_to_the_organization(
 ) -> None:
     owner = _member(db)
     intruder = _member(db)
-    workflow = await service.create(owner, name="Theirs")
+    workflow = (await service.create(owner, name="Theirs")).workflow
 
     with pytest.raises(NotFoundError):
         await service.replace_draft(intruder, workflow.public_id, revision=1, nodes=[], edges=[])
@@ -551,7 +586,7 @@ async def test_validating_an_empty_draft_reports_no_trigger(
     service: WorkflowService, db: FakeDatabase
 ) -> None:
     caller = _member(db)
-    workflow = await service.create(caller, name="W")
+    workflow = (await service.create(caller, name="W")).workflow
 
     report = await service.validate_draft(caller, workflow.public_id)
 
@@ -561,8 +596,8 @@ async def test_validating_an_empty_draft_reports_no_trigger(
 
 async def test_validating_a_good_draft_passes(service: WorkflowService, db: FakeDatabase) -> None:
     caller = _member(db)
-    workflow = await service.create(caller, name="W")
-    draft, _ = await service.get_draft(caller, workflow.public_id)
+    workflow = (await service.create(caller, name="W")).workflow
+    draft = _version(await service.get_draft(caller, workflow.public_id))
     nodes, edges = _valid_graph()
     await service.replace_draft(
         caller, workflow.public_id, revision=draft.revision, nodes=nodes, edges=edges
@@ -578,12 +613,12 @@ async def test_validation_does_not_change_the_revision(
     service: WorkflowService, db: FakeDatabase
 ) -> None:
     caller = _member(db)
-    workflow = await service.create(caller, name="W")
-    before, _ = await service.get_draft(caller, workflow.public_id)
+    workflow = (await service.create(caller, name="W")).workflow
+    before = _version(await service.get_draft(caller, workflow.public_id))
 
     await service.validate_draft(caller, workflow.public_id)
 
-    after, _ = await service.get_draft(caller, workflow.public_id)
+    after = _version(await service.get_draft(caller, workflow.public_id))
     assert after.revision == before.revision
 
 
@@ -594,8 +629,8 @@ async def test_publishing_promotes_the_draft_in_place(
     service: WorkflowService, db: FakeDatabase
 ) -> None:
     caller = _member(db, roles=("owner",))
-    workflow = await service.create(caller, name="W")
-    draft, _ = await service.get_draft(caller, workflow.public_id)
+    workflow = (await service.create(caller, name="W")).workflow
+    draft = _version(await service.get_draft(caller, workflow.public_id))
     nodes, edges = _valid_graph()
     await service.replace_draft(
         caller, workflow.public_id, revision=draft.revision, nodes=nodes, edges=edges
@@ -615,7 +650,7 @@ async def test_publishing_points_the_workflow_at_the_new_version(
     caller = _member(db, roles=("owner",))
     workflow, version = await _published(service, caller)
 
-    assert (await service.get(caller, workflow.public_id)).active_version_id == version.id
+    assert (await service.get(caller, workflow.public_id)).workflow.active_version_id == version.id
 
 
 async def test_publishing_leaves_no_draft_behind(
@@ -641,8 +676,8 @@ async def test_version_numbers_are_sequential(service: WorkflowService, db: Fake
 
 async def test_publish_notes_are_recorded(service: WorkflowService, db: FakeDatabase) -> None:
     caller = _member(db, roles=("owner",))
-    workflow = await service.create(caller, name="W")
-    draft, _ = await service.get_draft(caller, workflow.public_id)
+    workflow = (await service.create(caller, name="W")).workflow
+    draft = _version(await service.get_draft(caller, workflow.public_id))
     nodes, edges = _valid_graph()
     await service.replace_draft(
         caller, workflow.public_id, revision=draft.revision, nodes=nodes, edges=edges
@@ -657,7 +692,7 @@ async def test_publishing_with_no_draft_is_a_conflict(
     service: WorkflowService, db: FakeDatabase
 ) -> None:
     caller = _member(db, roles=("owner",))
-    workflow = await service.create(caller, name="W")
+    workflow = (await service.create(caller, name="W")).workflow
 
     with pytest.raises(ConflictError):
         await service.publish(caller, workflow.public_id)
@@ -705,8 +740,8 @@ async def test_publishing_an_invalid_graph_is_refused(
     reason: str,
 ) -> None:
     caller = _member(db, roles=("owner",))
-    workflow = await service.create(caller, name="W")
-    draft, _ = await service.get_draft(caller, workflow.public_id)
+    workflow = (await service.create(caller, name="W")).workflow
+    draft = _version(await service.get_draft(caller, workflow.public_id))
     await service.replace_draft(
         caller, workflow.public_id, revision=draft.revision, nodes=nodes, edges=edges
     )
@@ -719,23 +754,23 @@ async def test_a_refused_publish_leaves_the_draft_a_draft(
     service: WorkflowService, db: FakeDatabase
 ) -> None:
     caller = _member(db, roles=("owner",))
-    workflow = await service.create(caller, name="W")
-    draft, _ = await service.get_draft(caller, workflow.public_id)
+    workflow = (await service.create(caller, name="W")).workflow
+    draft = _version(await service.get_draft(caller, workflow.public_id))
 
     with pytest.raises(ConflictError):
         await service.publish(caller, workflow.public_id)
 
     assert draft.status == "DRAFT"
     assert draft.version_no is None
-    assert (await service.get(caller, workflow.public_id)).active_version_id is None
+    assert (await service.get(caller, workflow.public_id)).workflow.active_version_id is None
 
 
 async def test_a_refused_publish_reports_every_blocking_issue(
     service: WorkflowService, db: FakeDatabase
 ) -> None:
     caller = _member(db, roles=("owner",))
-    workflow = await service.create(caller, name="W")
-    draft, _ = await service.get_draft(caller, workflow.public_id)
+    workflow = (await service.create(caller, name="W")).workflow
+    draft = _version(await service.get_draft(caller, workflow.public_id))
     await service.replace_draft(
         caller,
         workflow.public_id,
@@ -758,8 +793,8 @@ async def test_warnings_do_not_block_publication(
     """An unreachable node is worth saying and not worth refusing over (§6.7)."""
 
     caller = _member(db, roles=("owner",))
-    workflow = await service.create(caller, name="W")
-    draft, _ = await service.get_draft(caller, workflow.public_id)
+    workflow = (await service.create(caller, name="W")).workflow
+    draft = _version(await service.get_draft(caller, workflow.public_id))
     nodes, edges = _valid_graph()
     nodes.append(_node("orphan", "core.constant"))
     await service.replace_draft(
@@ -793,8 +828,8 @@ async def test_an_administrator_may_publish_someone_elses_workflow(
     service: WorkflowService, db: FakeDatabase, role: str
 ) -> None:
     creator = _member(db, roles=("member",))
-    workflow = await service.create(creator, name="W")
-    draft, _ = await service.get_draft(creator, workflow.public_id)
+    workflow = (await service.create(creator, name="W")).workflow
+    draft = _version(await service.get_draft(creator, workflow.public_id))
     nodes, edges = _valid_graph()
     await service.replace_draft(
         creator, workflow.public_id, revision=draft.revision, nodes=nodes, edges=edges
@@ -815,8 +850,8 @@ async def test_a_member_who_is_not_the_creator_is_refused(
     service: WorkflowService, db: FakeDatabase
 ) -> None:
     creator = _member(db, roles=("member",))
-    workflow = await service.create(creator, name="W")
-    draft, _ = await service.get_draft(creator, workflow.public_id)
+    workflow = (await service.create(creator, name="W")).workflow
+    draft = _version(await service.get_draft(creator, workflow.public_id))
     nodes, edges = _valid_graph()
     await service.replace_draft(
         creator, workflow.public_id, revision=draft.revision, nodes=nodes, edges=edges
@@ -838,8 +873,8 @@ async def test_a_null_creator_leaves_publication_to_administrators(
     """The correct direction to fail in: the workflow outlived its author."""
 
     caller = _member(db, roles=("member",))
-    workflow = await service.create(caller, name="W")
-    draft, _ = await service.get_draft(caller, workflow.public_id)
+    workflow = (await service.create(caller, name="W")).workflow
+    draft = _version(await service.get_draft(caller, workflow.public_id))
     nodes, edges = _valid_graph()
     await service.replace_draft(
         caller, workflow.public_id, revision=draft.revision, nodes=nodes, edges=edges
@@ -855,8 +890,8 @@ async def test_an_authorization_failure_publishes_nothing(
     service: WorkflowService, db: FakeDatabase
 ) -> None:
     creator = _member(db, roles=("member",))
-    workflow = await service.create(creator, name="W")
-    draft, _ = await service.get_draft(creator, workflow.public_id)
+    workflow = (await service.create(creator, name="W")).workflow
+    draft = _version(await service.get_draft(creator, workflow.public_id))
     nodes, edges = _valid_graph()
     await service.replace_draft(
         creator, workflow.public_id, revision=draft.revision, nodes=nodes, edges=edges
@@ -871,7 +906,7 @@ async def test_an_authorization_failure_publishes_nothing(
         await service.publish(stranger, workflow.public_id)
 
     assert draft.status == "DRAFT"
-    assert (await service.get(creator, workflow.public_id)).active_version_id is None
+    assert (await service.get(creator, workflow.public_id)).workflow.active_version_id is None
 
 
 def _second_user(db: FakeDatabase, peer: AuthenticatedUser) -> str:
@@ -897,7 +932,7 @@ async def test_list_versions_is_newest_first(service: WorkflowService, db: FakeD
     workflow, first = await _published(service, caller)
     await service.get_draft(caller, workflow.public_id)
 
-    versions = await service.list_versions(caller, workflow.public_id)
+    versions, _total = await service.list_versions(caller, workflow.public_id, limit=50, offset=0)
 
     assert [v.status for v in versions] == ["DRAFT", "PUBLISHED"]
     assert versions[1].id == first.id
@@ -909,17 +944,17 @@ async def test_get_version_returns_the_frozen_graph(
     caller = _member(db, roles=("owner",))
     workflow, version = await _published(service, caller)
 
-    found, graph = await service.get_version(caller, workflow.public_id, version.version_no)
+    found, graph = _split(await service.get_version(caller, workflow.public_id, version.version_no))
 
     assert found.id == version.id
-    assert [n.key for n in graph.nodes] == ["trigger_1", "noop_1", "log_1"]
+    assert [n.node_key for n in graph] == ["trigger_1", "noop_1", "log_1"]
 
 
 async def test_an_unknown_version_number_is_not_found(
     service: WorkflowService, db: FakeDatabase
 ) -> None:
     caller = _member(db)
-    workflow = await service.create(caller, name="W")
+    workflow = (await service.create(caller, name="W")).workflow
 
     with pytest.raises(NotFoundError):
         await service.get_version(caller, workflow.public_id, 99)
@@ -933,7 +968,7 @@ async def test_versions_are_scoped_to_the_organization(
     workflow, version = await _published(service, owner)
 
     with pytest.raises(NotFoundError):
-        await service.list_versions(intruder, workflow.public_id)
+        await service.list_versions(intruder, workflow.public_id, limit=50, offset=0)
     with pytest.raises(NotFoundError):
         await service.get_version(intruder, workflow.public_id, version.version_no)
 
@@ -949,7 +984,7 @@ async def test_each_use_case_opens_exactly_one_transaction(
     service: WorkflowService, db: FakeDatabase, factory: FakeUnitOfWorkFactory, use_case: str
 ) -> None:
     caller = _member(db)
-    workflow = await service.create(caller, name="W")
+    workflow = (await service.create(caller, name="W")).workflow
     factory.created.clear()
 
     if use_case == "create":
@@ -979,7 +1014,7 @@ async def test_read_only_use_cases_close_their_transaction(
     """
 
     caller = _member(db)
-    workflow = await service.create(caller, name="W")
+    workflow = (await service.create(caller, name="W")).workflow
     factory.created.clear()
 
     if use_case == "get":
@@ -987,6 +1022,112 @@ async def test_read_only_use_cases_close_their_transaction(
     elif use_case == "list":
         await service.list(caller, limit=10, offset=0)
     else:
-        await service.list_versions(caller, workflow.public_id)
+        await service.list_versions(caller, workflow.public_id, limit=50, offset=0)
 
     assert factory.only.commit_calls == 1
+
+
+# --- Integrity-error classification (audit F-1) -------------------------------
+#
+# `_commit` used to report *every* IntegrityError as a duplicate workflow name.
+# The name collision is the only one it can explain, and the only one a client
+# can act on by renaming; anything else is a server-side fault and must surface
+# as one rather than sending a caller to rename a workflow that was never the
+# problem.
+
+
+def _mysql_duplicate(key: str) -> IntegrityError:
+    """An IntegrityError shaped like the one asyncmy raises for errno 1062."""
+
+    orig = Exception(f"(1062, \"Duplicate entry 'a-b' for key '{key}'\")")
+    return IntegrityError("INSERT INTO workflows ...", {}, orig)
+
+
+def test_the_name_collision_is_recognised() -> None:
+    """The real constraint, spelled as the database spells it."""
+
+    assert _is_duplicate_name(_mysql_duplicate(f"workflows.{_NAME_CONSTRAINT}"))
+
+
+def test_the_constraint_name_matches_the_schema() -> None:
+    """Guards against the model and the service drifting apart.
+
+    If migration 0004's constraint were ever renamed, this fails rather than the
+    service silently ceasing to recognise its own collision.
+    """
+
+    constraints = {
+        c.name for c in Workflow.__table__.constraints if c.__class__.__name__ == "UniqueConstraint"
+    }
+
+    assert _NAME_CONSTRAINT in constraints
+
+
+@pytest.mark.parametrize(
+    ("key", "reason"),
+    [
+        ("workflows.uq_workflows_public_id", "a different unique index on the same table"),
+        ("workflow_versions.uq_workflow_versions_draft_key", "the one-draft-per-workflow index"),
+        ("workflow_nodes.uq_workflow_nodes_workflow_version_id_node_key", "a node key collision"),
+    ],
+)
+def test_another_unique_violation_is_not_a_name_collision(key: str, reason: str) -> None:
+    assert not _is_duplicate_name(_mysql_duplicate(key))
+
+
+def test_a_foreign_key_violation_is_not_a_name_collision() -> None:
+    orig = Exception(
+        "(1452, 'Cannot add or update a child row: a foreign key constraint fails "
+        "(`app`.`workflows`, CONSTRAINT `fk_workflows_organization_id_organizations`)')"
+    )
+
+    assert not _is_duplicate_name(IntegrityError("INSERT ...", {}, orig))
+
+
+def test_an_unreadable_integrity_error_is_not_assumed_to_be_a_name_collision() -> None:
+    """Not knowing must fail towards honesty, not towards a convenient message."""
+
+    assert not _is_duplicate_name(IntegrityError("INSERT ...", {}, None))
+
+
+class _FailingUnitOfWork:
+    """A unit of work whose commit fails, to drive `_commit`'s two branches."""
+
+    def __init__(self, error: Exception) -> None:
+        self._error = error
+        self.rolled_back = False
+
+    async def commit(self) -> None:
+        raise self._error
+
+    async def rollback(self) -> None:
+        self.rolled_back = True
+
+
+async def test_a_name_collision_at_commit_becomes_a_conflict(
+    service: WorkflowService,
+) -> None:
+    """The race the pre-check cannot close: both callers pass, one loses the index."""
+
+    uow = _FailingUnitOfWork(_mysql_duplicate(f"workflows.{_NAME_CONSTRAINT}"))
+
+    with pytest.raises(ConflictError, match="already exists"):
+        await service._commit(uow, name="Nightly report")  # type: ignore[arg-type]
+
+    assert uow.rolled_back
+
+
+async def test_another_integrity_failure_is_re_raised_not_relabelled(
+    service: WorkflowService,
+) -> None:
+    """The F-1 defect: this used to arrive as "a workflow named X already exists"."""
+
+    original = _mysql_duplicate("workflow_versions.uq_workflow_versions_draft_key")
+    uow = _FailingUnitOfWork(original)
+
+    with pytest.raises(IntegrityError) as raised:
+        await service._commit(uow, name="Nightly report")  # type: ignore[arg-type]
+
+    assert raised.value is original
+    # The transaction is still unwound; only the label changed.
+    assert uow.rolled_back

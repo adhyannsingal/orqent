@@ -257,6 +257,9 @@ class FakeWorkflowRepository:
     async def add(self, workflow: Workflow) -> Workflow:
         workflow.id = self._db.next_id()
         workflow.public_id = workflow.public_id or new_public_id()
+        # A real flush populates the foreign key from the relationship.
+        if workflow.creator is not None:
+            workflow.created_by_user_id = workflow.creator.id
         self._db.pending_workflows.append(workflow)
         return workflow
 
@@ -338,11 +341,31 @@ class FakeWorkflowVersionRepository:
             None,
         )
 
-    async def list_for_workflow(self, workflow_id: int) -> list[WorkflowVersion]:
-        return sorted(
+    async def list_for_workflow(
+        self, workflow_id: int, *, limit: int | None = None, offset: int = 0
+    ) -> list[WorkflowVersion]:
+        found = sorted(
             (v for v in self._db.visible_workflow_versions if v.workflow_id == workflow_id),
             key=lambda v: v.id,
             reverse=True,
+        )
+        return found if limit is None else found[offset : offset + limit]
+
+    async def count_for_workflow(self, workflow_id: int) -> int:
+        return len([v for v in self._db.visible_workflow_versions if v.workflow_id == workflow_id])
+
+    async def version_numbers(self, version_ids: list[int]) -> dict[int, int]:
+        return {
+            v.id: v.version_no
+            for v in self._db.visible_workflow_versions
+            if v.id in set(version_ids) and v.version_no is not None
+        }
+
+    async def workflow_ids_with_drafts(self, workflow_ids: list[int]) -> frozenset[int]:
+        return frozenset(
+            v.workflow_id
+            for v in self._db.visible_workflow_versions
+            if v.workflow_id in set(workflow_ids) and v.status == "DRAFT"
         )
 
     async def list_nodes(self, version_id: int) -> list[WorkflowNode]:

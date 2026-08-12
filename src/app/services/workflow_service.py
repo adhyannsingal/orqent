@@ -31,13 +31,14 @@ the rule exists to admit.
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime
 
 import structlog
 from sqlalchemy.exc import IntegrityError
 
 from app.domain.errors import AuthenticationError, AuthorizationError, ConflictError, NotFoundError
-from app.domain.graph.model import GraphEdge, WorkflowGraph
+from app.domain.graph.model import GraphEdge
 from app.domain.graph.validation import ValidationReport, validate_graph
 from app.domain.nodes.registry import NodeRegistry
 from app.domain.value_objects.authenticated_user import AuthenticatedUser
@@ -56,6 +57,84 @@ PUBLISHED = "PUBLISHED"
 # publish their own regardless of role, which is the whole reason this decision
 # cannot live on the route (§1.6i).
 PUBLISHER_ROLES = ("owner", "admin")
+
+
+@dataclass(frozen=True, slots=True)
+class WorkflowSummaryView:
+    """A workflow plus the two facts a caller cannot read off its row.
+
+    Both are derived, not stored. ``active_version_id`` on the row is an
+    internal id, and the wire carries a version *number* (ADR-004); "has
+    unpublished changes" is simply whether a draft exists, which the
+    draft/published lifecycle already answers (ADR-026).
+
+    They live here rather than in a route because deriving them needs a
+    repository, and a route reaching for one would put persistence at the edge.
+    """
+
+    workflow: Workflow
+    active_version_no: int | None
+    has_unpublished_changes: bool
+
+
+@dataclass(frozen=True, slots=True)
+class WorkflowView(WorkflowSummaryView):
+    """One workflow read on its own, with the publish decision already made.
+
+    ``can_publish`` is the server's own answer to §1.6i for the calling user.
+    Computed here because the rule is resource-dependent (ADR-032): a client
+    re-deriving it would drift the moment the rule changes, and a route
+    re-deriving it would be the same rule in two places.
+
+    Listing produces :class:`WorkflowSummaryView` instead, because the creator
+    relationship it depends on is deliberately not loaded for a page of results.
+    """
+
+    can_publish: bool
+
+
+@dataclass(frozen=True, slots=True)
+class GraphView:
+    """A version and its graph, as rows plus key-addressed edges.
+
+    Nodes are the **rows**, not
+    :class:`~app.domain.graph.model.GraphNode`, because the domain node has no
+    ``ui_position`` — it is the validator's view, and canvas coordinates are not
+    something any rule reasons about. Reading them through ``list_nodes`` is the
+    path M11 added for exactly this reason.
+
+    Edges are domain values already addressed by node key, which is both what
+    the wire wants and what ``replace_graph`` accepts — so what a client reads
+    is the shape it can send straight back.
+    """
+
+    version: WorkflowVersion
+    nodes: Sequence[WorkflowNode]
+    edges: Sequence[GraphEdge]
+
+
+# The unique index behind "a workflow name is taken", declared in migration 0004
+# and on `Workflow.__table_args__`. Named here so the service checks for the one
+# constraint it can explain rather than assuming every integrity failure is this
+# one.
+_NAME_CONSTRAINT = "uq_workflows_organization_id_name_active"
+
+
+def _is_duplicate_name(error: IntegrityError) -> bool:
+    """Whether this integrity failure is the workflow-name collision.
+
+    Read from the driver's own message rather than a vendor error code: the
+    constraint name is what identifies it unambiguously, and asyncmy surfaces it
+    inside the 1062 text as ``Duplicate entry '...' for key
+    'workflows.uq_workflows_organization_id_name_active'``.
+
+    Deliberately tolerant of not knowing. If the message is missing or shaped
+    differently, this returns ``False`` and the caller re-raises — mislabelling
+    an unknown failure as a name collision is worse than surfacing it as the
+    fault it is.
+    """
+
+    return _NAME_CONSTRAINT in str(getattr(error, "orig", error))
 
 
 class WorkflowService:
@@ -85,7 +164,7 @@ class WorkflowService:
         *,
         name: str,
         description: str | None = None,
-    ) -> Workflow:
+    ) -> WorkflowView:
         """Create an empty workflow owned by the caller's organization.
 
         No version is created. A workflow with no draft and no active version is
@@ -104,12 +183,26 @@ class WorkflowService:
                     description=description,
                     organization_id=caller.organization_id,
                     created_by_user_id=caller.id,
+                    # Assigned as well as the foreign key so the relationship is
+                    # populated in memory. Every other read eager-loads it, and
+                    # without it here the publish rule and the `created_by`
+                    # field would both trigger a lazy load on a session that is
+                    # already closing — which under asyncio raises rather than
+                    # fetching.
+                    creator=caller,
                 )
             )
             await self._commit(uow, name=name)
 
             log.info("workflow.created", workflow_id=workflow.public_id)
-            return workflow
+            # A new workflow has no versions at all, so both version facts are
+            # known without asking the database.
+            return WorkflowView(
+                workflow=workflow,
+                active_version_no=None,
+                has_unpublished_changes=False,
+                can_publish=self._may_publish(workflow, current_user),
+            )
 
     async def list(
         self,
@@ -118,7 +211,7 @@ class WorkflowService:
         limit: int,
         offset: int,
         query: str | None = None,
-    ) -> tuple[Sequence[Workflow], int]:
+    ) -> tuple[Sequence[WorkflowSummaryView], int]:
         """One page of the organization's workflows, and the unpaginated total.
 
         Both come from the same transaction so the total describes the set the
@@ -131,17 +224,19 @@ class WorkflowService:
                 caller.organization_id, limit=limit, offset=offset, query=query
             )
             total = await uow.workflows.count_for_org(caller.organization_id, query=query)
+            summaries = await self._summarize(uow, page)
             await self._close_read(uow)
-            return page, total
+            return summaries, total
 
-    async def get(self, current_user: AuthenticatedUser, public_id: str) -> Workflow:
+    async def get(self, current_user: AuthenticatedUser, public_id: str) -> WorkflowView:
         """One workflow by public ID, scoped to the caller's organization."""
 
         async with self._unit_of_work_factory() as uow:
             caller = await self._caller(uow, current_user)
             workflow = await self._workflow(uow, caller, public_id)
+            view = await self._detail(uow, workflow, current_user)
             await self._close_read(uow)
-            return workflow
+            return view
 
     async def update_metadata(
         self,
@@ -150,7 +245,7 @@ class WorkflowService:
         *,
         name: str | None = None,
         description: str | None = None,
-    ) -> Workflow:
+    ) -> WorkflowView:
         """Rename a workflow or change its description.
 
         Both are optional; omitting one leaves it as it was. Renaming to the
@@ -168,8 +263,9 @@ class WorkflowService:
             if description is not None:
                 workflow.description = description
 
+            view = await self._detail(uow, workflow, current_user)
             await self._commit(uow, name=name)
-            return workflow
+            return view
 
     async def soft_delete(self, current_user: AuthenticatedUser, public_id: str) -> None:
         """Mark a workflow deleted, freeing its name for reuse (ADR-005).
@@ -190,9 +286,7 @@ class WorkflowService:
 
     # --- Drafts -------------------------------------------------------------
 
-    async def get_draft(
-        self, current_user: AuthenticatedUser, public_id: str
-    ) -> tuple[WorkflowVersion, WorkflowGraph]:
+    async def get_draft(self, current_user: AuthenticatedUser, public_id: str) -> GraphView:
         """The workflow's draft and its graph, creating the draft if needed.
 
         A read that can write, deliberately: the client should never have to
@@ -205,9 +299,9 @@ class WorkflowService:
             workflow = await self._workflow(uow, caller, public_id)
 
             draft = await self._ensure_draft(uow, workflow, caller)
-            graph = await uow.workflow_versions.load_graph(draft.id)
+            view = await self._graph_view(uow, draft)
             await uow.commit()
-            return draft, graph
+            return view
 
     async def replace_draft(
         self,
@@ -217,7 +311,7 @@ class WorkflowService:
         revision: int,
         nodes: Sequence[WorkflowNode],
         edges: Sequence[GraphEdge],
-    ) -> WorkflowVersion:
+    ) -> GraphView:
         """Replace the draft's whole graph, if ``revision`` is still current.
 
         The builder sends the entire canvas on every save, so this is a
@@ -246,7 +340,10 @@ class WorkflowService:
             await uow.commit()
 
             log.info("workflow.draft_replaced", workflow_id=public_id, revision=draft.revision)
-            return draft
+            # The rows just written, not a re-read: `replace_graph` assigned
+            # their ids, and re-querying would only confirm what this
+            # transaction already knows.
+            return GraphView(version=draft, nodes=list(nodes), edges=list(edges))
 
     async def validate_draft(
         self, current_user: AuthenticatedUser, public_id: str
@@ -342,20 +439,33 @@ class WorkflowService:
     # --- Versions -----------------------------------------------------------
 
     async def list_versions(
-        self, current_user: AuthenticatedUser, public_id: str
-    ) -> Sequence[WorkflowVersion]:
-        """Every version of a workflow, newest first."""
+        self,
+        current_user: AuthenticatedUser,
+        public_id: str,
+        *,
+        limit: int,
+        offset: int,
+    ) -> tuple[Sequence[WorkflowVersion], int]:
+        """One page of a workflow's versions, newest first, and the total.
+
+        The draft is included when one exists. A version history that hides the
+        row currently being edited would be a strange thing to show, and
+        ``version_no`` is nullable precisely so a draft can appear in this list.
+        """
 
         async with self._unit_of_work_factory() as uow:
             caller = await self._caller(uow, current_user)
             workflow = await self._workflow(uow, caller, public_id)
-            versions = await uow.workflow_versions.list_for_workflow(workflow.id)
+            page = await uow.workflow_versions.list_for_workflow(
+                workflow.id, limit=limit, offset=offset
+            )
+            total = await uow.workflow_versions.count_for_workflow(workflow.id)
             await self._close_read(uow)
-            return versions
+            return page, total
 
     async def get_version(
         self, current_user: AuthenticatedUser, public_id: str, version_no: int
-    ) -> tuple[WorkflowVersion, WorkflowGraph]:
+    ) -> GraphView:
         """One published version and the graph it froze."""
 
         async with self._unit_of_work_factory() as uow:
@@ -366,9 +476,79 @@ class WorkflowService:
             if version is None:
                 raise NotFoundError(f"Version {version_no} of this workflow does not exist.")
 
-            graph = await uow.workflow_versions.load_graph(version.id)
+            view = await self._graph_view(uow, version)
             await self._close_read(uow)
-            return version, graph
+            return view
+
+    # --- Views --------------------------------------------------------------
+
+    async def _summarize(
+        self, uow: SqlAlchemyUnitOfWork, workflows: Sequence[Workflow]
+    ) -> Sequence[WorkflowSummaryView]:
+        """Decorate a page of workflows with their derived facts.
+
+        Annotated ``Sequence`` rather than ``list`` because the ``list`` use
+        case above shadows the builtin inside this class body — the same trap
+        ``NodeDescriptor.node_type`` exists to avoid.
+
+        Two batched queries regardless of page size, which is the whole reason
+        the repository takes id sequences: asking per workflow would make a
+        twenty-row page twenty-one queries.
+        """
+
+        if not workflows:
+            return []
+
+        active_ids = [w.active_version_id for w in workflows if w.active_version_id is not None]
+        numbers = await uow.workflow_versions.version_numbers(active_ids)
+        with_drafts = await uow.workflow_versions.workflow_ids_with_drafts(
+            [w.id for w in workflows]
+        )
+
+        return [
+            WorkflowSummaryView(
+                workflow=workflow,
+                active_version_no=(
+                    None
+                    if workflow.active_version_id is None
+                    else numbers.get(workflow.active_version_id)
+                ),
+                has_unpublished_changes=workflow.id in with_drafts,
+            )
+            for workflow in workflows
+        ]
+
+    async def _detail(
+        self,
+        uow: SqlAlchemyUnitOfWork,
+        workflow: Workflow,
+        current_user: AuthenticatedUser,
+    ) -> WorkflowView:
+        """One workflow's summary plus the publish decision for this caller."""
+
+        summary = (await self._summarize(uow, [workflow]))[0]
+        return WorkflowView(
+            workflow=workflow,
+            active_version_no=summary.active_version_no,
+            has_unpublished_changes=summary.has_unpublished_changes,
+            can_publish=self._may_publish(workflow, current_user),
+        )
+
+    async def _graph_view(self, uow: SqlAlchemyUnitOfWork, version: WorkflowVersion) -> GraphView:
+        """A version's graph as rows plus key-addressed edges.
+
+        Nodes come from ``list_nodes`` because the API must return each node's
+        ``ui_position`` and ``load_graph`` deliberately drops it; edges come
+        from ``load_graph`` because they are already translated from internal
+        ids back to node keys. The same pairing ``_ensure_draft`` uses to copy a
+        graph without flattening its layout.
+        """
+
+        return GraphView(
+            version=version,
+            nodes=await uow.workflow_versions.list_nodes(version.id),
+            edges=(await uow.workflow_versions.load_graph(version.id)).edges,
+        )
 
     # --- Shared steps -------------------------------------------------------
 
@@ -438,16 +618,27 @@ class WorkflowService:
         and only one can win the unique index. Without this the loser would get
         a 500 for what is, from their side, exactly the conflict the check
         already knows how to describe.
+
+        **Only that one constraint is claimed.** Any other integrity failure is
+        re-raised untouched, because reporting it as a duplicate name would send
+        a client to rename a workflow that was never the problem — it would
+        retry forever on a message describing the wrong cause. An unexpected
+        constraint violation is a server-side fault and should surface as one.
+
+        The rollback happens either way: the transaction is dead once the
+        database has refused it, and leaving it open would poison the session.
         """
 
         try:
             await uow.commit()
         except IntegrityError as exc:
             await uow.rollback()
+            if not _is_duplicate_name(exc):
+                raise
             raise ConflictError(
                 f"A workflow named {name!r} already exists."
                 if name is not None
-                else "This change conflicts with another workflow."
+                else "That workflow name is already taken."
             ) from exc
 
     async def _ensure_draft(
@@ -532,8 +723,20 @@ class WorkflowService:
         outlived the person who made it.
         """
 
+        if not WorkflowService._may_publish(workflow, current_user):
+            raise AuthorizationError(
+                "Only the workflow's creator or an administrator may publish it."
+            )
+
+    @staticmethod
+    def _may_publish(workflow: Workflow, current_user: AuthenticatedUser) -> bool:
+        """Whether this caller may publish this workflow (§1.6i).
+
+        The single statement of the rule. :meth:`_require_publish_permission`
+        enforces it and ``can_publish`` reports it, so the answer a client is
+        shown and the answer publish acts on cannot drift apart.
+        """
+
         if any(current_user.has_role(role) for role in PUBLISHER_ROLES):
-            return
-        if workflow.creator is not None and workflow.creator.public_id == current_user.public_id:
-            return
-        raise AuthorizationError("Only the workflow's creator or an administrator may publish it.")
+            return True
+        return workflow.creator is not None and workflow.creator.public_id == current_user.public_id
