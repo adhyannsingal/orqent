@@ -65,6 +65,19 @@ class DomainRuleError(AppError):
     default_message = "The request violates a domain rule."
 
 
+class InvalidStateTransitionError(DomainRuleError):
+    """An execution state machine was asked to make an illegal move.
+
+    Separate from its parent so a caller can distinguish "this run cannot be
+    resumed because it already finished" from every other domain-rule refusal —
+    the scheduler's guarantees are only worth as much as the ability to tell
+    which one failed.
+    """
+
+    code = "invalid_state_transition"
+    default_message = "That state transition is not allowed."
+
+
 class InfrastructureError(AppError):
     code = "infrastructure_error"
     http_status = 503

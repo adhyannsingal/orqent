@@ -22,6 +22,11 @@ def test_exactly_the_expected_tables_exist() -> None:
         "workflow_versions",
         "workflow_nodes",
         "workflow_edges",
+        # Phase 6 execution tables; their own metadata lives in
+        # tests/unit/test_execution_metadata.py.
+        "runs",
+        "node_executions",
+        "run_events",
     }
 
 
