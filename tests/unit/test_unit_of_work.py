@@ -14,9 +14,12 @@ from sqlalchemy.ext.asyncio import (
 from sqlalchemy.pool import StaticPool
 
 from app.infrastructure.db.unit_of_work import SqlAlchemyUnitOfWork
+from app.infrastructure.repositories.node_execution_repository import NodeExecutionRepository
 from app.infrastructure.repositories.organization_repository import OrganizationRepository
 from app.infrastructure.repositories.refresh_token_repository import RefreshTokenRepository
 from app.infrastructure.repositories.role_repository import RoleRepository
+from app.infrastructure.repositories.run_event_repository import RunEventRepository
+from app.infrastructure.repositories.run_repository import RunRepository
 from app.infrastructure.repositories.user_repository import UserRepository
 from app.infrastructure.repositories.workflow_repository import WorkflowRepository
 from app.infrastructure.repositories.workflow_version_repository import (
@@ -30,6 +33,9 @@ REPOSITORIES = {
     "refresh_tokens": RefreshTokenRepository,
     "workflows": WorkflowRepository,
     "workflow_versions": WorkflowVersionRepository,
+    "runs": RunRepository,
+    "node_executions": NodeExecutionRepository,
+    "run_events": RunEventRepository,
 }
 
 

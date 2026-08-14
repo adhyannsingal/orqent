@@ -21,9 +21,12 @@ from typing import Self
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.domain.ports.unit_of_work import UnitOfWork
+from app.infrastructure.repositories.node_execution_repository import NodeExecutionRepository
 from app.infrastructure.repositories.organization_repository import OrganizationRepository
 from app.infrastructure.repositories.refresh_token_repository import RefreshTokenRepository
 from app.infrastructure.repositories.role_repository import RoleRepository
+from app.infrastructure.repositories.run_event_repository import RunEventRepository
+from app.infrastructure.repositories.run_repository import RunRepository
 from app.infrastructure.repositories.user_repository import UserRepository
 from app.infrastructure.repositories.workflow_repository import WorkflowRepository
 from app.infrastructure.repositories.workflow_version_repository import (
@@ -43,6 +46,9 @@ class SqlAlchemyUnitOfWork(UnitOfWork):
         self._refresh_tokens: RefreshTokenRepository | None = None
         self._workflows: WorkflowRepository | None = None
         self._workflow_versions: WorkflowVersionRepository | None = None
+        self._runs: RunRepository | None = None
+        self._node_executions: NodeExecutionRepository | None = None
+        self._run_events: RunEventRepository | None = None
 
     @property
     def session(self) -> AsyncSession:
@@ -95,6 +101,24 @@ class SqlAlchemyUnitOfWork(UnitOfWork):
             self._workflow_versions = WorkflowVersionRepository(self.session)
         return self._workflow_versions
 
+    @property
+    def runs(self) -> RunRepository:
+        if self._runs is None:
+            self._runs = RunRepository(self.session)
+        return self._runs
+
+    @property
+    def node_executions(self) -> NodeExecutionRepository:
+        if self._node_executions is None:
+            self._node_executions = NodeExecutionRepository(self.session)
+        return self._node_executions
+
+    @property
+    def run_events(self) -> RunEventRepository:
+        if self._run_events is None:
+            self._run_events = RunEventRepository(self.session)
+        return self._run_events
+
     # --- Lifecycle ----------------------------------------------------------
 
     async def __aenter__(self) -> Self:
@@ -122,6 +146,9 @@ class SqlAlchemyUnitOfWork(UnitOfWork):
             self._refresh_tokens = None
             self._workflows = None
             self._workflow_versions = None
+            self._runs = None
+            self._node_executions = None
+            self._run_events = None
 
     async def commit(self) -> None:
         await self.session.commit()
