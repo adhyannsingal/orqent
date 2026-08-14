@@ -199,7 +199,12 @@ def test_exactly_one_built_in_is_a_trigger(registry: NodeRegistry) -> None:
 
 async def test_manual_trigger_completes_on_its_output_handle() -> None:
     result = await trigger_manual.RUNNER.run(
-        NodeRunContext(config=trigger_manual.ManualTriggerConfig(), inputs={})
+        NodeRunContext(
+            config=trigger_manual.ManualTriggerConfig(),
+            inputs={},
+            idempotency_key="1:1:1",
+            trigger_payload={},
+        )
     )
 
     assert isinstance(result, Completed)
@@ -208,7 +213,12 @@ async def test_manual_trigger_completes_on_its_output_handle() -> None:
 
 async def test_constant_returns_its_configured_value() -> None:
     result = await core_constant.RUNNER.run(
-        NodeRunContext(config=core_constant.ConstantConfig(value="hello"), inputs={})
+        NodeRunContext(
+            config=core_constant.ConstantConfig(value="hello"),
+            inputs={},
+            idempotency_key="1:1:1",
+            trigger_payload={},
+        )
     )
 
     assert isinstance(result, Completed)
@@ -219,7 +229,12 @@ async def test_noop_passes_its_input_through() -> None:
     payload = {"anything": [1, 2, 3]}
 
     result = await core_noop.RUNNER.run(
-        NodeRunContext(config=core_noop.NoOpConfig(), inputs={"main": payload})
+        NodeRunContext(
+            config=core_noop.NoOpConfig(),
+            inputs={"main": payload},
+            idempotency_key="1:1:1",
+            trigger_payload={},
+        )
     )
 
     assert isinstance(result, Completed)
@@ -228,7 +243,12 @@ async def test_noop_passes_its_input_through() -> None:
 
 async def test_log_completes_with_no_outputs() -> None:
     result = await core_log.RUNNER.run(
-        NodeRunContext(config=core_log.LogConfig(), inputs={"main": "hello"})
+        NodeRunContext(
+            config=core_log.LogConfig(),
+            inputs={"main": "hello"},
+            idempotency_key="1:1:1",
+            trigger_payload={},
+        )
     )
 
     assert isinstance(result, Completed)

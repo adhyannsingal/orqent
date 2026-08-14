@@ -29,12 +29,12 @@ from app.domain.nodes.result import NodeResult
 class NodeRunContext:
     """What a node is given when it runs.
 
-    Deliberately two fields. Both are certain for any engine design: a node
-    needs its validated configuration and the values that arrived on its input
-    handles. Everything else Phase 5 may want — an idempotency key, run
-    metadata, a cancellation signal — is a guess today, and guessing produces
-    fields that are wrong in a way nobody notices until they are load-bearing.
-    Adding fields to a frozen dataclass later is cheap; removing them is not.
+    Phase 4 declared the two fields certain for any engine design — a validated
+    configuration and the values on the input handles — and deferred the rest
+    rather than guess. The engine phase named two of those guesses correctly, so
+    they arrived in Phase 6 M6: an idempotency key and the run's starting
+    payload. Nothing else has been added, and a cancellation signal remains a
+    guess.
     """
 
     config: BaseModel
@@ -45,6 +45,22 @@ class NodeRunContext:
     """Values by input handle name. A handle with no inbound edge is absent
     rather than ``None``, so "not connected" and "connected to null" stay
     distinguishable."""
+
+    idempotency_key: str
+    """Stable for one attempt, different for the next (ADR-024).
+
+    Execution is at-least-once: a worker can die after an email is sent and
+    before that is recorded. This is what lets a node recognise its own earlier
+    call rather than duplicating the effect. Nodes that do nothing observable
+    outside the process may ignore it."""
+
+    trigger_payload: Mapping[str, object]
+    """What the run was started with.
+
+    Handed to every node and read only by a trigger, which is how data enters a
+    graph whose first node has no inbound edge to carry it — without the engine
+    learning that triggers exist (ADR-014, ADR-020). Empty when the run was
+    started with nothing."""
 
 
 class NodeRunner(ABC):

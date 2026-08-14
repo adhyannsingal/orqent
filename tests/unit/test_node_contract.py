@@ -292,7 +292,12 @@ def test_results_are_frozen() -> None:
 
 
 def test_run_context_carries_config_and_inputs() -> None:
-    context = NodeRunContext(config=_Config(value="v"), inputs={"main": 1})
+    context = NodeRunContext(
+        config=_Config(value="v"),
+        inputs={"main": 1},
+        idempotency_key="1:1:1",
+        trigger_payload={},
+    )
 
     assert context.config.value == "v"
     assert context.inputs["main"] == 1
@@ -300,7 +305,9 @@ def test_run_context_carries_config_and_inputs() -> None:
 
 def test_unconnected_input_is_absent_rather_than_none() -> None:
     # "not connected" and "connected to null" must stay distinguishable.
-    context = NodeRunContext(config=_Config(), inputs={})
+    context = NodeRunContext(
+        config=_Config(), inputs={}, idempotency_key="1:1:1", trigger_payload={}
+    )
 
     assert "main" not in context.inputs
 

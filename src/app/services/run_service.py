@@ -32,6 +32,7 @@ from datetime import UTC, datetime
 import structlog
 
 from app.domain.engine.events import RunEventType
+from app.domain.engine.invocation import build_context, invoke
 from app.domain.engine.scheduler import tick
 from app.domain.engine.snapshot import (
     NodeExecutionSnapshot,
@@ -47,7 +48,14 @@ from app.domain.engine.state import (
     ensure_node_execution_transition,
     ensure_run_transition,
 )
-from app.domain.errors import AuthenticationError, ConflictError, NotFoundError
+from app.domain.errors import (
+    AuthenticationError,
+    ConflictError,
+    DomainRuleError,
+    NotFoundError,
+)
+from app.domain.nodes.registry import NodeRegistry
+from app.domain.nodes.result import Completed, Failed
 from app.domain.value_objects.authenticated_user import AuthenticatedUser
 from app.infrastructure.db.models.node_execution import NodeExecution
 from app.infrastructure.db.models.run import Run
@@ -91,6 +99,7 @@ class RunService:
     def __init__(
         self,
         unit_of_work_factory: Callable[[], SqlAlchemyUnitOfWork],
+        node_registry: NodeRegistry,
     ) -> None:
         """Take a *factory* for units of work, not a unit of work.
 
@@ -98,11 +107,14 @@ class RunService:
         use case" holds structurally rather than depending on how long this
         service happens to live — the same reasoning as ``WorkflowService``.
 
-        No node registry: M4 dispatches nothing, so it needs nothing that knows
-        what a node type is.
+        The registry arrives with invocation (M6): it is the *port* through
+        which a node type name becomes a runner, so this service resolves nodes
+        without importing one and the engine never owns the catalogue (ADR-014,
+        ADR-022).
         """
 
         self._unit_of_work_factory = unit_of_work_factory
+        self._node_registry = node_registry
 
     async def create_run(
         self,
@@ -181,73 +193,207 @@ class RunService:
             return run
 
     async def advance_run(self, current_user: AuthenticatedUser, run_public_id: str) -> Run:
-        """Run **one** scheduler tick against this run and apply what it decides.
+        """Drive this run forward until it can go no further.
 
-        Loads the run's persisted state, hands the pure scheduler a snapshot of
-        it, and applies the decisions — transitions, their events, and the
-        attempt counter — inside one transaction. Nothing is held between calls;
-        the next tick re-reads the rows (ADR-019).
+        Alternates scheduling and execution: a tick decides what should start,
+        those transitions are **committed**, and only then are the runners
+        invoked — each result committed in a transaction of its own. The cycle
+        repeats while the scheduler still has something to say.
 
-        **Exactly one tick per call, deliberately.** The frozen spec's §7 step 7
-        re-ticks while progress is being made, which is correct once a node
-        runner can move a node out of ``RUNNING`` inside the same tick. That
-        arrives in M6. Looping here would instead find the node it just started
-        still ``RUNNING``, recover it, restart it, and repeat forever — so the
-        loop waits for the milestone that makes it terminate (2026-08-14).
+        **Committing before invoking is the point, not an optimisation.** A node
+        marked ``RUNNING`` in durable storage before anything runs it is what
+        makes a crash decidable: the row is unambiguously an interrupted attempt,
+        and the next call recovers it. Collapsing this into one transaction would
+        lose the marker on a crash, so a node whose side effect had already
+        happened would look untouched — quietly turning at-least-once into no
+        record at all (ADR-024).
 
-        A consequence worth stating: calling this again while a node is
-        ``RUNNING`` will recover and restart that node. Until M6, a ``RUNNING``
-        row genuinely is indistinguishable from one stranded by a dead process,
-        and re-attempting is the at-least-once behaviour ADR-024 describes.
+        Bounded by ``len(graph) + 1`` cycles. In Phase 6 every node reaches a
+        terminal state at most once and there are no loops, so a run needs at
+        most one cycle per node plus a final one to conclude; exceeding that is a
+        bug in the engine rather than a slow workflow. Purely a termination
+        guard — there is no retry policy, backoff, or timeout here (Phase 8).
         """
+
+        limit: int | None = None
+        cycles = 0
+
+        while True:
+            async with self._unit_of_work_factory() as uow:
+                caller = await self._caller(uow, current_user)
+                run = await self._run(uow, caller, run_public_id)
+                snapshot, executions = await self._snapshot(uow, run, caller.organization_id)
+
+                if limit is None:
+                    limit = len(snapshot.graph) + 1
+
+                decisions = tick(snapshot)
+                if not decisions:
+                    return run
+
+                cycles += 1
+                if cycles > limit:
+                    raise DomainRuleError(
+                        f"This run did not settle within {limit} scheduler cycles, "
+                        "which should be impossible for a graph of this size."
+                    )
+
+                await self._apply(uow, run, executions, decisions)
+                # Durable before anything runs. Everything below happens in its
+                # own transaction.
+                await uow.commit()
+
+                started = [
+                    decision.node_key for decision in decisions if isinstance(decision, StartNode)
+                ]
+                run_id, organization_id = run.id, caller.organization_id
+                node_ids = {key: executions[key].workflow_node_id for key in started}
+                attempts = {key: executions[key].attempt for key in started}
+
+            for node_key in started:
+                await self._execute(
+                    current_user,
+                    run_public_id,
+                    snapshot,
+                    node_key,
+                    run_id=run_id,
+                    organization_id=organization_id,
+                    workflow_node_id=node_ids[node_key],
+                    attempt=attempts[node_key],
+                )
+
+    async def _execute(
+        self,
+        current_user: AuthenticatedUser,
+        run_public_id: str,
+        snapshot: RunSnapshot,
+        node_key: str,
+        *,
+        run_id: int,
+        organization_id: int,
+        workflow_node_id: int,
+        attempt: int,
+    ) -> None:
+        """Invoke one node and record what it did, in its own transaction.
+
+        The invocation happens **outside** any transaction: a runner may take as
+        long as it likes, and holding a database transaction open across it would
+        make every slow node a lock held against the rest of the system. The
+        result is then written in a short transaction of its own.
+
+        A failure to write the result rolls back only that write. The node stays
+        ``RUNNING`` in durable storage, so the next call recovers and re-attempts
+        it — the at-least-once duplicate ADR-024 describes, rather than a
+        silently lost node.
+        """
+
+        context = build_context(
+            snapshot,
+            self._node_registry,
+            node_key,
+            run_id=run_id,
+            workflow_node_id=workflow_node_id,
+            attempt=attempt,
+        )
+        result = await invoke(snapshot, self._node_registry, node_key, context)
 
         async with self._unit_of_work_factory() as uow:
             caller = await self._caller(uow, current_user)
+            run = await self._run(uow, caller, run_public_id)
+            _, executions = await self._snapshot(uow, run, organization_id)
+            execution = executions[node_key]
 
-            run = await uow.runs.get_by_public_id(run_public_id, caller.organization_id)
-            if run is None:
-                raise NotFoundError("This run does not exist.")
-
-            executions = await uow.node_executions.list_for_run(run.id, caller.organization_id)
-            # `list_nodes` gives both halves of what is needed here: the graph is
-            # addressed by `node_key` and `node_executions` by `workflow_node_id`,
-            # so one pass builds the translation in each direction. No second
-            # graph loader is written — `load_graph` already returns the pure
-            # object the scheduler wants.
-            nodes = await uow.workflow_versions.list_nodes(run.workflow_version_id)
-            key_by_node_id = {node.id: node.node_key for node in nodes}
-            execution_by_key = {
-                key_by_node_id[execution.workflow_node_id]: execution
-                for execution in executions
-                if execution.workflow_node_id in key_by_node_id
-            }
-
-            graph = await uow.workflow_versions.load_graph(run.workflow_version_id)
-            snapshot = RunSnapshot(
-                status=RunStatus(run.status),
-                graph=graph,
-                node_executions={
-                    node_key: NodeExecutionSnapshot(
-                        node_key=node_key,
-                        status=NodeExecutionStatus(execution.status),
-                        attempt=execution.attempt,
-                        outputs=execution.output,
+            match result:
+                case Completed(outputs):
+                    ensure_node_execution_transition(
+                        NodeExecutionStatus(execution.status), NodeExecutionStatus.SUCCEEDED
                     )
-                    for node_key, execution in execution_by_key.items()
-                },
-                trigger_payload=run.trigger_payload,
-            )
+                    execution.status = NodeExecutionStatus.SUCCEEDED
+                    execution.output = dict(outputs)
+                    execution.finished_at = _utcnow()
+                    await self._append(
+                        uow, run, RunEventType.NODE_SUCCEEDED, payload={"node_key": node_key}
+                    )
 
-            decisions = tick(snapshot)
-            await self._apply(uow, run, execution_by_key, decisions)
+                case Failed(error, retryable):
+                    ensure_node_execution_transition(
+                        NodeExecutionStatus(execution.status), NodeExecutionStatus.FAILED
+                    )
+                    execution.status = NodeExecutionStatus.FAILED
+                    execution.error = error
+                    execution.finished_at = _utcnow()
+                    # `retryable` lives in the event rather than a column: nothing
+                    # acts on it in Phase 6, and the timeline is already the audit
+                    # record (the same reasoning that means there is no attempts
+                    # table). Phase 8's retry machinery is where it earns a column.
+                    await self._append(
+                        uow,
+                        run,
+                        RunEventType.NODE_FAILED,
+                        payload={
+                            "node_key": node_key,
+                            "error": error,
+                            "retryable": retryable,
+                        },
+                    )
+
+                case _:
+                    # `Suspended` is a legal NodeResult that M7 teaches the engine
+                    # to persist. Refusing it here beats recording a suspended
+                    # node as finished, which no later milestone could undo.
+                    raise DomainRuleError(
+                        f"Node {node_key!r} returned a result this version cannot record yet."
+                    )
+
             await uow.commit()
 
-            log.info(
-                "run_advanced",
-                run_public_id=run.public_id,
-                decisions=[type(decision).__name__ for decision in decisions],
-            )
-            return run
+    async def _snapshot(
+        self, uow: SqlAlchemyUnitOfWork, run: Run, organization_id: int
+    ) -> tuple[RunSnapshot, dict[str, NodeExecution]]:
+        """Read the run's persisted state into the scheduler's pure boundary.
+
+        Returns the ORM rows alongside it, keyed the same way: the snapshot is
+        what decides, and the rows are what the decisions are applied to.
+
+        ``list_nodes`` supplies both halves of the translation — the graph is
+        addressed by ``node_key`` and ``node_executions`` by ``workflow_node_id``.
+        No second graph loader is written; ``load_graph`` already returns the pure
+        object the scheduler wants (A4).
+        """
+
+        executions = await uow.node_executions.list_for_run(run.id, organization_id)
+        nodes = await uow.workflow_versions.list_nodes(run.workflow_version_id)
+        key_by_node_id = {node.id: node.node_key for node in nodes}
+        execution_by_key = {
+            key_by_node_id[execution.workflow_node_id]: execution
+            for execution in executions
+            if execution.workflow_node_id in key_by_node_id
+        }
+
+        graph = await uow.workflow_versions.load_graph(run.workflow_version_id)
+        snapshot = RunSnapshot(
+            status=RunStatus(run.status),
+            graph=graph,
+            node_executions={
+                node_key: NodeExecutionSnapshot(
+                    node_key=node_key,
+                    status=NodeExecutionStatus(execution.status),
+                    attempt=execution.attempt,
+                    outputs=execution.output,
+                )
+                for node_key, execution in execution_by_key.items()
+            },
+            trigger_payload=run.trigger_payload,
+        )
+        return snapshot, execution_by_key
+
+    async def _run(self, uow: SqlAlchemyUnitOfWork, caller: User, public_id: str) -> Run:
+        """Load a run the caller's organization owns, or raise."""
+
+        run = await uow.runs.get_by_public_id(public_id, caller.organization_id)
+        if run is None:
+            raise NotFoundError("This run does not exist.")
+        return run
 
     async def _apply(
         self,
@@ -275,7 +421,9 @@ class RunService:
                     )
                     execution.status = NodeExecutionStatus.RUNNING
                     execution.started_at = _utcnow()
-                    await self._append(uow, run, RunEventType.NODE_STARTED, node_key=node_key)
+                    await self._append(
+                        uow, run, RunEventType.NODE_STARTED, payload={"node_key": node_key}
+                    )
 
                 case RecoverNode(node_key):
                     execution = executions[node_key]
@@ -309,7 +457,7 @@ class RunService:
         run: Run,
         event_type: RunEventType,
         *,
-        node_key: str | None = None,
+        payload: Mapping[str, object] | None = None,
     ) -> None:
         """Append one timeline row, in the same transaction as its state change.
 
@@ -325,7 +473,7 @@ class RunService:
                 run_id=run.id,
                 seq=await uow.run_events.next_seq(run.id),
                 event_type=event_type,
-                payload={"node_key": node_key} if node_key is not None else None,
+                payload=dict(payload) if payload is not None else None,
             )
         )
 

@@ -17,13 +17,20 @@ import pytest
 from app.domain.engine.events import RunEventType
 from app.domain.engine.state import NodeExecutionStatus, RunStatus
 from app.domain.errors import AuthenticationError, ConflictError, NotFoundError
+from app.domain.graph.model import GraphEdge
+from app.domain.nodes.result import NodeResult
+from app.domain.nodes.runner import NodeRunContext, NodeRunner
 from app.domain.value_objects.authenticated_user import AuthenticatedUser
 from app.infrastructure.db.identifiers import new_public_id
 from app.infrastructure.db.models.organization import Organization
+from app.infrastructure.db.models.run import Run
 from app.infrastructure.db.models.user import User
 from app.infrastructure.db.models.workflow import Workflow
 from app.infrastructure.db.models.workflow_node import WorkflowNode
 from app.infrastructure.db.models.workflow_version import WorkflowVersion
+from app.infrastructure.nodes import build_registry
+from app.infrastructure.nodes.builtin import core_noop, trigger_manual
+from app.infrastructure.nodes.registry import InMemoryNodeRegistry
 from app.services.run_service import RunService
 from tests.unit.fakes import (
     FakeDatabase,
@@ -77,18 +84,31 @@ class _Tenant:
         self.db.workflow_versions.append(version)
 
         nodes = []
-        for key in node_keys:
+        for index, key in enumerate(node_keys):
             node = WorkflowNode(
                 workflow_version_id=version.id,
                 node_key=key,
-                node_type="core.noop",
+                # A runnable chain: a trigger, then forwarding no-ops. `core.noop`
+                # requires its `main` input, so the edges below are what make the
+                # graph something the engine can actually execute.
+                node_type="trigger.manual" if index == 0 else "core.noop",
                 node_type_version=1,
                 config={},
                 ui_position={"x": 0, "y": 0},
             )
             node.id = self.db.next_id()
             nodes.append(node)
-        self.db.graphs[version.id] = (nodes, [])
+
+        edges = [
+            GraphEdge(
+                source_key=node_keys[index - 1],
+                source_handle="main",
+                target_key=node_keys[index],
+                target_handle="main",
+            )
+            for index in range(1, len(node_keys))
+        ]
+        self.db.graphs[version.id] = (nodes, edges)
         return version
 
     @property
@@ -116,7 +136,7 @@ def tenant(db: FakeDatabase) -> _Tenant:
 
 def _service(db: FakeDatabase, **kwargs: object) -> tuple[RunService, FakeUnitOfWorkFactory]:
     factory = FakeUnitOfWorkFactory(db, **kwargs)  # type: ignore[arg-type]
-    return RunService(factory), factory  # type: ignore[arg-type]
+    return RunService(factory, build_registry()), factory  # type: ignore[arg-type]
 
 
 # --- The happy path ---------------------------------------------------------
@@ -577,120 +597,248 @@ async def test_a_failed_creation_rolls_back_rather_than_committing(
     assert factory.only.rollback_calls == 1
 
 
-# --- advance_run: the scheduler tick applied (M5) ----------------------------
+# --- advance_run: scheduling + invocation (M6) -------------------------------
 
 
-async def _started(db: FakeDatabase, tenant: _Tenant) -> tuple[RunService, object]:
-    """A created run, ready to be advanced."""
-
-    service, factory = _service(db)
+async def _created(db: FakeDatabase, tenant: _Tenant) -> tuple[RunService, Run]:
+    service, _ = _service(db)
     run = await service.create_run(tenant.current_user, tenant.workflow.public_id)
-    factory.created.clear()
     return service, run
 
 
-async def test_advancing_starts_the_first_node_and_moves_the_run_to_running(
+async def test_a_linear_workflow_runs_to_completion(db: FakeDatabase, tenant: _Tenant) -> None:
+    service, run = await _created(db, tenant)
+
+    await service.advance_run(tenant.current_user, run.public_id)
+
+    assert db.runs[0].status == RunStatus.COMPLETED
+    assert db.runs[0].finished_at is not None
+    assert {e.status for e in db.node_executions} == {NodeExecutionStatus.SUCCEEDED}
+
+
+async def test_nodes_execute_in_graph_order(db: FakeDatabase) -> None:
+    tenant = _Tenant(db, node_keys=("trigger", "a", "b", "c"))
+    service, run = await _created(db, tenant)
+
+    await service.advance_run(tenant.current_user, run.public_id)
+
+    started = [
+        e.payload["node_key"]
+        for e in sorted(db.run_events, key=lambda e: e.seq)
+        if e.event_type == RunEventType.NODE_STARTED
+    ]
+    assert started == ["trigger", "a", "b", "c"]
+
+
+async def test_the_trigger_payload_reaches_the_first_node(
     db: FakeDatabase, tenant: _Tenant
 ) -> None:
-    service, run = await _started(db, tenant)
+    service, _ = _service(db)
+    run = await service.create_run(
+        tenant.current_user, tenant.workflow.public_id, trigger_payload={"order": 7}
+    )
 
-    await service.advance_run(tenant.current_user, run.public_id)  # type: ignore[attr-defined]
+    await service.advance_run(tenant.current_user, run.public_id)
 
-    statuses = {e.workflow_node_id: e.status for e in db.node_executions}
-    assert statuses[tenant.nodes[0].id] == NodeExecutionStatus.RUNNING
-    # The second node has an inbound edge from nothing in this fixture, so it is
-    # also a source and starts too; what matters is the run moved.
-    assert db.runs[0].status == RunStatus.RUNNING
-
-
-async def test_advancing_stamps_started_at_once(db: FakeDatabase, tenant: _Tenant) -> None:
-    service, run = await _started(db, tenant)
-
-    await service.advance_run(tenant.current_user, run.public_id)  # type: ignore[attr-defined]
-    first = db.runs[0].started_at
-    await service.advance_run(tenant.current_user, run.public_id)  # type: ignore[attr-defined]
-
-    assert first is not None
-    assert db.runs[0].started_at == first
+    trigger = next(e for e in db.node_executions if e.workflow_node_id == tenant.nodes[0].id)
+    assert trigger.output == {"main": {"order": 7}}
 
 
-async def test_advancing_writes_a_node_started_event_naming_the_node(
+async def test_output_flows_downstream(db: FakeDatabase, tenant: _Tenant) -> None:
+    """`core.noop` forwards whatever arrived, so the payload appears at the end
+    of the chain having crossed a real edge."""
+
+    service, _ = _service(db)
+    run = await service.create_run(
+        tenant.current_user, tenant.workflow.public_id, trigger_payload={"order": 7}
+    )
+
+    await service.advance_run(tenant.current_user, run.public_id)
+
+    last = next(e for e in db.node_executions if e.workflow_node_id == tenant.nodes[-1].id)
+    assert last.output == {"main": {"order": 7}}
+
+
+async def test_a_run_started_with_nothing_still_completes(
     db: FakeDatabase, tenant: _Tenant
 ) -> None:
-    service, run = await _started(db, tenant)
+    service, run = await _created(db, tenant)
 
-    await service.advance_run(tenant.current_user, run.public_id)  # type: ignore[attr-defined]
+    await service.advance_run(tenant.current_user, run.public_id)
 
-    started = [e for e in db.run_events if e.event_type == RunEventType.NODE_STARTED]
-    assert len(started) == len(tenant.nodes)
-    assert {e.payload["node_key"] for e in started} == {n.node_key for n in tenant.nodes}
+    trigger = next(e for e in db.node_executions if e.workflow_node_id == tenant.nodes[0].id)
+    assert trigger.output == {"main": {}}
+    assert db.runs[0].status == RunStatus.COMPLETED
 
 
-async def test_the_run_started_event_is_not_written_twice(
+async def test_every_node_execution_is_stamped_finished(db: FakeDatabase, tenant: _Tenant) -> None:
+    service, run = await _created(db, tenant)
+
+    await service.advance_run(tenant.current_user, run.public_id)
+
+    assert all(e.started_at is not None for e in db.node_executions)
+    assert all(e.finished_at is not None for e in db.node_executions)
+
+
+async def test_attempts_stay_at_one_when_nothing_is_interrupted(
     db: FakeDatabase, tenant: _Tenant
 ) -> None:
-    """M4 wrote it at creation; PENDING -> RUNNING must not repeat it."""
+    service, run = await _created(db, tenant)
 
-    service, run = await _started(db, tenant)
+    await service.advance_run(tenant.current_user, run.public_id)
 
-    await service.advance_run(tenant.current_user, run.public_id)  # type: ignore[attr-defined]
-
-    assert len([e for e in db.run_events if e.event_type == RunEventType.RUN_STARTED]) == 1
+    assert {e.attempt for e in db.node_executions} == {1}
 
 
-async def test_events_are_appended_in_an_unbroken_sequence(
+# --- Events -----------------------------------------------------------------
+
+
+async def test_the_event_timeline_is_ordered_and_complete(
     db: FakeDatabase, tenant: _Tenant
 ) -> None:
-    service, run = await _started(db, tenant)
+    service, run = await _created(db, tenant)
 
-    await service.advance_run(tenant.current_user, run.public_id)  # type: ignore[attr-defined]
+    await service.advance_run(tenant.current_user, run.public_id)
+
+    timeline = [e.event_type for e in sorted(db.run_events, key=lambda e: e.seq)]
+    assert timeline == [
+        RunEventType.RUN_STARTED,
+        RunEventType.NODE_STARTED,
+        RunEventType.NODE_SUCCEEDED,
+        RunEventType.NODE_STARTED,
+        RunEventType.NODE_SUCCEEDED,
+        RunEventType.RUN_COMPLETED,
+    ]
+
+
+async def test_event_sequence_numbers_are_unbroken(db: FakeDatabase, tenant: _Tenant) -> None:
+    service, run = await _created(db, tenant)
+
+    await service.advance_run(tenant.current_user, run.public_id)
 
     seqs = sorted(e.seq for e in db.run_events)
     assert seqs == list(range(1, len(seqs) + 1))
 
 
-async def test_advancing_uses_exactly_one_transaction_and_commits_once(
+async def test_run_started_is_written_exactly_once(db: FakeDatabase, tenant: _Tenant) -> None:
+    """M4 wrote it at creation; PENDING -> RUNNING must not repeat it."""
+
+    service, run = await _created(db, tenant)
+
+    await service.advance_run(tenant.current_user, run.public_id)
+
+    assert len([e for e in db.run_events if e.event_type == RunEventType.RUN_STARTED]) == 1
+
+
+async def test_node_events_name_their_node(db: FakeDatabase, tenant: _Tenant) -> None:
+    service, run = await _created(db, tenant)
+
+    await service.advance_run(tenant.current_user, run.public_id)
+
+    succeeded = [e for e in db.run_events if e.event_type == RunEventType.NODE_SUCCEEDED]
+    assert {e.payload["node_key"] for e in succeeded} == {n.node_key for n in tenant.nodes}
+
+
+# --- Failure ----------------------------------------------------------------
+
+
+def _failing_registry() -> object:
+    """A registry whose `core.noop` raises, leaving the trigger intact."""
+
+    registry = InMemoryNodeRegistry()
+    registry.register(trigger_manual.DESCRIPTOR, trigger_manual.RUNNER)
+
+    class _Boom(NodeRunner):
+        async def run(self, context: NodeRunContext) -> NodeResult:
+            raise ValueError("node exploded")
+
+    registry.register(core_noop.DESCRIPTOR, _Boom())
+    return registry
+
+
+async def test_a_failing_node_becomes_failed_and_fails_the_run(
     db: FakeDatabase, tenant: _Tenant
 ) -> None:
-    service, run = await _started(db, tenant)
+    factory = FakeUnitOfWorkFactory(db)
+    service = RunService(factory, _failing_registry())  # type: ignore[arg-type]
+    run = await service.create_run(tenant.current_user, tenant.workflow.public_id)
 
-    await service.advance_run(tenant.current_user, run.public_id)  # type: ignore[attr-defined]
+    await service.advance_run(tenant.current_user, run.public_id)
 
-    assert len(_factory_of(service).created) == 1
-    assert _factory_of(service).only.commit_calls == 1
+    failed = next(e for e in db.node_executions if e.workflow_node_id == tenant.nodes[1].id)
+    assert failed.status == NodeExecutionStatus.FAILED
+    assert "node exploded" in failed.error
+    assert db.runs[0].status == RunStatus.FAILED
+
+
+async def test_the_failed_event_records_the_error_and_retryable_flag(
+    db: FakeDatabase, tenant: _Tenant
+) -> None:
+    """`retryable` lives in the event, not a column: nothing acts on it in
+    Phase 6 and the timeline is already the audit record."""
+
+    factory = FakeUnitOfWorkFactory(db)
+    service = RunService(factory, _failing_registry())  # type: ignore[arg-type]
+    run = await service.create_run(tenant.current_user, tenant.workflow.public_id)
+
+    await service.advance_run(tenant.current_user, run.public_id)
+
+    event = next(e for e in db.run_events if e.event_type == RunEventType.NODE_FAILED)
+    assert event.payload["node_key"] == tenant.nodes[1].node_key
+    assert "node exploded" in event.payload["error"]
+    assert event.payload["retryable"] is False
+
+
+async def test_a_node_downstream_of_a_failure_stays_pending(db: FakeDatabase) -> None:
+    """There is no SKIPPED until branch pruning (Phase 7)."""
+
+    tenant = _Tenant(db, node_keys=("trigger", "boom", "after"))
+    factory = FakeUnitOfWorkFactory(db)
+    service = RunService(factory, _failing_registry())  # type: ignore[arg-type]
+    run = await service.create_run(tenant.current_user, tenant.workflow.public_id)
+
+    await service.advance_run(tenant.current_user, run.public_id)
+
+    after = next(e for e in db.node_executions if e.workflow_node_id == tenant.nodes[2].id)
+    assert after.status == NodeExecutionStatus.PENDING
+    assert db.runs[0].status == RunStatus.FAILED
+
+
+# --- Transactions and termination -------------------------------------------
+
+
+async def test_advancing_uses_several_transactions_not_one(
+    db: FakeDatabase, tenant: _Tenant
+) -> None:
+    """A node is marked RUNNING and committed *before* anything runs it, so a
+    crash leaves a decidable row (ADR-024)."""
+
+    service, run = await _created(db, tenant)
+    factory = _factory_of(service)
+    factory.created.clear()
+
+    await service.advance_run(tenant.current_user, run.public_id)
+
+    # One tick transaction plus one per invocation, repeatedly.
+    assert len(factory.created) > 1
+    assert sum(uow.commit_calls for uow in factory.created) > 1
 
 
 def _factory_of(service: RunService) -> FakeUnitOfWorkFactory:
     return service._unit_of_work_factory  # type: ignore[return-value]
 
 
-async def test_advancing_again_recovers_and_restarts_the_running_node(
-    db: FakeDatabase, tenant: _Tenant
-) -> None:
-    """The intended Phase 6 at-least-once behaviour until M6 can complete a
-    node: a RUNNING row with no invoker is indistinguishable from a crash."""
+async def test_advancing_a_finished_run_does_nothing(db: FakeDatabase, tenant: _Tenant) -> None:
+    """Terminal states absorb, so the loop stops immediately."""
 
-    service, run = await _started(db, tenant)
-    await service.advance_run(tenant.current_user, run.public_id)  # type: ignore[attr-defined]
+    service, run = await _created(db, tenant)
+    await service.advance_run(tenant.current_user, run.public_id)
+    events = len(db.run_events)
 
-    await service.advance_run(tenant.current_user, run.public_id)  # type: ignore[attr-defined]
+    await service.advance_run(tenant.current_user, run.public_id)
 
-    assert {e.attempt for e in db.node_executions} == {2}
-    assert {e.status for e in db.node_executions} == {NodeExecutionStatus.RUNNING}
-
-
-async def test_recovery_writes_no_event(db: FakeDatabase, tenant: _Tenant) -> None:
-    """The attempt increment is the record; NodeFailed would be a lie."""
-
-    service, run = await _started(db, tenant)
-    await service.advance_run(tenant.current_user, run.public_id)  # type: ignore[attr-defined]
-    before = len(db.run_events)
-
-    await service.advance_run(tenant.current_user, run.public_id)  # type: ignore[attr-defined]
-
-    # Only the fresh NodeStarted events, one per restarted node.
-    assert len(db.run_events) == before + len(tenant.nodes)
-    assert all(e.event_type != RunEventType.NODE_FAILED for e in db.run_events)
+    assert len(db.run_events) == events
+    assert db.runs[0].status == RunStatus.COMPLETED
 
 
 async def test_an_unknown_run_is_not_found(db: FakeDatabase, tenant: _Tenant) -> None:
@@ -708,28 +856,3 @@ async def test_another_organizations_run_is_not_found(db: FakeDatabase) -> None:
 
     with pytest.raises(NotFoundError):
         await service.advance_run(intruder.current_user, run.public_id)
-
-
-async def test_a_failure_writing_an_event_rolls_back_rather_than_committing(
-    db: FakeDatabase, tenant: _Tenant
-) -> None:
-    """That the *state* reverts is proved against a real transaction in
-    `tests/integration/test_run_service.py`: these doubles roll back staged
-    rows, but cannot undo an in-place mutation to an already-committed object
-    the way MySQL does. What is honest to assert here is that nothing was
-    committed and the unit of work unwound."""
-
-    service, _ = _service(db)
-    run = await service.create_run(tenant.current_user, tenant.workflow.public_id)
-
-    broken, factory = _service(
-        db,
-        run_event_repository=FakeRunEventRepository(
-            db, raise_on_append=integrity_error("uq_run_events_run_id_seq")
-        ),
-    )
-    with pytest.raises(Exception, match="uq_run_events"):
-        await broken.advance_run(tenant.current_user, run.public_id)
-
-    assert factory.only.commit_calls == 0
-    assert factory.only.rollback_calls == 1

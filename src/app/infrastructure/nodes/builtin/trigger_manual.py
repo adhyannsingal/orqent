@@ -41,10 +41,10 @@ class ManualTriggerRunner(NodeRunner):
     """Emits the run's starting payload."""
 
     async def run(self, context: NodeRunContext) -> NodeResult:
-        # Emits an empty object today. The payload a run was started with is not
-        # yet reachable from NodeRunContext — Phase 5 decides how the engine
-        # delivers it, and this is where it will arrive.
-        return Completed(outputs={"main": {}})
+        # Where the payload arrives, exactly as this comment anticipated in
+        # Phase 4. Emitted unchanged: a trigger carries data into the graph, it
+        # does not interpret it.
+        return Completed(outputs={"main": context.trigger_payload})
 
 
 RUNNER = ManualTriggerRunner()
