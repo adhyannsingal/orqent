@@ -12,6 +12,7 @@ service pass here and fail against MySQL.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from types import TracebackType
@@ -26,9 +27,12 @@ from app.domain.ports.token_service import TokenService
 from app.domain.value_objects.authenticated_user import AuthenticatedUser
 from app.domain.value_objects.token import IssuedToken, TokenClaims, TokenType
 from app.infrastructure.db.identifiers import new_public_id
+from app.infrastructure.db.models.node_execution import NodeExecution
 from app.infrastructure.db.models.organization import Organization
 from app.infrastructure.db.models.refresh_token import RefreshToken
 from app.infrastructure.db.models.role import Role
+from app.infrastructure.db.models.run import Run
+from app.infrastructure.db.models.run_event import RunEvent
 from app.infrastructure.db.models.user import User
 from app.infrastructure.db.models.user_role import UserRole
 from app.infrastructure.db.models.workflow import Workflow
@@ -63,6 +67,9 @@ class FakeDatabase:
     workflow_versions: list[WorkflowVersion] = field(default_factory=list)
     # Graph rows, keyed by version id. Replaced wholesale, like the real one.
     graphs: dict[int, tuple[list[WorkflowNode], list[GraphEdge]]] = field(default_factory=dict)
+    runs: list[Run] = field(default_factory=list)
+    node_executions: list[NodeExecution] = field(default_factory=list)
+    run_events: list[RunEvent] = field(default_factory=list)
 
     pending_organizations: list[Organization] = field(default_factory=list)
     pending_users: list[User] = field(default_factory=list)
@@ -70,6 +77,9 @@ class FakeDatabase:
     pending_refresh_tokens: list[RefreshToken] = field(default_factory=list)
     pending_workflows: list[Workflow] = field(default_factory=list)
     pending_workflow_versions: list[WorkflowVersion] = field(default_factory=list)
+    pending_runs: list[Run] = field(default_factory=list)
+    pending_node_executions: list[NodeExecution] = field(default_factory=list)
+    pending_run_events: list[RunEvent] = field(default_factory=list)
 
     _next_id: int = 1
 
@@ -104,6 +114,18 @@ class FakeDatabase:
     def visible_workflow_versions(self) -> list[WorkflowVersion]:
         return [*self.workflow_versions, *self.pending_workflow_versions]
 
+    @property
+    def visible_runs(self) -> list[Run]:
+        return [*self.runs, *self.pending_runs]
+
+    @property
+    def visible_node_executions(self) -> list[NodeExecution]:
+        return [*self.node_executions, *self.pending_node_executions]
+
+    @property
+    def visible_run_events(self) -> list[RunEvent]:
+        return [*self.run_events, *self.pending_run_events]
+
     def commit(self) -> None:
         self.organizations.extend(self.pending_organizations)
         self.users.extend(self.pending_users)
@@ -111,6 +133,9 @@ class FakeDatabase:
         self.refresh_tokens.extend(self.pending_refresh_tokens)
         self.workflows.extend(self.pending_workflows)
         self.workflow_versions.extend(self.pending_workflow_versions)
+        self.runs.extend(self.pending_runs)
+        self.node_executions.extend(self.pending_node_executions)
+        self.run_events.extend(self.pending_run_events)
         self.clear_pending()
 
     def rollback(self) -> None:
@@ -123,6 +148,9 @@ class FakeDatabase:
         self.pending_refresh_tokens.clear()
         self.pending_workflows.clear()
         self.pending_workflow_versions.clear()
+        self.pending_runs.clear()
+        self.pending_node_executions.clear()
+        self.pending_run_events.clear()
 
 
 # --- Repositories -----------------------------------------------------------
@@ -331,6 +359,9 @@ class FakeWorkflowVersionRepository:
             None,
         )
 
+    async def get_by_id(self, version_id: int) -> WorkflowVersion | None:
+        return next((v for v in self._db.visible_workflow_versions if v.id == version_id), None)
+
     async def get_by_version_no(self, workflow_id: int, version_no: int) -> WorkflowVersion | None:
         return next(
             (
@@ -404,10 +435,153 @@ class FakeWorkflowVersionRepository:
         return version.revision
 
 
+class FakeRunRepository:
+    """Mirrors the real one: organization-scoped reads, ids assigned on add."""
+
+    def __init__(self, db: FakeDatabase, *, raise_on_add: Exception | None = None) -> None:
+        self._db = db
+        self._raise_on_add = raise_on_add
+
+    async def add(self, run: Run) -> Run:
+        if self._raise_on_add is not None:
+            raise self._raise_on_add
+        run.id = self._db.next_id()
+        if run.public_id is None:
+            run.public_id = new_public_id()
+        run.created_at = run.created_at or datetime.now(UTC)
+        run.updated_at = run.updated_at or datetime.now(UTC)
+        self._db.pending_runs.append(run)
+        return run
+
+    async def get_by_public_id(self, public_id: str, organization_id: int) -> Run | None:
+        return next(
+            (
+                run
+                for run in self._db.visible_runs
+                if run.public_id == public_id and run.organization_id == organization_id
+            ),
+            None,
+        )
+
+    async def list_for_org(
+        self,
+        organization_id: int,
+        *,
+        limit: int,
+        offset: int,
+        workflow_id: int | None = None,
+    ) -> list[Run]:
+        matches = [
+            run
+            for run in self._db.visible_runs
+            if run.organization_id == organization_id
+            and (workflow_id is None or run.workflow_id == workflow_id)
+        ]
+        matches.sort(key=lambda run: run.id, reverse=True)
+        return matches[offset : offset + limit]
+
+    async def count_for_org(self, organization_id: int, *, workflow_id: int | None = None) -> int:
+        return len(
+            [
+                run
+                for run in self._db.visible_runs
+                if run.organization_id == organization_id
+                and (workflow_id is None or run.workflow_id == workflow_id)
+            ]
+        )
+
+
+class FakeNodeExecutionRepository:
+    """Mirrors the real one, including the one-per-node-per-run constraint."""
+
+    def __init__(self, db: FakeDatabase, *, raise_on_add: Exception | None = None) -> None:
+        self._db = db
+        self._raise_on_add = raise_on_add
+
+    async def add_all(self, executions: Sequence[NodeExecution]) -> Sequence[NodeExecution]:
+        if self._raise_on_add is not None:
+            raise self._raise_on_add
+        for execution in executions:
+            taken = {(row.run_id, row.workflow_node_id) for row in self._db.visible_node_executions}
+            if (execution.run_id, execution.workflow_node_id) in taken:
+                raise integrity_error("uq_node_executions_run_id_workflow_node_id")
+            execution.id = self._db.next_id()
+            if execution.public_id is None:
+                execution.public_id = new_public_id()
+            if execution.attempt is None:
+                execution.attempt = 1
+            self._db.pending_node_executions.append(execution)
+        return executions
+
+    async def list_for_run(self, run_id: int, organization_id: int) -> list[NodeExecution]:
+        return sorted(
+            (
+                execution
+                for execution in self._db.visible_node_executions
+                if execution.run_id == run_id and execution.organization_id == organization_id
+            ),
+            key=lambda execution: execution.id,
+        )
+
+    async def get_by_resume_token(
+        self, resume_token: str, organization_id: int
+    ) -> NodeExecution | None:
+        return next(
+            (
+                execution
+                for execution in self._db.visible_node_executions
+                if execution.resume_token == resume_token
+                and execution.organization_id == organization_id
+            ),
+            None,
+        )
+
+
+class FakeRunEventRepository:
+    """Mirrors the real one, including ``unique(run_id, seq)`` and no rewrites."""
+
+    def __init__(self, db: FakeDatabase, *, raise_on_append: Exception | None = None) -> None:
+        self._db = db
+        self._raise_on_append = raise_on_append
+
+    async def append(self, event: RunEvent) -> RunEvent:
+        if self._raise_on_append is not None:
+            raise self._raise_on_append
+        taken = {(row.run_id, row.seq) for row in self._db.visible_run_events}
+        if (event.run_id, event.seq) in taken:
+            raise integrity_error("uq_run_events_run_id_seq")
+        event.id = self._db.next_id()
+        event.created_at = event.created_at or datetime.now(UTC)
+        self._db.pending_run_events.append(event)
+        return event
+
+    async def list_for_run(self, run_id: int, organization_id: int) -> list[RunEvent]:
+        return sorted(
+            (
+                event
+                for event in self._db.visible_run_events
+                if event.run_id == run_id and event.organization_id == organization_id
+            ),
+            key=lambda event: event.seq,
+        )
+
+    async def next_seq(self, run_id: int) -> int:
+        seqs = [event.seq for event in self._db.visible_run_events if event.run_id == run_id]
+        return max(seqs, default=0) + 1
+
+
 class FakeUnitOfWork:
     """Mirrors ``SqlAlchemyUnitOfWork``: exit rolls back what was not committed."""
 
-    def __init__(self, db: FakeDatabase, *, user_repository: FakeUserRepository | None = None):
+    def __init__(
+        self,
+        db: FakeDatabase,
+        *,
+        user_repository: FakeUserRepository | None = None,
+        run_repository: FakeRunRepository | None = None,
+        node_execution_repository: FakeNodeExecutionRepository | None = None,
+        run_event_repository: FakeRunEventRepository | None = None,
+    ):
         self._db = db
         self.organizations = FakeOrganizationRepository(db)
         self.users = user_repository or FakeUserRepository(db)
@@ -415,6 +589,9 @@ class FakeUnitOfWork:
         self.refresh_tokens = FakeRefreshTokenRepository(db)
         self.workflows = FakeWorkflowRepository(db)
         self.workflow_versions = FakeWorkflowVersionRepository(db)
+        self.runs = run_repository or FakeRunRepository(db)
+        self.node_executions = node_execution_repository or FakeNodeExecutionRepository(db)
+        self.run_events = run_event_repository or FakeRunEventRepository(db)
         self.commit_calls = 0
         self.rollback_calls = 0
         self.entered = 0
@@ -447,13 +624,30 @@ class FakeUnitOfWorkFactory:
     still holds.
     """
 
-    def __init__(self, db: FakeDatabase, *, user_repository: FakeUserRepository | None = None):
+    def __init__(
+        self,
+        db: FakeDatabase,
+        *,
+        user_repository: FakeUserRepository | None = None,
+        run_repository: FakeRunRepository | None = None,
+        node_execution_repository: FakeNodeExecutionRepository | None = None,
+        run_event_repository: FakeRunEventRepository | None = None,
+    ):
         self._db = db
         self._user_repository = user_repository
+        self._run_repository = run_repository
+        self._node_execution_repository = node_execution_repository
+        self._run_event_repository = run_event_repository
         self.created: list[FakeUnitOfWork] = []
 
     def __call__(self) -> FakeUnitOfWork:
-        uow = FakeUnitOfWork(self._db, user_repository=self._user_repository)
+        uow = FakeUnitOfWork(
+            self._db,
+            user_repository=self._user_repository,
+            run_repository=self._run_repository,
+            node_execution_repository=self._node_execution_repository,
+            run_event_repository=self._run_event_repository,
+        )
         self.created.append(uow)
         return uow
 

@@ -59,6 +59,22 @@ class WorkflowVersionRepository:
         )
         return result.scalar_one_or_none()
 
+    async def get_by_id(self, version_id: int) -> WorkflowVersion | None:
+        """One version by its internal id.
+
+        Exists for ``workflows.active_version_id``, which is a BIGINT: starting
+        a run resolves the workflow's active version, and no other method here
+        takes an internal id. Walking ``list_for_workflow`` to find one row, or
+        reaching through a relationship — which under asyncio raises
+        ``MissingGreenlet`` on an unloaded attribute — are both worse.
+
+        Tenancy is inherited, as everywhere in this repository: the id came from
+        a workflow the caller already loaded through an organization-scoped
+        lookup.
+        """
+
+        return await self._session.get(WorkflowVersion, version_id)
+
     async def get_by_version_no(self, workflow_id: int, version_no: int) -> WorkflowVersion | None:
         """One published version by its number within the workflow."""
 
