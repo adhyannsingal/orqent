@@ -6,8 +6,17 @@ from collections.abc import Sequence
 
 from sqlalchemy import Select, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import joinedload
 
 from app.infrastructure.db.models.run import Run
+
+# A run's rows carry internal ids, but the wire carries a workflow's public ULID
+# and a version *number* (ADR-004), so every read has to translate. Loaded here
+# rather than by the service because under asyncio a lazy load on an unloaded
+# relationship raises MissingGreenlet: it is fetched now or not at all — the same
+# reason `WorkflowRepository` eager-loads its creator. Doing it in the query also
+# keeps a page of runs to one round trip instead of two per row.
+_IDENTITY = (joinedload(Run.workflow), joinedload(Run.version))
 
 
 class RunRepository:
@@ -51,12 +60,14 @@ class RunRepository:
         """
 
         result = await self._session.execute(
-            select(Run).where(
+            select(Run)
+            .where(
                 Run.public_id == public_id,
                 Run.organization_id == organization_id,
             )
+            .options(*_IDENTITY)
         )
-        return result.scalar_one_or_none()
+        return result.unique().scalar_one_or_none()
 
     async def list_for_org(
         self,
@@ -82,9 +93,10 @@ class RunRepository:
             .order_by(Run.created_at.desc(), Run.id.desc())
             .limit(limit)
             .offset(offset)
+            .options(*_IDENTITY)
         )
         result = await self._session.execute(statement)
-        return result.scalars().all()
+        return result.unique().scalars().all()
 
     async def count_for_org(self, organization_id: int, *, workflow_id: int | None = None) -> int:
         """How many runs match — the ``total`` beside a page.

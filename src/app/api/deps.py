@@ -21,6 +21,7 @@ from app.container import Container
 from app.core.config import Settings
 from app.domain.nodes.registry import NodeRegistry
 from app.services.auth_service import AuthService
+from app.services.run_service import RunService
 from app.services.workflow_service import WorkflowService
 
 
@@ -72,6 +73,15 @@ def get_workflow_service(container: ContainerDep) -> WorkflowService:
 
 
 WorkflowServiceDep = Annotated[WorkflowService, Depends(get_workflow_service)]
+
+
+def get_run_service(container: ContainerDep) -> RunService:
+    """Expose the run execution service to routes."""
+
+    return container.run_service
+
+
+RunServiceDep = Annotated[RunService, Depends(get_run_service)]
 
 
 async def get_session(container: ContainerDep) -> AsyncIterator[AsyncSession]:

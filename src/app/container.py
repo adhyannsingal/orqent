@@ -24,6 +24,7 @@ from app.infrastructure.nodes import build_registry
 from app.infrastructure.security.password_hasher import Argon2PasswordHasher
 from app.infrastructure.security.token_service import JwtTokenService
 from app.services.auth_service import AuthService
+from app.services.run_service import RunService
 from app.services.workflow_service import WorkflowService
 
 
@@ -39,6 +40,7 @@ class Container:
         self._auth_service: AuthService | None = None
         self._node_registry: NodeRegistry | None = None
         self._workflow_service: WorkflowService | None = None
+        self._run_service: RunService | None = None
 
     @property
     def settings(self) -> Settings:
@@ -137,6 +139,22 @@ class Container:
         if self._workflow_service is None:
             self._workflow_service = WorkflowService(self.unit_of_work, self.node_registry)
         return self._workflow_service
+
+    @property
+    def run_service(self) -> RunService:
+        """The application's run execution service.
+
+        Takes the node registry as the *port*: the service resolves a node type
+        to a runner without importing one, which is what keeps the engine
+        node-agnostic (ADR-014, ADR-022). Shared and stateless like the others,
+        and given ``unit_of_work`` as a factory so each call owns its
+        transactions — several of them, since a run commits its scheduling
+        before anything is invoked.
+        """
+
+        if self._run_service is None:
+            self._run_service = RunService(self.unit_of_work, self.node_registry)
+        return self._run_service
 
     async def dispose(self) -> None:
         """Release the connection pool. Safe to call if never initialised."""

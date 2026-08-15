@@ -306,6 +306,8 @@ something it did not.
 | **D5** | §9 — node `WAITING` + run `SUSPENDED` + both events in "**one transaction**" | **Two**: the result transaction writes `WAITING` + token + `NodeSuspended`; the **next tick** writes `SUSPENDED` + `RunSuspended` | The run's status is *derived* from node state by the scheduler, like every other run status. Writing it in the result transaction would create a second source of truth for something the tick already computes. | M7 |
 | **D6** | §9 — `RunService.resume(token)`; transition, commit, "**then** tick" | `resume_run(current_user, run_public_id, resume_token)`, which **invokes the resumed node directly** before re-entering the loop | Two reasons. Tenancy: resume must be authorized and organization-scoped like every other operation. And correctness — see the box below. | M7 |
 
+| **D7** | §4/M9 — `POST /workflows/{workflow_id}/runs` | **`POST /runs`**, with `workflow_id` in the body | Runs are a top-level collection: they are listed, read, advanced, and resumed at `/runs/{id}`, so creating them under a different parent made the one write the odd route out. The workflow is an argument to starting a run, not the resource being addressed. Naming a *version* remains unsupported — a run executes what the workflow has published (ADR-026). | M9 |
+
 > **D6, in detail — why resume cannot just tick.**
 >
 > A tick treats a `RUNNING` node at its start as a *stranded* execution: it

@@ -27,6 +27,7 @@ forbidden.
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime
 
 import structlog
@@ -111,8 +112,41 @@ def _utcnow() -> datetime:
     return datetime.now(UTC)
 
 
+@dataclass(frozen=True, slots=True)
+class RunSummaryView:
+    """A run plus the two facts a caller cannot read off its row.
+
+    Both are derived. ``workflow_id`` and ``workflow_version_id`` on the row are
+    internal ids, and the wire carries a public ULID and a version *number*
+    (ADR-004) — so something has to translate, and doing it here keeps a route
+    from reaching for a repository.
+    """
+
+    run: Run
+    workflow_public_id: str
+    version_no: int | None
+
+
+@dataclass(frozen=True, slots=True)
+class RunDetailView(RunSummaryView):
+    """One run read on its own, with its node executions already loaded.
+
+    Loaded **explicitly**, never through ``run.node_executions``: a lazy
+    relationship touched after the unit of work closes raises ``MissingGreenlet``
+    under asyncio, so a route that walked it would fail in production and pass
+    in any test that happened to keep a session open.
+
+    ``node_keys`` maps ``workflow_node_id`` to the key the graph is addressed
+    by. The rows carry the foreign key; the wire must carry the key, and the
+    internal BIGINT never crosses the boundary (ADR-004).
+    """
+
+    node_executions: Sequence[NodeExecution]
+    node_keys: Mapping[int, str]
+
+
 class RunService:
-    """Start runs of published workflows."""
+    """Start, advance, resume, and read runs of published workflows."""
 
     def __init__(
         self,
@@ -652,7 +686,121 @@ class RunService:
             )
         )
 
+    # --- Reads --------------------------------------------------------------
+
+    async def get_run(self, current_user: AuthenticatedUser, run_public_id: str) -> RunDetailView:
+        """One run and every node execution beneath it.
+
+        Reads only. The scheduler is not consulted, so this reports what is
+        persisted rather than what would happen next — which is what makes it
+        safe to poll while something else advances the run.
+        """
+
+        async with self._unit_of_work_factory() as uow:
+            caller = await self._caller(uow, current_user)
+            run = await self._run(uow, caller, run_public_id)
+            view = await self._detail(uow, run, caller.organization_id)
+            await self._close_read(uow)
+            return view
+
+    async def list_runs(
+        self,
+        current_user: AuthenticatedUser,
+        *,
+        limit: int,
+        offset: int,
+        workflow_id: str | None = None,
+    ) -> tuple[Sequence[RunSummaryView], int]:
+        """One page of the organization's runs, newest first, plus the total.
+
+        ``workflow_id`` is a public ULID and narrows the page to one workflow's
+        history — the query the ``(organization_id, workflow_id, created_at)``
+        index exists for. An unknown workflow is *not* an error here: a filter
+        that matches nothing is an empty page, not a missing resource.
+        """
+
+        async with self._unit_of_work_factory() as uow:
+            caller = await self._caller(uow, current_user)
+
+            internal_id: int | None = None
+            if workflow_id is not None:
+                workflow = await uow.workflows.get_by_public_id(workflow_id, caller.organization_id)
+                if workflow is None:
+                    return (), 0
+                internal_id = workflow.id
+
+            runs = await uow.runs.list_for_org(
+                caller.organization_id, limit=limit, offset=offset, workflow_id=internal_id
+            )
+            total = await uow.runs.count_for_org(caller.organization_id, workflow_id=internal_id)
+            views = [self._summary(run) for run in runs]
+            await self._close_read(uow)
+            return views, total
+
+    async def list_events(
+        self, current_user: AuthenticatedUser, run_public_id: str
+    ) -> Sequence[RunEvent]:
+        """A run's timeline, in sequence order.
+
+        Read straight from ``run_events`` — never reconstructed from current
+        state. A timeline derived from the rows it describes could not record
+        anything those rows no longer say, which is the whole reason the log is
+        append-only.
+        """
+
+        async with self._unit_of_work_factory() as uow:
+            caller = await self._caller(uow, current_user)
+            run = await self._run(uow, caller, run_public_id)
+            events = await uow.run_events.list_for_run(run.id, caller.organization_id)
+            await self._close_read(uow)
+            return events
+
+    @staticmethod
+    def _summary(run: Run) -> RunSummaryView:
+        """Translate one run's internal ids into what the wire carries.
+
+        Reads the relationships ``RunRepository`` eager-loaded rather than
+        querying again: they are fetched with the run precisely so a page of
+        runs costs one round trip and no lazy load can escape into asyncio.
+        """
+
+        return RunSummaryView(
+            run=run,
+            workflow_public_id=run.workflow.public_id,
+            version_no=run.version.version_no,
+        )
+
+    async def _detail(
+        self, uow: SqlAlchemyUnitOfWork, run: Run, organization_id: int
+    ) -> RunDetailView:
+        """A run's summary plus its node executions, keyed for the wire."""
+
+        summary = self._summary(run)
+        executions = await uow.node_executions.list_for_run(run.id, organization_id)
+        nodes = await uow.workflow_versions.list_nodes(run.workflow_version_id)
+        return RunDetailView(
+            run=summary.run,
+            workflow_public_id=summary.workflow_public_id,
+            version_no=summary.version_no,
+            node_executions=executions,
+            node_keys={node.id: node.node_key for node in nodes},
+        )
+
     # --- Shared steps -------------------------------------------------------
+
+    @staticmethod
+    async def _close_read(uow: SqlAlchemyUnitOfWork) -> None:
+        """End a read-only transaction so its rows survive the return.
+
+        A read still opens a transaction, and the unit of work rolls back on the
+        way out — **which expires every loaded attribute**, regardless of
+        ``expire_on_commit=False``. Without this, a read-only use case would hand
+        its caller rows that raise the moment anything is read off them, and
+        under asyncio the refresh they attempt cannot even run. The same reason
+        ``WorkflowService`` closes its reads.
+        """
+
+        await uow.commit()
 
     async def _caller(self, uow: SqlAlchemyUnitOfWork, current_user: AuthenticatedUser) -> User:
         """Resolve the authenticated caller to their row.
