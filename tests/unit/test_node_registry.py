@@ -22,7 +22,13 @@ from app.infrastructure.nodes import build_registry
 from app.infrastructure.nodes.builtin import core_constant, core_log, core_noop, trigger_manual
 from app.infrastructure.nodes.registry import DuplicateNodeTypeError, InMemoryNodeRegistry
 
-BUILT_IN_NAMES = ("trigger.manual@1", "core.constant@1", "core.noop@1", "core.log@1")
+BUILT_IN_NAMES = (
+    "trigger.manual@1",
+    "core.constant@1",
+    "core.noop@1",
+    "core.log@1",
+    "core.wait@1",
+)
 
 # `namespace.name`, lower snake case. Keeps the catalogue readable and the
 # qualified name safe to embed in JSON, URLs, and validation messages.

@@ -16,9 +16,17 @@ import pytest
 
 from app.domain.engine.events import RunEventType
 from app.domain.engine.state import NodeExecutionStatus, RunStatus
-from app.domain.errors import AuthenticationError, ConflictError, NotFoundError
+from app.domain.errors import AuthenticationError, ConflictError, DomainRuleError, NotFoundError
 from app.domain.graph.model import GraphEdge
-from app.domain.nodes.result import NodeResult
+from app.domain.nodes import handles
+from app.domain.nodes.descriptor import (
+    NodeCategory,
+    NodeDescriptor,
+    NodeDisplay,
+    SideEffect,
+)
+from app.domain.nodes.handles import InputHandle, OutputHandle
+from app.domain.nodes.result import Completed, NodeResult, Suspended
 from app.domain.nodes.runner import NodeRunContext, NodeRunner
 from app.domain.value_objects.authenticated_user import AuthenticatedUser
 from app.infrastructure.db.identifiers import new_public_id
@@ -29,7 +37,7 @@ from app.infrastructure.db.models.workflow import Workflow
 from app.infrastructure.db.models.workflow_node import WorkflowNode
 from app.infrastructure.db.models.workflow_version import WorkflowVersion
 from app.infrastructure.nodes import build_registry
-from app.infrastructure.nodes.builtin import core_noop, trigger_manual
+from app.infrastructure.nodes.builtin import core_noop, core_wait, trigger_manual
 from app.infrastructure.nodes.registry import InMemoryNodeRegistry
 from app.services.run_service import RunService
 from tests.unit.fakes import (
@@ -856,3 +864,389 @@ async def test_another_organizations_run_is_not_found(db: FakeDatabase) -> None:
 
     with pytest.raises(NotFoundError):
         await service.advance_run(intruder.current_user, run.public_id)
+
+
+# --- Suspension and resume (M7) ---------------------------------------------
+
+
+def _waiting_tenant(db: FakeDatabase) -> _Tenant:
+    """trigger.manual -> core.wait -> core.noop."""
+
+    tenant = _Tenant(db, node_keys=("trigger", "hold", "after"))
+    nodes, _ = db.graphs[tenant.version.id]
+    nodes[1].node_type = "core.wait"
+    return tenant
+
+
+async def _suspended(db: FakeDatabase) -> tuple[RunService, Run, _Tenant, str]:
+    tenant = _waiting_tenant(db)
+    service, _ = _service(db)
+    run = await service.create_run(
+        tenant.current_user, tenant.workflow.public_id, trigger_payload={"order": 7}
+    )
+    await service.advance_run(tenant.current_user, run.public_id)
+    token = next(e.resume_token for e in db.node_executions if e.resume_token is not None)
+    return service, run, tenant, token
+
+
+async def test_a_wait_node_leaves_the_execution_waiting_with_a_token(
+    db: FakeDatabase,
+) -> None:
+    _, _, tenant, token = await _suspended(db)
+
+    holder = next(e for e in db.node_executions if e.workflow_node_id == tenant.nodes[1].id)
+    assert holder.status == NodeExecutionStatus.WAITING
+    assert holder.resume_token == token
+    # Not finished: a parked node must not look like a completed one.
+    assert holder.finished_at is None
+
+
+async def test_the_run_becomes_suspended(db: FakeDatabase) -> None:
+    _, _, _, _ = await _suspended(db)
+
+    assert db.runs[0].status == RunStatus.SUSPENDED
+
+
+async def test_suspension_writes_node_suspended_then_run_suspended(
+    db: FakeDatabase,
+) -> None:
+    """Two separate state changes, so two events — in that order."""
+
+    _, _, _, _ = await _suspended(db)
+
+    timeline = [e.event_type for e in sorted(db.run_events, key=lambda e: e.seq)]
+    assert timeline == [
+        RunEventType.RUN_STARTED,
+        RunEventType.NODE_STARTED,
+        RunEventType.NODE_SUCCEEDED,
+        RunEventType.NODE_STARTED,
+        RunEventType.NODE_SUSPENDED,
+        RunEventType.RUN_SUSPENDED,
+    ]
+
+
+async def test_the_node_suspended_event_names_the_node_and_its_hint(
+    db: FakeDatabase,
+) -> None:
+    _, _, _, _ = await _suspended(db)
+
+    event = next(e for e in db.run_events if e.event_type == RunEventType.NODE_SUSPENDED)
+    assert event.payload["node_key"] == "hold"
+    assert event.payload["hint"] == "Waiting to be resumed."
+
+
+async def test_a_downstream_node_does_not_run_while_the_wait_holds(
+    db: FakeDatabase,
+) -> None:
+    _, _, tenant, _ = await _suspended(db)
+
+    after = next(e for e in db.node_executions if e.workflow_node_id == tenant.nodes[2].id)
+    assert after.status == NodeExecutionStatus.PENDING
+
+
+# --- Resume -----------------------------------------------------------------
+
+
+async def test_resuming_completes_the_run(db: FakeDatabase) -> None:
+    service, run, _, token = await _suspended(db)
+
+    await service.resume_run(tenant_user(db), run.public_id, token)
+
+    assert db.runs[0].status == RunStatus.COMPLETED
+    assert {e.status for e in db.node_executions} == {NodeExecutionStatus.SUCCEEDED}
+
+
+def tenant_user(db: FakeDatabase) -> AuthenticatedUser:
+    user = db.users[0]
+    organization = db.organizations[0]
+    return AuthenticatedUser(
+        public_id=user.public_id,
+        organization_id=organization.public_id,
+        roles=frozenset({"member"}),
+    )
+
+
+async def test_resuming_preserves_the_attempt(db: FakeDatabase) -> None:
+    """Suspension is deliberate, not ambiguous — so it is the same logical
+    attempt and keeps the same idempotency key."""
+
+    service, run, tenant, token = await _suspended(db)
+
+    await service.resume_run(tenant.current_user, run.public_id, token)
+
+    holder = next(e for e in db.node_executions if e.workflow_node_id == tenant.nodes[1].id)
+    assert holder.attempt == 1
+
+
+async def test_resuming_consumes_the_token(db: FakeDatabase) -> None:
+    service, run, tenant, token = await _suspended(db)
+
+    await service.resume_run(tenant.current_user, run.public_id, token)
+
+    assert all(e.resume_token is None for e in db.node_executions)
+
+
+async def test_the_same_token_cannot_resume_twice(db: FakeDatabase) -> None:
+    service, run, tenant, token = await _suspended(db)
+    await service.resume_run(tenant.current_user, run.public_id, token)
+
+    with pytest.raises(NotFoundError):
+        await service.resume_run(tenant.current_user, run.public_id, token)
+
+
+async def test_resuming_writes_run_resumed_and_restarts_the_node(
+    db: FakeDatabase,
+) -> None:
+    service, run, tenant, token = await _suspended(db)
+    before = len(db.run_events)
+
+    await service.resume_run(tenant.current_user, run.public_id, token)
+
+    added = [e.event_type for e in sorted(db.run_events, key=lambda e: e.seq)][before:]
+    assert added[0] == RunEventType.RUN_RESUMED
+    assert added[1] == RunEventType.NODE_STARTED
+    assert RunEventType.RUN_COMPLETED in added
+
+
+async def test_the_resumed_node_receives_and_forwards_its_input(
+    db: FakeDatabase,
+) -> None:
+    service, run, tenant, token = await _suspended(db)
+
+    await service.resume_run(tenant.current_user, run.public_id, token)
+
+    holder = next(e for e in db.node_executions if e.workflow_node_id == tenant.nodes[1].id)
+    assert holder.output == {"main": {"order": 7}}
+
+
+async def test_an_unknown_token_is_not_found(db: FakeDatabase) -> None:
+    service, run, tenant, _ = await _suspended(db)
+
+    with pytest.raises(NotFoundError):
+        await service.resume_run(tenant.current_user, run.public_id, new_public_id())
+
+
+async def test_a_token_from_another_run_is_not_found(db: FakeDatabase) -> None:
+    """Confirming it names something real elsewhere is exactly what isolation
+    exists to withhold."""
+
+    service, first, tenant, token = await _suspended(db)
+    other = await service.create_run(tenant.current_user, tenant.workflow.public_id)
+
+    with pytest.raises(NotFoundError):
+        await service.resume_run(tenant.current_user, other.public_id, token)
+    assert first.status == RunStatus.SUSPENDED
+
+
+async def test_another_organizations_token_is_not_found(db: FakeDatabase) -> None:
+    service, run, _, token = await _suspended(db)
+    intruder = _Tenant(db)
+
+    with pytest.raises(NotFoundError):
+        await service.resume_run(intruder.current_user, run.public_id, token)
+
+
+async def test_resuming_a_run_that_is_not_suspended_is_refused(
+    db: FakeDatabase, tenant: _Tenant
+) -> None:
+    service, _ = _service(db)
+    run = await service.create_run(tenant.current_user, tenant.workflow.public_id)
+
+    with pytest.raises(NotFoundError):
+        await service.resume_run(tenant.current_user, run.public_id, new_public_id())
+
+
+# --- Repeated suspension ----------------------------------------------------
+
+
+class _TwiceWaiting(NodeRunner):
+    """Suspends on the first two invocations, then completes."""
+
+    def __init__(self) -> None:
+        self.tokens: list[str] = []
+
+    async def run(self, context: NodeRunContext) -> NodeResult:
+        if len(self.tokens) < 2:
+            token = new_public_id()
+            self.tokens.append(token)
+            return Suspended(resume_token=token, hint="again")
+        return Completed(outputs={"main": context.inputs.get("main")})
+
+
+async def test_a_node_may_suspend_again_with_a_fresh_token(db: FakeDatabase) -> None:
+    tenant = _waiting_tenant(db)
+    runner = _TwiceWaiting()
+    registry = InMemoryNodeRegistry()
+    registry.register(trigger_manual.DESCRIPTOR, trigger_manual.RUNNER)
+    registry.register(core_noop.DESCRIPTOR, core_noop.RUNNER)
+    registry.register(core_wait.DESCRIPTOR, runner)
+    service = RunService(FakeUnitOfWorkFactory(db), registry)  # type: ignore[arg-type]
+    run = await service.create_run(tenant.current_user, tenant.workflow.public_id)
+    await service.advance_run(tenant.current_user, run.public_id)
+
+    await service.resume_run(tenant.current_user, run.public_id, runner.tokens[0])
+
+    holder = next(e for e in db.node_executions if e.workflow_node_id == tenant.nodes[1].id)
+    assert holder.status == NodeExecutionStatus.WAITING
+    assert holder.resume_token == runner.tokens[1]
+    assert runner.tokens[0] != runner.tokens[1]
+    # Deliberate suspension never counts as a re-attempt.
+    assert holder.attempt == 1
+    assert db.runs[0].status == RunStatus.SUSPENDED
+
+
+async def test_a_second_resume_finishes_the_run(db: FakeDatabase) -> None:
+    tenant = _waiting_tenant(db)
+    runner = _TwiceWaiting()
+    registry = InMemoryNodeRegistry()
+    registry.register(trigger_manual.DESCRIPTOR, trigger_manual.RUNNER)
+    registry.register(core_noop.DESCRIPTOR, core_noop.RUNNER)
+    registry.register(core_wait.DESCRIPTOR, runner)
+    service = RunService(FakeUnitOfWorkFactory(db), registry)  # type: ignore[arg-type]
+    run = await service.create_run(tenant.current_user, tenant.workflow.public_id)
+    await service.advance_run(tenant.current_user, run.public_id)
+    await service.resume_run(tenant.current_user, run.public_id, runner.tokens[0])
+
+    await service.resume_run(tenant.current_user, run.public_id, runner.tokens[1])
+
+    assert db.runs[0].status == RunStatus.COMPLETED
+
+
+async def test_a_resumed_node_that_fails_fails_the_run(db: FakeDatabase) -> None:
+    tenant = _waiting_tenant(db)
+
+    class _FailsOnResume(NodeRunner):
+        async def run(self, context: NodeRunContext) -> NodeResult:
+            if context.resume_token is None:
+                return Suspended(resume_token=new_public_id(), hint="hold")
+            raise ValueError("resumed and broke")
+
+    registry = InMemoryNodeRegistry()
+    registry.register(trigger_manual.DESCRIPTOR, trigger_manual.RUNNER)
+    registry.register(core_noop.DESCRIPTOR, core_noop.RUNNER)
+    registry.register(core_wait.DESCRIPTOR, _FailsOnResume())
+    service = RunService(FakeUnitOfWorkFactory(db), registry)  # type: ignore[arg-type]
+    run = await service.create_run(tenant.current_user, tenant.workflow.public_id)
+    await service.advance_run(tenant.current_user, run.public_id)
+    token = next(e.resume_token for e in db.node_executions if e.resume_token is not None)
+
+    await service.resume_run(tenant.current_user, run.public_id, token)
+
+    holder = next(e for e in db.node_executions if e.workflow_node_id == tenant.nodes[1].id)
+    assert holder.status == NodeExecutionStatus.FAILED
+    assert "resumed and broke" in holder.error
+    assert db.runs[0].status == RunStatus.FAILED
+
+
+async def test_a_token_too_long_to_store_is_refused_by_name(db: FakeDatabase) -> None:
+    """A driver error would name neither the node nor the reason."""
+
+    tenant = _waiting_tenant(db)
+
+    class _Oversized(NodeRunner):
+        async def run(self, context: NodeRunContext) -> NodeResult:
+            return Suspended(resume_token="x" * 64, hint="too long")
+
+    registry = InMemoryNodeRegistry()
+    registry.register(trigger_manual.DESCRIPTOR, trigger_manual.RUNNER)
+    registry.register(core_noop.DESCRIPTOR, core_noop.RUNNER)
+    registry.register(core_wait.DESCRIPTOR, _Oversized())
+    service = RunService(FakeUnitOfWorkFactory(db), registry)  # type: ignore[arg-type]
+    run = await service.create_run(tenant.current_user, tenant.workflow.public_id)
+
+    with pytest.raises(DomainRuleError, match="resume token"):
+        await service.advance_run(tenant.current_user, run.public_id)
+
+
+# --- AT_MOST_ONCE safety refusal --------------------------------------------
+
+
+class _CountingRunner(NodeRunner):
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def run(self, context: NodeRunContext) -> NodeResult:
+        self.calls += 1
+        return Completed(outputs={"main": context.inputs.get("main")})
+
+
+def _once_only_descriptor() -> NodeDescriptor:
+    """A node that declares it must never be repeated. No built-in does."""
+
+    return NodeDescriptor(
+        node_type="core.noop",
+        version=1,
+        category=NodeCategory.ACTION,
+        config_model=core_noop.NoOpConfig,
+        display=NodeDisplay(label="Once", description="Never repeated.", icon="x"),
+        inputs=(InputHandle(name="main", type=handles.ANY, required=False),),
+        outputs=(OutputHandle(name="main", type=handles.ANY),),
+        side_effect=SideEffect.AT_MOST_ONCE,
+    )
+
+
+async def _stranded_at_most_once(db: FakeDatabase) -> tuple[RunService, Run, _CountingRunner]:
+    """A run whose AT_MOST_ONCE node was left RUNNING by a dead process."""
+
+    tenant = _Tenant(db, node_keys=("trigger", "once"))
+    runner = _CountingRunner()
+    registry = InMemoryNodeRegistry()
+    registry.register(trigger_manual.DESCRIPTOR, trigger_manual.RUNNER)
+    registry.register(_once_only_descriptor(), runner)
+    service = RunService(FakeUnitOfWorkFactory(db), registry)  # type: ignore[arg-type]
+    run = await service.create_run(tenant.current_user, tenant.workflow.public_id)
+
+    # The state a crash leaves behind: the trigger done, the node it unlocked
+    # stranded mid-flight with no process behind it.
+    trigger = next(e for e in db.node_executions if e.workflow_node_id == tenant.nodes[0].id)
+    trigger.status = NodeExecutionStatus.SUCCEEDED
+    trigger.output = {"main": {}}
+    once = next(e for e in db.node_executions if e.workflow_node_id == tenant.nodes[1].id)
+    once.status = NodeExecutionStatus.RUNNING
+    run.status = RunStatus.RUNNING
+    return service, run, runner
+
+
+async def test_an_at_most_once_node_is_not_re_attempted(db: FakeDatabase) -> None:
+    service, run, runner = await _stranded_at_most_once(db)
+
+    await service.advance_run(tenant_user(db), run.public_id)
+
+    once = next(e for e in db.node_executions if e.status == NodeExecutionStatus.FAILED)
+    assert once.attempt > 1
+    assert runner.calls == 0
+    assert once.status == NodeExecutionStatus.FAILED
+    assert "must not run more than once" in once.error
+    assert db.runs[0].status == RunStatus.FAILED
+
+
+async def test_the_refusal_is_recorded_as_a_non_retryable_failure(
+    db: FakeDatabase,
+) -> None:
+    service, run, _ = await _stranded_at_most_once(db)
+
+    await service.advance_run(tenant_user(db), run.public_id)
+
+    event = next(e for e in db.run_events if e.event_type == RunEventType.NODE_FAILED)
+    assert event.payload["retryable"] is False
+    assert event.payload["node_key"] == "once"
+
+
+async def test_a_pure_node_is_still_re_attempted_after_a_crash(
+    db: FakeDatabase, tenant: _Tenant
+) -> None:
+    """The refusal is scoped to AT_MOST_ONCE; at-least-once is unchanged."""
+
+    service, _ = _service(db)
+    run = await service.create_run(tenant.current_user, tenant.workflow.public_id)
+    trigger = next(e for e in db.node_executions if e.workflow_node_id == tenant.nodes[0].id)
+    trigger.status = NodeExecutionStatus.SUCCEEDED
+    trigger.output = {"main": {}}
+    stranded = next(e for e in db.node_executions if e.workflow_node_id == tenant.nodes[1].id)
+    stranded.status = NodeExecutionStatus.RUNNING
+    run.status = RunStatus.RUNNING
+
+    await service.advance_run(tenant.current_user, run.public_id)
+
+    assert stranded.status == NodeExecutionStatus.SUCCEEDED
+    assert stranded.attempt == 2

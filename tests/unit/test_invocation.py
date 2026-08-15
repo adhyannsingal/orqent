@@ -20,9 +20,11 @@ from app.domain.nodes import handles
 from app.domain.nodes.descriptor import NodeCategory, NodeDescriptor, NodeDisplay, SideEffect
 from app.domain.nodes.handles import InputHandle, OutputHandle
 from app.domain.nodes.registry import NodeRegistry
-from app.domain.nodes.result import Completed, Failed, NodeResult
+from app.domain.nodes.result import Completed, Failed, NodeResult, Suspended
 from app.domain.nodes.runner import NodeRunContext, NodeRunner
+from app.infrastructure.db.identifiers import PUBLIC_ID_LENGTH
 from app.infrastructure.nodes import build_registry
+from app.infrastructure.nodes.builtin import core_wait
 from app.infrastructure.nodes.registry import InMemoryNodeRegistry
 
 SUCCEEDED = NodeExecutionStatus.SUCCEEDED
@@ -368,3 +370,123 @@ async def test_the_manual_trigger_emits_an_empty_object_when_started_with_nothin
     result = await invoke(snapshot, registry, "t", context)
 
     assert result == Completed(outputs={"main": {}})
+
+
+# --- Suspension (M7) --------------------------------------------------------
+
+
+async def test_a_suspended_result_is_returned_untouched() -> None:
+    """The engine reacts to the result type, never to the node type."""
+
+    class _Waits(NodeRunner):
+        async def run(self, context: NodeRunContext) -> NodeResult:
+            return Suspended(resume_token="01ABCDEFGHJKMNPQRSTVWXYZ00", hint="why")
+
+    registry = _custom(_Waits())
+    snapshot = _snapshot((GraphNode(key="n", node_type="test.node", version=1),), (), {})
+
+    result = await invoke(snapshot, registry, "n", _context())
+
+    assert result == Suspended(resume_token="01ABCDEFGHJKMNPQRSTVWXYZ00", hint="why")
+
+
+def test_a_fresh_invocation_carries_no_resume_token() -> None:
+    snapshot = _snapshot((GraphNode(key="w", node_type="core.wait", version=1),), (), {})
+
+    context = build_context(snapshot, _registry(), "w", run_id=1, workflow_node_id=1, attempt=1)
+
+    assert context.resume_token is None
+
+
+def test_a_resumed_invocation_carries_the_token_that_resumed_it() -> None:
+    snapshot = _snapshot((GraphNode(key="w", node_type="core.wait", version=1),), (), {})
+
+    context = build_context(
+        snapshot,
+        _registry(),
+        "w",
+        run_id=1,
+        workflow_node_id=1,
+        attempt=1,
+        resume_token="01ABCDEFGHJKMNPQRSTVWXYZ00",
+    )
+
+    assert context.resume_token == "01ABCDEFGHJKMNPQRSTVWXYZ00"
+
+
+def test_the_idempotency_key_is_unchanged_by_a_resume() -> None:
+    """Suspension is deliberate, not ambiguous, so the resumed invocation is the
+    same logical attempt and can recognise the work it did before parking."""
+
+    snapshot = _snapshot((GraphNode(key="w", node_type="core.wait", version=1),), (), {})
+
+    first = build_context(snapshot, _registry(), "w", run_id=5, workflow_node_id=6, attempt=2)
+    resumed = build_context(
+        snapshot, _registry(), "w", run_id=5, workflow_node_id=6, attempt=2, resume_token="t"
+    )
+
+    assert first.idempotency_key == resumed.idempotency_key == "5:6:2"
+
+
+# --- core.wait@1 ------------------------------------------------------------
+
+
+async def _wait(inputs: dict[str, object], resume_token: str | None) -> NodeResult:
+    registry = _registry()
+    snapshot = _snapshot((GraphNode(key="w", node_type="core.wait", version=1),), (), {})
+    context = NodeRunContext(
+        config=core_wait.WaitConfig(),
+        inputs=inputs,
+        idempotency_key="1:1:1",
+        trigger_payload={},
+        resume_token=resume_token,
+    )
+    return await invoke(snapshot, registry, "w", context)
+
+
+async def test_the_wait_node_suspends_on_its_first_invocation() -> None:
+    result = await _wait({}, None)
+
+    assert isinstance(result, Suspended)
+    assert result.hint == "Waiting to be resumed."
+
+
+async def test_the_wait_nodes_token_fits_the_storage_contract() -> None:
+    """It borrows the project's identifier generator, so the engine can persist
+    it without the node knowing anything about the column."""
+
+    result = await _wait({}, None)
+
+    assert isinstance(result, Suspended)
+    assert len(result.resume_token) == PUBLIC_ID_LENGTH
+
+
+async def test_each_suspension_mints_a_fresh_token() -> None:
+    first = await _wait({}, None)
+    second = await _wait({}, None)
+
+    assert isinstance(first, Suspended)
+    assert isinstance(second, Suspended)
+    assert first.resume_token != second.resume_token
+
+
+async def test_the_wait_node_completes_once_resumed() -> None:
+    result = await _wait({}, "01ABCDEFGHJKMNPQRSTVWXYZ00")
+
+    assert result == Completed()
+
+
+async def test_a_resumed_wait_forwards_whatever_arrived() -> None:
+    result = await _wait({"main": {"order": 7}}, "01ABCDEFGHJKMNPQRSTVWXYZ00")
+
+    assert result == Completed(outputs={"main": {"order": 7}})
+
+
+async def test_the_wait_node_is_pure_and_dispatched_like_any_other() -> None:
+    """Suspending is the absence of a side effect, not one. ACTION rather than
+    CONTROL: control nodes are the ones the engine interprets (Phase 7)."""
+
+    descriptor = _registry().get("core.wait", 1)
+
+    assert descriptor.side_effect is SideEffect.PURE
+    assert descriptor.category is NodeCategory.ACTION

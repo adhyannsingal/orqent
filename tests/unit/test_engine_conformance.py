@@ -184,6 +184,29 @@ _FIXTURES: tuple[tuple[str, RunSnapshot, tuple[SchedulerDecision, ...]], ...] = 
         (),
     ),
     (
+        # 10a. A waiting node does not park a run that still has work: the
+        #      independent source starts and the run stays RUNNING. Only when
+        #      nothing else can move does waiting decide the run's status.
+        "waiting_alongside_ready_work_keeps_the_run_running",
+        _snapshot(
+            _TWO_SOURCES,
+            {"trigger": WAITING, "constant": PENDING, "sink": PENDING},
+            run_status=RunStatus.RUNNING,
+        ),
+        (StartNode("constant"),),
+    ),
+    (
+        # 10b. A suspended run decides nothing — the waiting node is not
+        #      recovered, not restarted, and the status is already correct.
+        "suspended_run_is_absorbing",
+        _snapshot(
+            _LINEAR,
+            {"a": WAITING, "b": PENDING, "c": PENDING},
+            run_status=RunStatus.SUSPENDED,
+        ),
+        (),
+    ),
+    (
         # 10. A suspended node parks the run rather than finishing it.
         "waiting_node_suspends_the_run",
         _snapshot(

@@ -31,10 +31,12 @@ class NodeRunContext:
 
     Phase 4 declared the two fields certain for any engine design — a validated
     configuration and the values on the input handles — and deferred the rest
-    rather than guess. The engine phase named two of those guesses correctly, so
-    they arrived in Phase 6 M6: an idempotency key and the run's starting
-    payload. Nothing else has been added, and a cancellation signal remains a
-    guess.
+    rather than guess. Three of those guesses turned out to be right: an
+    idempotency key and the run's starting payload (M6), and the token that
+    resumed this invocation (M7). A cancellation signal remains a guess.
+
+    Every field is node-agnostic. A runner that ignores all three still works,
+    and the engine never varies what it hands over by node type (ADR-020).
     """
 
     config: BaseModel
@@ -61,6 +63,17 @@ class NodeRunContext:
     graph whose first node has no inbound edge to carry it — without the engine
     learning that triggers exist (ADR-014, ADR-020). Empty when the run was
     started with nothing."""
+
+    resume_token: str | None = None
+    """The token that resumed this invocation, or ``None`` on a fresh one.
+
+    A node that suspends is *re-invoked* when it resumes, not continued: a
+    coroutine cannot survive the process restart the whole feature exists to
+    tolerate. So a node needs some way to tell "start" from "carry on", and this
+    is it — the only thing that differs between the two calls.
+
+    Optional, and last, so the two fields M6 added keep their positions and a
+    runner that never suspends need not mention it."""
 
 
 class NodeRunner(ABC):

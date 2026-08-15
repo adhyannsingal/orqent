@@ -54,9 +54,11 @@ from app.domain.errors import (
     DomainRuleError,
     NotFoundError,
 )
+from app.domain.nodes.descriptor import SideEffect
 from app.domain.nodes.registry import NodeRegistry
-from app.domain.nodes.result import Completed, Failed
+from app.domain.nodes.result import Completed, Failed, Suspended
 from app.domain.value_objects.authenticated_user import AuthenticatedUser
+from app.infrastructure.db.identifiers import PUBLIC_ID_LENGTH
 from app.infrastructure.db.models.node_execution import NodeExecution
 from app.infrastructure.db.models.run import Run
 from app.infrastructure.db.models.run_event import RunEvent
@@ -85,6 +87,22 @@ _RUN_EVENTS: Mapping[tuple[RunStatus, RunStatus], RunEventType | None] = {
     (RunStatus.PENDING, RunStatus.FAILED): RunEventType.RUN_FAILED,
     (RunStatus.RUNNING, RunStatus.FAILED): RunEventType.RUN_FAILED,
 }
+
+
+def _validate_resume_token(node_key: str, token: str) -> None:
+    """Refuse a token the engine could not store, naming the node.
+
+    ``Suspended.resume_token`` is contractually opaque, but it is persisted in a
+    fixed-width column. Checking here turns a driver error that names neither the
+    node nor the reason into a domain error that names both — and keeps the
+    storage contract out of the node, which knows nothing about MySQL.
+    """
+
+    if not token or len(token) > PUBLIC_ID_LENGTH:
+        raise DomainRuleError(
+            f"Node {node_key!r} suspended with a resume token of "
+            f"{len(token)} characters; at most {PUBLIC_ID_LENGTH} can be stored."
+        )
 
 
 def _utcnow() -> datetime:
@@ -273,6 +291,7 @@ class RunService:
         organization_id: int,
         workflow_node_id: int,
         attempt: int,
+        resume_token: str | None = None,
     ) -> None:
         """Invoke one node and record what it did, in its own transaction.
 
@@ -287,6 +306,10 @@ class RunService:
         silently lost node.
         """
 
+        if self._repeat_would_be_unsafe(snapshot, node_key, attempt):
+            await self._refuse_repeat(current_user, run_public_id, organization_id, node_key)
+            return
+
         context = build_context(
             snapshot,
             self._node_registry,
@@ -294,6 +317,7 @@ class RunService:
             run_id=run_id,
             workflow_node_id=workflow_node_id,
             attempt=attempt,
+            resume_token=resume_token,
         )
         result = await invoke(snapshot, self._node_registry, node_key, context)
 
@@ -337,15 +361,166 @@ class RunService:
                         },
                     )
 
-                case _:
-                    # `Suspended` is a legal NodeResult that M7 teaches the engine
-                    # to persist. Refusing it here beats recording a suspended
-                    # node as finished, which no later milestone could undo.
-                    raise DomainRuleError(
-                        f"Node {node_key!r} returned a result this version cannot record yet."
+                case Suspended(token, hint):
+                    _validate_resume_token(node_key, token)
+                    ensure_node_execution_transition(
+                        NodeExecutionStatus(execution.status), NodeExecutionStatus.WAITING
                     )
+                    execution.status = NodeExecutionStatus.WAITING
+                    execution.resume_token = token
+                    # No `finished_at`: the node has not finished, and stamping
+                    # it would make a parked node indistinguishable from a
+                    # completed one in every listing.
+                    await self._append(
+                        uow,
+                        run,
+                        RunEventType.NODE_SUSPENDED,
+                        payload={"node_key": node_key, "hint": hint},
+                    )
+                    # The run is *not* suspended here. Other nodes may still be
+                    # runnable, and only the scheduler can see the whole graph —
+                    # so the next tick derives RUNNING → SUSPENDED from the
+                    # WAITING row, exactly as it derives every other run status.
 
             await uow.commit()
+
+    def _repeat_would_be_unsafe(self, snapshot: RunSnapshot, node_key: str, attempt: int) -> bool:
+        """Whether re-attempting this node would break its own declaration.
+
+        A second attempt only happens after an interruption whose outcome is
+        unknown: the node was ``RUNNING`` when its process stopped existing, so
+        it may or may not have reached the outside world. ADR-024 says a node
+        that declares ``AT_MOST_ONCE`` must "surface for a human decision rather
+        than retrying" — so it does not run again.
+
+        A safety refusal, not retry policy. There is no backoff, no ceiling, and
+        no schedule; the other side-effect classes are unaffected and re-attempt
+        exactly as before.
+
+        Checked here rather than in the scheduler because the answer lives on the
+        descriptor, and the scheduler resolves no node types by design (ADR-014).
+        """
+
+        if attempt <= 1:
+            return False
+
+        node = snapshot.graph.node(node_key)
+        if node is None:  # pragma: no cover - the tick already resolved it
+            return False
+        descriptor = self._node_registry.get(node.node_type, node.version)
+        return descriptor.side_effect is SideEffect.AT_MOST_ONCE
+
+    async def _refuse_repeat(
+        self,
+        current_user: AuthenticatedUser,
+        run_public_id: str,
+        organization_id: int,
+        node_key: str,
+    ) -> None:
+        """Fail a node that must not be repeated, without invoking it."""
+
+        async with self._unit_of_work_factory() as uow:
+            caller = await self._caller(uow, current_user)
+            run = await self._run(uow, caller, run_public_id)
+            _, executions = await self._snapshot(uow, run, organization_id)
+            execution = executions[node_key]
+
+            error = (
+                "This node was interrupted and declares that it must not run "
+                "more than once, so it was not attempted again."
+            )
+            ensure_node_execution_transition(
+                NodeExecutionStatus(execution.status), NodeExecutionStatus.FAILED
+            )
+            execution.status = NodeExecutionStatus.FAILED
+            execution.error = error
+            execution.finished_at = _utcnow()
+            await self._append(
+                uow,
+                run,
+                RunEventType.NODE_FAILED,
+                payload={"node_key": node_key, "error": error, "retryable": False},
+            )
+            await uow.commit()
+
+    async def resume_run(
+        self, current_user: AuthenticatedUser, run_public_id: str, resume_token: str
+    ) -> Run:
+        """Resolve a suspended node's token and carry the run on.
+
+        The token is the only thing that can restart a parked run, and it names
+        one suspension instance: resolving it moves the node out of ``WAITING``,
+        so the same token cannot be presented twice. A crash between this commit
+        and the node's invocation leaves a durable ``RUNNING`` row, which
+        ordinary recovery re-attempts (ADR-024).
+
+        **Attempt is preserved.** Suspension was deliberate, not ambiguous, so
+        the resumed invocation is the same logical attempt and carries the same
+        idempotency key — which is exactly what lets a node recognise the work it
+        did before it parked.
+
+        Refuses, as *not found*, a token that belongs to another organization or
+        another run: confirming that a token names something real elsewhere is
+        the fact tenant isolation exists to withhold.
+        """
+
+        async with self._unit_of_work_factory() as uow:
+            caller = await self._caller(uow, current_user)
+            run = await self._run(uow, caller, run_public_id)
+
+            execution = await uow.node_executions.get_by_resume_token(
+                resume_token, caller.organization_id
+            )
+            if execution is None or execution.run_id != run.id:
+                raise NotFoundError("This resume token does not match a waiting node.")
+
+            if NodeExecutionStatus(execution.status) is not NodeExecutionStatus.WAITING:
+                raise ConflictError("This node is not waiting to be resumed.")
+            if RunStatus(run.status) is not RunStatus.SUSPENDED:
+                raise ConflictError("This run is not suspended.")
+
+            snapshot, executions = await self._snapshot(uow, run, caller.organization_id)
+            node_key = next(
+                key for key, candidate in executions.items() if candidate.id == execution.id
+            )
+
+            ensure_node_execution_transition(
+                NodeExecutionStatus(execution.status), NodeExecutionStatus.RUNNING
+            )
+            execution.status = NodeExecutionStatus.RUNNING
+            # Consumed. Leaving it would let a stale token resolve a node that is
+            # no longer waiting, and the unique index would then refuse the next
+            # suspension's fresh token.
+            execution.resume_token = None
+            execution.started_at = _utcnow()
+
+            ensure_run_transition(RunStatus(run.status), RunStatus.RUNNING)
+            run.status = RunStatus.RUNNING
+
+            await self._append(uow, run, RunEventType.RUN_RESUMED)
+            await self._append(uow, run, RunEventType.NODE_STARTED, payload={"node_key": node_key})
+            await uow.commit()
+
+            run_id, organization_id = run.id, caller.organization_id
+            workflow_node_id, attempt = execution.workflow_node_id, execution.attempt
+
+        # Outside the transaction, exactly as advance_run invokes.
+        await self._execute(
+            current_user,
+            run_public_id,
+            snapshot,
+            node_key,
+            run_id=run_id,
+            organization_id=organization_id,
+            workflow_node_id=workflow_node_id,
+            attempt=attempt,
+            resume_token=resume_token,
+        )
+
+        # The graph is re-evaluated as a whole rather than the resumed node being
+        # nudged along by hand: whatever the completed node unlocked is the
+        # scheduler's decision, not this method's.
+        return await self.advance_run(current_user, run_public_id)
 
     async def _snapshot(
         self, uow: SqlAlchemyUnitOfWork, run: Run, organization_id: int

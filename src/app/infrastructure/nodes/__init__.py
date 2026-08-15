@@ -22,6 +22,7 @@ from app.infrastructure.nodes.builtin import (
     core_constant,
     core_log,
     core_noop,
+    core_wait,
     trigger_manual,
 )
 from app.infrastructure.nodes.registry import InMemoryNodeRegistry
@@ -33,6 +34,7 @@ _BUILT_INS: Final[tuple[tuple[NodeDescriptor, NodeRunner], ...]] = (
     (core_constant.DESCRIPTOR, core_constant.RUNNER),
     (core_noop.DESCRIPTOR, core_noop.RUNNER),
     (core_log.DESCRIPTOR, core_log.RUNNER),
+    (core_wait.DESCRIPTOR, core_wait.RUNNER),
 )
 
 

@@ -24,7 +24,13 @@ from app.main import create_app
 SECRET = "node-types-endpoint-secret-long-enough"
 PATH = "/api/v1/node-types"
 
-EXPECTED_ORDER = ["trigger.manual@1", "core.constant@1", "core.noop@1", "core.log@1"]
+EXPECTED_ORDER = [
+    "trigger.manual@1",
+    "core.constant@1",
+    "core.noop@1",
+    "core.log@1",
+    "core.wait@1",
+]
 
 ITEM_KEYS = {
     "type",

@@ -21,12 +21,14 @@ honour-based.
 from __future__ import annotations
 
 import ast
+import tokenize
 from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
 
 import app
+from app.infrastructure.nodes import build_registry
 
 SRC = Path(app.__file__).parent
 
@@ -275,3 +277,64 @@ def test_every_layer_actually_has_modules_to_check() -> None:
         ("app.schemas", 5),
     ):
         assert len(list(_modules(package))) >= minimum, package
+
+
+# --- The engine knows no node type (Phase 6, M7) -----------------------------
+
+# Every module that decides *what runs next* or *what a result means*. None of
+# them may name a node type: the engine reacts to `Suspended`, never to
+# `core.wait` (ADR-014, ADR-020). This is the mechanical form of the claim that
+# adding a node type touches no engine code.
+_ENGINE_MODULES = (
+    "domain/engine/scheduler.py",
+    "domain/engine/snapshot.py",
+    "domain/engine/invocation.py",
+    "domain/engine/state.py",
+    "domain/engine/events.py",
+    "services/run_service.py",
+)
+
+# The whole built-in catalogue, so a future node is covered without editing this.
+_NODE_TYPES = tuple(descriptor.node_type for descriptor in build_registry().all())
+
+
+def _code_only(path: Path) -> str:
+    """The module's source with comments and string literals removed.
+
+    Prose may name a node type — `scheduler.py`'s docstring cites
+    ``core.constant`` as the example of a second zero-inbound node, and that
+    explains the rule rather than breaking it. What must never appear is a node
+    type the *code* depends on.
+    """
+
+    with tokenize.open(path) as handle:
+        return " ".join(
+            token.string
+            for token in tokenize.generate_tokens(handle.readline)
+            if token.type not in (tokenize.COMMENT, tokenize.STRING)
+        )
+
+
+@pytest.mark.parametrize("module", _ENGINE_MODULES)
+def test_the_engine_names_no_node_type(module: str) -> None:
+    """Suspension is the sharpest case: the engine must react to the *result*
+    type a runner returned, not to which node returned it."""
+
+    code = _code_only(SRC / module)
+    named = [node_type for node_type in _NODE_TYPES if node_type in code]
+
+    assert not named, f"{module} names node types: {named}"
+
+
+@pytest.mark.parametrize("module", _ENGINE_MODULES)
+def test_the_engine_imports_no_concrete_node(module: str) -> None:
+    """Runners are resolved through the `NodeRegistry` port, never imported."""
+
+    assert not _violations(SRC / module, ("app.infrastructure.nodes",))
+
+
+def test_the_node_type_guard_actually_has_types_to_check() -> None:
+    """A registry that returned nothing would make the guard above vacuous."""
+
+    assert len(_NODE_TYPES) >= 5
+    assert "core.wait" in _NODE_TYPES

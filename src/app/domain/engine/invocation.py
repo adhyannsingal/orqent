@@ -92,6 +92,7 @@ def build_context(
     run_id: int,
     workflow_node_id: int,
     attempt: int,
+    resume_token: str | None = None,
 ) -> NodeRunContext:
     """Assemble what the runner is handed.
 
@@ -124,6 +125,9 @@ def build_context(
         # lets data enter a graph whose first node has no inbound edge, without
         # the engine learning what a trigger is (ADR-014).
         trigger_payload=snapshot.trigger_payload or {},
+        # Set only when this invocation follows an explicit resume, which is the
+        # one thing distinguishing it from the call that suspended.
+        resume_token=resume_token,
     )
 
 
