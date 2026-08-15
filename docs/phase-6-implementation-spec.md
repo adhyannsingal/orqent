@@ -288,6 +288,38 @@ beyond what the end-to-end demonstration requires. Where a requirement would add
 significant scope without materially improving that demonstration, flag it rather
 than build it.
 
+### 0.10 — Deviations approved during implementation (M5–M7)
+
+Six decisions taken while building diverge from the wording frozen above. Each
+was approved at its milestone; the **code is the source of truth**, and
+[`execution-engine.md`](execution-engine.md) describes the engine as built. The
+frozen wording is left in place rather than rewritten — it records what was
+decided at the time, and editing it would make this document appear to have said
+something it did not.
+
+| # | Frozen wording | What was built | Why | Milestone |
+|---|---|---|---|---|
+| **D1** | §7 step 7 — "re-tick while progress was made" | **M5:** exactly one tick per call. **M6:** the loop, bounded by `len(graph) + 1` | With no runner, a `RUNNING` node never reaches a terminal state, so a loop would recover and restart it forever. The loop became correct the moment invocation could complete a node. **Final behaviour is the loop.** | M5 → M6 |
+| **D2** | §7 steps 5–6 imply one transaction per `advance_run` | **Several**: tick + decisions + events commit; the runner is invoked with **no transaction open**; the result commits separately | The `RUNNING` marker must be durable *before* anything runs, or a crash mid-invocation loses it and at-least-once silently becomes no record at all (ADR-024). Holding a transaction across a slow runner would also lock the system behind it. | M6 |
+| **D3** | §8.2 — `NodeRunContext` "gains exactly **two** additive fields" | **Three**: `idempotency_key`, `trigger_payload`, and `resume_token` | A suspended node is *re-invoked* on resume, not continued — a coroutine cannot survive the process restart the feature exists to tolerate. `resume_token` is the only thing distinguishing the two calls. Node-agnostic: every node receives it. | M7 |
+| **D4** | §8.8 — the `AT_MOST_ONCE` gate lives in **recovery** | Immediately **before invocation**: `attempt > 1` and `side_effect is AT_MOST_ONCE` ⇒ `RUNNING → FAILED`, runner never called | Recovery is decided by the pure scheduler, which cannot see `SideEffect` without owning the registry (ADR-014 forbids it) or a new snapshot field. Gating one step later satisfies ADR-024 identically with no scheduler change, no snapshot field, and no fourth decision type. | M7 |
+| **D5** | §9 — node `WAITING` + run `SUSPENDED` + both events in "**one transaction**" | **Two**: the result transaction writes `WAITING` + token + `NodeSuspended`; the **next tick** writes `SUSPENDED` + `RunSuspended` | The run's status is *derived* from node state by the scheduler, like every other run status. Writing it in the result transaction would create a second source of truth for something the tick already computes. | M7 |
+| **D6** | §9 — `RunService.resume(token)`; transition, commit, "**then** tick" | `resume_run(current_user, run_public_id, resume_token)`, which **invokes the resumed node directly** before re-entering the loop | Two reasons. Tenancy: resume must be authorized and organization-scoped like every other operation. And correctness — see the box below. | M7 |
+
+> **D6, in detail — why resume cannot just tick.**
+>
+> A tick treats a `RUNNING` node at its start as a *stranded* execution: it
+> recovers it (`RUNNING → PENDING`, `attempt += 1`) and restarts it. The restart
+> carries no resume token, so a node waiting to be resumed would suspend again —
+> forever, incrementing `attempt` each cycle.
+>
+> `SchedulerDecision` carries no token, and deliberately so: the scheduler is
+> node-agnostic and knows nothing of suspension beyond the `WAITING` status. The
+> resume path is the only place holding the token, so it is the only place that
+> can deliver it. This is an architectural consequence, **not** special-casing —
+> the engine still reacts to the `Suspended` *result type* and never to a node
+> type.
+
 ---
 
 ## 1. Objective

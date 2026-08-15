@@ -64,8 +64,8 @@ Each layer has one responsibility and a strict set of allowed dependencies. The 
 | Layer | Package | Responsibility | Status |
 |-------|---------|----------------|--------|
 | API / Edge | `app.api` | HTTP↔app translation, routing, auth entry, error mapping, correlation | **[Implemented]** |
-| Application / Services | `app.services` | One method per use case; owns the transaction; enforces ownership | **[Implemented]** (`auth_service` Phase 3, `workflow_service` Phase 4) |
-| Domain | `app.domain` | Entities, value objects, **ports**, execution engine core — pure Python | **[Partly Implemented]** (errors, UnitOfWork port) |
+| Application / Services | `app.services` | One method per use case; owns the transaction; enforces ownership | **[Implemented]** (`auth_service` Phase 3, `workflow_service` Phase 4, `run_service` Phase 6) |
+| Domain | `app.domain` | Entities, value objects, **ports**, execution engine core — pure Python | **[Implemented]** (errors, ports, node contract, graph model + validation, execution engine) |
 | Infrastructure | `app.infrastructure` | Adapters: repositories, DB, LLM/agent runner, vector store, queue, worker, security | **[Partly Implemented]** (DB infra) |
 | Data | MySQL, ChromaDB | Source-of-truth relational state; derived vector index | **[Partly Implemented]** (MySQL models) |
 | Cross-cutting | `app.core` | Config, logging, correlation, constants | **[Implemented]** |
@@ -193,11 +193,17 @@ Validation pipeline        validate_graph(graph, registry) -> ValidationReport
 
 ---
 
-## 11. Execution architecture **[Planned — nothing implemented]**
+## 11. Execution architecture **[Implemented — Phase 6, M1–M7]**
 
-**No execution code exists.** `app.domain.engine` is a docstring-only stub, and `infrastructure/{queue,worker}` likewise.
+The engine runs workflows: a run executes its graph to completion, survives the process that started it, and can park indefinitely on a suspension and resume afterwards. Full description — scheduler, transactions, invocation, events, recovery, suspension — in **[execution-engine.md](execution-engine.md)**, which is authoritative for behaviour.
+
+`app.domain.engine` holds `state`, `snapshot`, `scheduler`, `invocation`, and `events`; `app.services.run_service` owns transactions and dispatch; `runs`, `node_executions`, and `run_events` arrived with migration `0005`. **`infrastructure/{queue,worker}` remain empty** — the queue is Phase 8, and Phase 6 calls the scheduler directly, in-process.
 
 The design (`ADR-019`): a **reentrant scheduler over persisted state**, not a program that runs a workflow to completion. Every state transition is committed before it is acted on; the unit of dispatch is the node execution, not the run; and a runner may return `Suspended(resume_token)` to park a run indefinitely at no cost. The `Suspended` result type already exists in `domain/nodes/result.py` precisely because retrofitting suspension later would mean rewriting the engine and every runner. The engine itself is **Phase 6**; control flow (`ADR-018`, `ADR-028`) arrives in Phase 7; the queue (`ADR-015`) in Phase 8. `ADR-007`'s linear-workflow model is **superseded**.
+
+Six deviations from the frozen Phase 6 plan were approved while building — the execution loop, multi-transaction advancement, a third `NodeRunContext` field, the `AT_MOST_ONCE` gate's position, split suspension transactions, and direct invocation on resume. They are tabulated in [phase-6-implementation-spec.md §0.10](phase-6-implementation-spec.md) and explained in [execution-engine.md](execution-engine.md).
+
+**Still absent:** the Runs HTTP API (Phase 6 M9), queue/workers (Phase 8), retries, timeouts, cancellation, parallel dispatch, and control flow.
 
 > Phase numbers here follow the **2026-08-10 numbering** (Phase 5 = Workflow Authoring API, execution from Phase 6). ADR prose still uses the earlier numbering; see the [mapping rule](roadmap.md#mapping-note).
 

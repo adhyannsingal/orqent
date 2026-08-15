@@ -10,19 +10,19 @@ picks up from the rows (ADR-019).
 performs a transition. The service applies the returned decisions under the M1
 guards, writes their events, and commits — one transaction, or nothing.
 
-**Phase 6 M5 scope.** The tick starts work and decides the run's status. It does
-not invoke anything: moving a node out of ``RUNNING`` needs a node runner, which
-arrives in M6. Consequently a run advanced by this milestone reaches ``RUNNING``
-and stops there, and the terminal rules below — though implemented and tested in
-full against hand-built snapshots — are unreachable through the service until M6
-can produce a ``SUCCEEDED``.
+**It starts work; it never does any.** A tick says which nodes should begin and
+what the run's status has become. Invoking a runner, reading its result, and
+recording it belong to the service, because all three are effects. That division
+is what makes the whole of this module testable with a dictionary and no
+database.
 
-**Deliberately not implemented here:** the "re-tick while progress was made" loop
-of the frozen spec §7 step 7. Without a runner, a node never leaves ``RUNNING``,
-so every subsequent tick would recover and restart it — forever, incrementing
-``attempt`` each time. The loop becomes correct in M6, when invocation moves a
-node to a terminal state inside the same tick. Until then the service performs
-**exactly one tick per call** (milestone-scoped decision, 2026-08-14).
+**The loop lives in the service, not here.** ``RunService.advance_run`` calls this
+repeatedly — tick, apply, commit, invoke, commit, tick again — until a tick
+decides nothing. It is bounded by the node count, because in Phase 6 every node
+reaches a terminal state at most once. Keeping the repetition outside this
+function is what leaves it a pure function of one snapshot: a loop in here would
+need to know what the invocations it triggered had done, which means reading the
+database.
 
 No control flow, no branch pruning, no loops, no joins, no scopes, no parallel
 dispatch, no queue: Phases 7 and 8.
