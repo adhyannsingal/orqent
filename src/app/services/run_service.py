@@ -29,6 +29,7 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from typing import assert_never
 
 import structlog
 
@@ -41,6 +42,7 @@ from app.domain.engine.snapshot import (
     RunSnapshot,
     SchedulerDecision,
     SetRunStatus,
+    SkipNode,
     StartNode,
 )
 from app.domain.engine.state import (
@@ -659,6 +661,22 @@ class RunService:
                     event_type = _RUN_EVENTS[(previous, status)]
                     if event_type is not None:
                         await self._append(uow, run, event_type)
+
+                case SkipNode(node_key):
+                    # Emitted from Phase 7 M2 onwards; applied in M3. Refusing
+                    # beats letting it fall through, which would leave the node
+                    # PENDING and stall the run short of a terminal state — the
+                    # exact failure pruning exists to prevent.
+                    raise DomainRuleError(
+                        f"Node {node_key!r} was pruned, which this version cannot record yet."
+                    )
+
+                case _ as unhandled:
+                    # The decision union is closed, so this is unreachable — and
+                    # `assert_never` is what makes the type checker prove it. A
+                    # fifth decision cannot be added without mypy naming this
+                    # method as a place that must handle it.
+                    assert_never(unhandled)
 
     async def _append(
         self,

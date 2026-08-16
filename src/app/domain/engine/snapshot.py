@@ -113,7 +113,23 @@ class RecoverNode:
     node_key: str
 
 
-SchedulerDecision = StartNode | SetRunStatus | RecoverNode
+@dataclass(frozen=True, slots=True)
+class SkipNode:
+    """This node will never run: ``PENDING → SKIPPED``.
+
+    Emitted when every path that could have reached the node is dead — the
+    branch a condition did not take. Without it those nodes would sit ``PENDING``
+    forever and the run would stall short of a terminal state, which is the
+    classic failure ADR-028 exists to prevent.
+
+    Nothing is invoked. A skipped node produced no outputs, so the edges leaving
+    it are dead too, and the next tick prunes onward from here.
+    """
+
+    node_key: str
+
+
+SchedulerDecision = StartNode | SetRunStatus | RecoverNode | SkipNode
 """The closed set of things a tick can decide.
 
 Closed so ``match`` over it is exhaustive and a new decision cannot appear

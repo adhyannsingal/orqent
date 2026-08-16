@@ -10,11 +10,10 @@ Pure by construction: standard library only, no persistence, no I/O, no node
 type. The transition tables are the single source of truth, and terminality is
 *derived* from them rather than listed separately, so the two can never disagree.
 
-Phase 6 scope. There is no ``CANCELLED`` run state — nothing can request a
-cancellation until an API exists to ask for one — and no ``SKIPPED`` node state,
-because only branch pruning produces one and that is Phase 7 (ADR-028). Both are
-omitted rather than declared-and-unreachable: the status columns are ``VARCHAR``
-rather than a native ``ENUM``, so adding a member later costs no migration.
+Scope. There is no ``CANCELLED`` run state — nothing can request a cancellation
+until an API exists to ask for one. ``SKIPPED`` arrived with branch pruning in
+Phase 7 (ADR-028) and cost no migration, because the status columns are
+``VARCHAR`` rather than a native ``ENUM`` — which is exactly why they are.
 """
 
 from __future__ import annotations
@@ -69,6 +68,14 @@ class NodeExecutionStatus(StrEnum):
     SUCCEEDED = "SUCCEEDED"
     FAILED = "FAILED"
 
+    SKIPPED = "SKIPPED"
+    """The node will never run: every path that could have reached it is dead.
+
+    Reached only from ``PENDING`` — a node that has already started cannot
+    become irrelevant, so ``RUNNING → SKIPPED`` is illegal. Terminal, so a run
+    whose remaining nodes are all skipped is finished rather than stalled, which
+    is the whole reason the state exists (ADR-028)."""
+
     @property
     def is_terminal(self) -> bool:
         """Whether this state has no successor."""
@@ -92,7 +99,16 @@ RUN_TRANSITIONS: Final[Mapping[RunStatus, frozenset[RunStatus]]] = {
 
 
 NODE_EXECUTION_TRANSITIONS: Final[Mapping[NodeExecutionStatus, frozenset[NodeExecutionStatus]]] = {
-    NodeExecutionStatus.PENDING: frozenset({NodeExecutionStatus.RUNNING}),
+    NodeExecutionStatus.PENDING: frozenset(
+        {
+            NodeExecutionStatus.RUNNING,
+            # Pruned before it ever started. Only from PENDING: a node that has
+            # been handed to a runner may have already reached the outside
+            # world, so "it turned out not to matter" is not a thing that can
+            # be said about it afterwards.
+            NodeExecutionStatus.SKIPPED,
+        }
+    ),
     NodeExecutionStatus.RUNNING: frozenset(
         {
             NodeExecutionStatus.WAITING,
@@ -109,6 +125,7 @@ NODE_EXECUTION_TRANSITIONS: Final[Mapping[NodeExecutionStatus, frozenset[NodeExe
     NodeExecutionStatus.WAITING: frozenset({NodeExecutionStatus.RUNNING}),
     NodeExecutionStatus.SUCCEEDED: frozenset(),
     NodeExecutionStatus.FAILED: frozenset(),
+    NodeExecutionStatus.SKIPPED: frozenset(),
 }
 """Legal node-execution transitions. Absent pair ⇒ illegal."""
 

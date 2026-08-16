@@ -7,6 +7,8 @@ run-status precedence, and the states the scheduler must *not* invent.
 
 from __future__ import annotations
 
+from typing import get_args
+
 import pytest
 
 from app.domain.engine.scheduler import tick
@@ -14,7 +16,9 @@ from app.domain.engine.snapshot import (
     NodeExecutionSnapshot,
     RecoverNode,
     RunSnapshot,
+    SchedulerDecision,
     SetRunStatus,
+    SkipNode,
     StartNode,
 )
 from app.domain.engine.state import NodeExecutionStatus, RunStatus
@@ -288,3 +292,24 @@ def test_the_tick_does_not_mutate_the_snapshot() -> None:
     assert snapshot.status is RunStatus.RUNNING
     assert snapshot.node_executions["a"].status is RUNNING
     assert snapshot.node_executions["a"].attempt == 1
+
+
+# --- The decision union (Phase 7, M1) ---------------------------------------
+
+
+def test_the_decision_union_is_closed_and_complete() -> None:
+    """Closed so `match` over it is exhaustive. `RunService._apply` asserts the
+    same thing at type-check time via `assert_never`, so a fifth decision cannot
+    be added without the type checker naming every place that must handle it."""
+
+    assert set(get_args(SchedulerDecision)) == {StartNode, SetRunStatus, RecoverNode, SkipNode}
+
+
+def test_a_skip_decision_names_only_the_node() -> None:
+    """Nothing is invoked and nothing is produced, so there is nothing else to
+    carry."""
+
+    decision = SkipNode("pruned")
+
+    assert decision.node_key == "pruned"
+    assert decision == SkipNode("pruned")

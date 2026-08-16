@@ -45,6 +45,8 @@ _LEGAL_NODE: frozenset[tuple[NodeExecutionStatus, NodeExecutionStatus]] = frozen
         (NodeExecutionStatus.RUNNING, NodeExecutionStatus.FAILED),
         (NodeExecutionStatus.RUNNING, NodeExecutionStatus.PENDING),
         (NodeExecutionStatus.WAITING, NodeExecutionStatus.RUNNING),
+        # Pruned before it ever started (ADR-028).
+        (NodeExecutionStatus.PENDING, NodeExecutionStatus.SKIPPED),
     }
 )
 
@@ -115,10 +117,14 @@ def test_terminal_run_states_are_exactly_completed_and_failed() -> None:
     assert terminal == {RunStatus.COMPLETED, RunStatus.FAILED}
 
 
-def test_terminal_node_execution_states_are_exactly_succeeded_and_failed() -> None:
+def test_terminal_node_execution_states_are_succeeded_failed_and_skipped() -> None:
     terminal = {status for status in NodeExecutionStatus if status.is_terminal}
 
-    assert terminal == {NodeExecutionStatus.SUCCEEDED, NodeExecutionStatus.FAILED}
+    assert terminal == {
+        NodeExecutionStatus.SUCCEEDED,
+        NodeExecutionStatus.FAILED,
+        NodeExecutionStatus.SKIPPED,
+    }
 
 
 @pytest.mark.parametrize("status", [status for status in RunStatus if status.is_terminal])
@@ -186,11 +192,52 @@ def test_a_node_cannot_succeed_without_running() -> None:
         ensure_node_execution_transition(NodeExecutionStatus.PENDING, NodeExecutionStatus.SUCCEEDED)
 
 
-def test_phase_6_declares_no_cancelled_or_skipped_state() -> None:
-    """Both are deliberately absent until the phase that can produce them."""
+def test_no_cancelled_run_state_is_declared() -> None:
+    """Deliberately absent until something can request a cancellation."""
 
     assert "CANCELLED" not in {status.name for status in RunStatus}
-    assert "SKIPPED" not in {status.name for status in NodeExecutionStatus}
+
+
+# --- Pruning (Phase 7, M1) --------------------------------------------------
+
+
+def test_a_pending_node_may_be_pruned() -> None:
+    """The branch a condition did not take (ADR-028)."""
+
+    ensure_node_execution_transition(NodeExecutionStatus.PENDING, NodeExecutionStatus.SKIPPED)
+
+
+def test_a_started_node_may_not_be_pruned() -> None:
+    """A node handed to a runner may already have reached the outside world, so
+    "it turned out not to matter" is not something that can be said about it."""
+
+    with pytest.raises(InvalidStateTransitionError):
+        ensure_node_execution_transition(NodeExecutionStatus.RUNNING, NodeExecutionStatus.SKIPPED)
+
+
+@pytest.mark.parametrize(
+    "target",
+    [
+        NodeExecutionStatus.PENDING,
+        NodeExecutionStatus.RUNNING,
+        NodeExecutionStatus.WAITING,
+        NodeExecutionStatus.SUCCEEDED,
+        NodeExecutionStatus.FAILED,
+        NodeExecutionStatus.SKIPPED,
+    ],
+)
+def test_nothing_leaves_a_skipped_node(target: NodeExecutionStatus) -> None:
+    """Terminal and absorbing: a pruned branch is not revisited."""
+
+    with pytest.raises(InvalidStateTransitionError):
+        ensure_node_execution_transition(NodeExecutionStatus.SKIPPED, target)
+
+
+def test_a_waiting_node_may_not_be_pruned() -> None:
+    """It is parked on something external, not irrelevant."""
+
+    with pytest.raises(InvalidStateTransitionError):
+        ensure_node_execution_transition(NodeExecutionStatus.WAITING, NodeExecutionStatus.SKIPPED)
 
 
 # --- The error itself -------------------------------------------------------
