@@ -28,6 +28,8 @@ BUILT_IN_NAMES = (
     "core.noop@1",
     "core.log@1",
     "core.wait@1",
+    "core.condition@1",
+    "core.merge@1",
 )
 
 # `namespace.name`, lower snake case. Keeps the catalogue readable and the

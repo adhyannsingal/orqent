@@ -1477,3 +1477,89 @@ async def test_skipping_a_node_that_already_started_is_refused(
             {tenant.nodes[0].node_key: execution},
             [SkipNode(tenant.nodes[0].node_key)],
         )
+
+
+# --- The real Condition and Merge, through the engine (Phase 7, M4) ----------
+
+
+def _diamond_tenant(db: FakeDatabase) -> _Tenant:
+    """The acceptance shape, built from the *registered* control nodes.
+
+    trigger -> condition -{true}-> b -> merge.a -> next
+                         -{false}-> c -> merge.b
+    """
+
+    tenant = _Tenant(db, node_keys=("trigger", "cond", "b", "c", "merge", "next"))
+    nodes, _ = db.graphs[tenant.version.id]
+    nodes[1].node_type = "core.condition"
+    nodes[1].config = {"path": "flag", "operator": "equals", "value": True}
+    nodes[4].node_type = "core.merge"
+    db.graphs[tenant.version.id] = (
+        nodes,
+        [
+            GraphEdge("trigger", "main", "cond", "main"),
+            GraphEdge("cond", "true", "b", "main"),
+            GraphEdge("cond", "false", "c", "main"),
+            GraphEdge("b", "main", "merge", "a"),
+            GraphEdge("c", "main", "merge", "b"),
+            GraphEdge("merge", "main", "next", "main"),
+        ],
+    )
+    return tenant
+
+
+async def _run_diamond(db: FakeDatabase, *, flag: bool) -> tuple[_Tenant, object]:
+    tenant = _diamond_tenant(db)
+    service, _ = _service(db)  # the real registry, with core.condition and core.merge
+    run = await service.create_run(
+        tenant.current_user, tenant.workflow.public_id, trigger_payload={"flag": flag}
+    )
+    await service.advance_run(tenant.current_user, run.public_id)
+    return tenant, run
+
+
+async def test_the_true_path_runs_and_the_false_branch_is_pruned(db: FakeDatabase) -> None:
+    tenant, _ = await _run_diamond(db, flag=True)
+
+    assert _execution(db, tenant, 2).status == NodeExecutionStatus.SUCCEEDED  # b
+    assert _execution(db, tenant, 3).status == NodeExecutionStatus.SKIPPED  # c
+    assert _execution(db, tenant, 4).status == NodeExecutionStatus.SUCCEEDED  # merge
+    assert _execution(db, tenant, 5).status == NodeExecutionStatus.SUCCEEDED  # next
+    assert db.runs[0].status == RunStatus.COMPLETED
+
+
+async def test_the_false_path_runs_and_the_true_branch_is_pruned(db: FakeDatabase) -> None:
+    """The same published workflow, the opposite payload, the opposite path —
+    and no engine code knows what a condition is."""
+
+    tenant, _ = await _run_diamond(db, flag=False)
+
+    assert _execution(db, tenant, 2).status == NodeExecutionStatus.SKIPPED  # b
+    assert _execution(db, tenant, 3).status == NodeExecutionStatus.SUCCEEDED  # c
+    assert _execution(db, tenant, 4).status == NodeExecutionStatus.SUCCEEDED  # merge
+    assert _execution(db, tenant, 5).status == NodeExecutionStatus.SUCCEEDED  # next
+    assert db.runs[0].status == RunStatus.COMPLETED
+
+
+async def test_the_merge_carries_the_live_branchs_value_onward(db: FakeDatabase) -> None:
+    tenant, _ = await _run_diamond(db, flag=True)
+
+    payload = {"flag": True}
+    assert _execution(db, tenant, 4).output == {"main": payload}  # merge
+    assert _execution(db, tenant, 5).output == {"main": payload}  # next
+
+
+async def test_the_condition_emitted_on_exactly_one_handle(db: FakeDatabase) -> None:
+    tenant, _ = await _run_diamond(db, flag=True)
+
+    outputs = _execution(db, tenant, 1).output
+    assert outputs is not None
+    assert set(outputs) == {"true"}
+
+
+async def test_a_pruned_branch_is_reported_in_the_timeline(db: FakeDatabase) -> None:
+    await _run_diamond(db, flag=False)
+
+    skipped = [e for e in db.run_events if e.event_type == RunEventType.NODE_SKIPPED]
+    assert {e.payload["node_key"] for e in skipped} == {"b"}
+    assert all(e.event_type != RunEventType.NODE_FAILED for e in db.run_events)

@@ -19,8 +19,10 @@ from app.domain.nodes.descriptor import NodeDescriptor
 from app.domain.nodes.registry import NodeRegistry
 from app.domain.nodes.runner import NodeRunner
 from app.infrastructure.nodes.builtin import (
+    core_condition,
     core_constant,
     core_log,
+    core_merge,
     core_noop,
     core_wait,
     trigger_manual,
@@ -35,6 +37,8 @@ _BUILT_INS: Final[tuple[tuple[NodeDescriptor, NodeRunner], ...]] = (
     (core_noop.DESCRIPTOR, core_noop.RUNNER),
     (core_log.DESCRIPTOR, core_log.RUNNER),
     (core_wait.DESCRIPTOR, core_wait.RUNNER),
+    (core_condition.DESCRIPTOR, core_condition.RUNNER),
+    (core_merge.DESCRIPTOR, core_merge.RUNNER),
 )
 
 

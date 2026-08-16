@@ -30,6 +30,8 @@ EXPECTED_ORDER = [
     "core.noop@1",
     "core.log@1",
     "core.wait@1",
+    "core.condition@1",
+    "core.merge@1",
 ]
 
 ITEM_KEYS = {
