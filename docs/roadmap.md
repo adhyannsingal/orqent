@@ -1,8 +1,8 @@
 # Roadmap
 
-**This file has two halves.** Sections 1–4 below are the **authoritative plan
-being executed**, current as of **2026-08-10**. Everything from
-[§5 Historical plan](#5-historical-plan-pre-redesign--retained-for-history-only)
+**This file has two halves.** Sections 1–5 below are the **authoritative plan
+being executed**, current as of **2026-08-16**. Everything from
+[§6 Historical plan](#5-historical-plan-pre-redesign--retained-for-history-only)
 onward is the pre-redesign plan, kept for history and **not** a status source.
 
 ---
@@ -42,9 +42,9 @@ amended, or reordered; only the position of the authoring API in the sequence.
 | 2 | Database infrastructure — async SQLAlchemy, mixins, Unit of Work, Alembic; foundation models; migration `0001` | ✅ **Implemented** |
 | 3 | Authentication & tenancy — Argon2id + JWT behind ports, `AuthService`, refresh rotation with reuse detection, RBAC; migrations `0002`–`0003` | ✅ **Implemented** |
 | 4 | Workflow authoring, node contract & graph validation — M1–M11: node contract, registry, `WorkflowGraph`, validation pipeline, authoring tables, repositories, `WorkflowService`; migration `0004` | ✅ **Implemented** |
-| **5** | **Workflow Authoring API** — the HTTP authoring layer over Phase 4 (§3) | 🟡 **In progress — M1–M3 complete, M4–M6 not started** |
-| 6 | Durable execution core — reentrant scheduler over persisted state, run and node-execution state machines, event log, sequential and in-process, **suspension from day one** (ADR-019) | ⬜ Not started |
-| 7 | Control flow — Condition, Merge, Loop scopes, structural parallelism, branch pruning, join policies (ADR-018, ADR-028) | ⬜ Not started |
+| 5 | Workflow Authoring API — the HTTP authoring layer over Phase 4 (§3) | ✅ **Implemented** (M1–M6, merged `db4f754`) |
+| 6 | Durable execution core — reentrant scheduler, run/node-execution state machines, event log, node invocation, crash recovery, suspension and resume, and the Runs API (§4) | ✅ **Implemented** (M1–M9, migration `0005`) |
+| **7** | **Control flow** — Condition, Merge, Loop scopes, structural parallelism, branch pruning, join policies (ADR-018, ADR-028) | 🟢 **Next** |
 | 8 | Queue & workers — per-node dispatch, DB-backed queue with `SKIP LOCKED`, reaper, concurrency limits, per-org fairness (ADR-015, ADR-030) | ⬜ Not started |
 | 9 | Triggers — manual → webhook → schedule; registration lifecycle tied to publish | ⬜ Not started |
 | 10 | Human-in-the-loop — approval node, inbox API, authorization, timeouts/escalation | ⬜ Not started |
@@ -59,7 +59,7 @@ only when it starts; the ordering and dependencies are inherited from
 
 ---
 
-## 3. Phase 5 — Workflow Authoring API
+## 3. Phase 5 — Workflow Authoring API ✅ **COMPLETE**
 
 ### Goal
 
@@ -79,15 +79,15 @@ then hardens the boundary, and nothing more.
 | **M1** | API contracts & schemas — the frozen request/response contract for workflows, drafts, graphs, versions, and validation reports | ✅ **COMPLETE** | `3649719` |
 | **M2** | Workflow authoring HTTP API — the eleven routes over `WorkflowService` | ✅ **COMPLETE** | `01f0e3e` |
 | **M3** | API boundary hardening — dangling edges rejected at the boundary | ✅ **COMPLETE** | `e3c1cbb` |
-| **M4** | API contract & consistency review | ⬜ **NOT STARTED** | — |
-| **M5** | API architecture & production hardening | ⬜ **NOT STARTED** | — |
-| **M6** | Phase 5 final verification & documentation | ⬜ **NOT STARTED** | — |
+| **M4** | API contract & consistency review | ✅ **COMPLETE** | `e99f1a3` |
+| **M5** | API architecture & production hardening | ✅ **COMPLETE** | `90025d9` |
+| **M6** | Phase 5 final verification & documentation | ✅ **COMPLETE** | `de4666d` |
+| — | Audit findings F-1 … F-3 fixed (F-4, F-5 closed as contract-conformant) | ✅ **COMPLETE** | `2fa3ec7` |
 
-**M1–M3 live on the `phase-5` branch and are not yet merged into `main`.** The
-milestone plan is authoritative on `main` from 2026-08-10; the code is not on
-`main` yet. Do not read `main`'s `src/app/api/v1/routes/` and conclude the API
-was never built, and do not read this table and conclude `main` serves workflow
-routes. Both statements are true at once until the branch merges.
+**Merged into `main` as `db4f754`.** The integration deliberately took only the
+code and tests from `phase-5`, leaving `main`'s documentation authoritative;
+that documentation was reconciled afterwards. `main` serves all eleven workflow
+routes.
 
 The routes delivered by M2, all under `/api/v1/workflows`:
 
@@ -145,9 +145,68 @@ future phases ([CLAUDE.md](CLAUDE.md)) applies to every item on this list: an
 empty `runs` table, a `TaskQueue` stub, or a provider-credentials column added
 "while we're in here" is a Phase 5 scope violation regardless of how small it is.
 
+*Since resolved:* the execution engine, runs, node execution records, execution
+events, and retries/state machines arrived in **Phase 6** (§4). Queues, workers,
+scheduling and triggers, LangChain, `AgentRunner`, LLM providers, provider
+configuration, API keys, runtime tool execution, execution WebSockets, and
+execution observability remain unbuilt.
+
 ---
 
-## 4. Cross-references (authoritative set)
+## 4. Phase 6 — Durable Execution Core ✅ **COMPLETE**
+
+### Goal
+
+Execute a published workflow durably: run it to completion, survive the process
+that started it, and park indefinitely on a suspension without holding
+resources. Phase 6 ends with a workflow that can be published, run, inspected,
+suspended, and resumed **entirely over HTTP**.
+
+Behaviour is described in **[execution-engine.md](execution-engine.md)**, which
+is authoritative. The plan and its six approved deviations are in
+[phase-6-implementation-spec.md](phase-6-implementation-spec.md) §0.9–§0.10.
+
+### Milestones
+
+| Milestone | Scope | Status |
+|---|---|---|
+| **M1** | Execution state machines — run and node-execution statuses, legal transitions, guards | ✅ **COMPLETE** |
+| **M2** | Execution persistence — `runs`, `node_executions`, `run_events`; **migration `0005`** | ✅ **COMPLETE** |
+| **M3** | Execution repositories on the unit of work, every read tenant-scoped | ✅ **COMPLETE** |
+| **M4** | Run materialization and the event log — `create_run`, `RunEventType` | ✅ **COMPLETE** |
+| **M5** | The scheduler — pure `tick()`, the snapshot/decision boundary, conformance suite | ✅ **COMPLETE** |
+| **M6** | Node invocation — input resolution, idempotency key, trigger payload, result persistence | ✅ **COMPLETE** |
+| **M7** | Suspension and resume — `WAITING`/`SUSPENDED`, resume tokens, `core.wait@1`, `AT_MOST_ONCE` refusal | ✅ **COMPLETE** |
+| **M8** | Documentation reconciliation — `execution-engine.md`, deviation record | ✅ **COMPLETE** |
+| **M9** | Runs HTTP API — six routes, service read layer, container wiring | ✅ **COMPLETE** |
+
+### What Phase 6 delivered
+
+- A **pure scheduler** (`tick(snapshot) → decisions`) with a stdlib-only domain
+  boundary, and an imperative shell that owns every transaction.
+- **Durable execution**: a node is marked `RUNNING` and committed *before* its
+  runner is called, so a crash is decidable and recovery re-attempts it
+  (at-least-once, ADR-024).
+- **Suspension and resume** that survive a full process restart, with
+  single-use resume tokens.
+- An **append-only event timeline** written in the same transaction as the state
+  it describes.
+- A fifth built-in node, **`core.wait@1`**, and the `AT_MOST_ONCE` safety
+  refusal.
+- The **Runs API** — six routes under `/api/v1/runs`.
+
+### What Phase 6 deliberately did **not** build
+
+Queue/workers/`SKIP LOCKED`/reapers (Phase 8) · retry policy, backoff, timeouts
+(Phase 8) · cancellation · concurrency or parallel dispatch · control flow,
+`SKIPPED`, scopes, loops, joins (Phase 7) · triggers/webhooks/schedules
+(Phase 9) · human tasks (Phase 10) · connections and I/O nodes (Phase 11) ·
+LangChain/LLM/vector (Phases 12–13) · metrics, quotas, retention, SSE
+(Phase 14) · frontend.
+
+---
+
+## 5. Cross-references (authoritative set)
 
 - Where the project stands: [project_status.md](project_status.md) §§10–11
 - Durable context for AI sessions: [CLAUDE.md](CLAUDE.md)
@@ -156,10 +215,11 @@ empty `runs` table, a `TaskQueue` stub, or a provider-credentials column added
   the workflow platform)
 - Phase 4's frozen specification: [phase-4-implementation-spec.md](phase-4-implementation-spec.md)
   — read through the §1 mapping note
+- Engine behaviour as built: [execution-engine.md](execution-engine.md)
 
 ---
 
-## 5. Historical plan (pre-redesign) — retained for history only
+## 6. Historical plan (pre-redesign) — retained for history only
 
 <a name="5-historical-plan-pre-redesign--retained-for-history-only"></a>
 

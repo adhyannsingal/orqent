@@ -27,42 +27,50 @@ Full picture: [docs/architecture.md](docs/architecture.md).
   - **Persistence**: `workflows`, `workflow_versions`, `workflow_nodes`, `workflow_edges` + **migration `0004`**; one-draft-per-workflow and per-org name uniqueness enforced by generated columns.
   - **Repositories**: `WorkflowRepository`, `WorkflowVersionRepository` on the unit of work; every read tenant-scoped.
   - **`WorkflowService`**: create/list/get/update/soft-delete, draft copy-on-write, graph replacement, optimistic revision locking, validate, publish with resource-dependent authorization (ADR-032).
-- **[In progress] Phase 5 — Workflow Authoring API (M1–M3 complete, M4–M6 not started).** See the scope section below. **M1–M3 are committed on the `phase-5` branch and are not yet merged into `main`:** `main`'s `src/app/api/v1/routes/` contains `health`, `auth`, and `node_types` only, and `main` has no `schemas/workflows.py`. If you are working on `main`, the workflow API is *documented but absent*; check out `phase-5` to see it.
-- **[Implemented] Phase 6 — durable execution core (M1–M7).** Runs execute their graph to completion, survive the process that started them, and can suspend indefinitely and resume. Run/node-execution/event records **exist** (`runs`, `node_executions`, `run_events`, migration `0005`); so do the state machines, the pure scheduler, node invocation, crash recovery, suspension with durable resume tokens, `core.wait@1`, and the `AT_MOST_ONCE` safety refusal. Authoritative description: **[docs/execution-engine.md](docs/execution-engine.md)**. **M9 — the Runs HTTP API — is not built**, so a run is reachable only from `RunService`, and `Container.run_service()` is deliberately unwired.
-- **Still [Planned] — do not describe any of these as existing:** the Runs HTTP API, control flow (conditions/loops/joins/scopes/pruning), queue/worker/`SKIP LOCKED`/reapers, retries/backoff/timeouts, cancellation, parallel dispatch, scheduling and triggers, human-in-the-loop, connections and secrets, the AI agent node, LangChain, `AgentRunner`, LLM/provider integrations, API keys or provider credentials, and memory/RAG.
-- Remaining placeholder packages (`infrastructure/{llm,vector,queue,worker,tools}`) are empty or contain only a docstring describing future intent — **do not treat them as implemented.** `domain/engine` is no longer among them.
-- **Migrations `0001`–`0005` are applied.** Phase 5 added no migrations (HTTP over the Phase 4 schema); Phase 6 added `0005` for the three execution tables. Tests: **1271 default + 246 integration = 1517**.
+- **[Implemented] Phase 5 — Workflow Authoring API (M1–M6, merged `db4f754`).** Eleven routes under `/api/v1/workflows`: CRUD, draft read/replace, validate, publish, version history. No execution.
+- **[Implemented] Phase 6 — durable execution core (M1–M9, complete).** Runs execute their graph to completion, survive the process that started them, and can suspend indefinitely and resume. `runs`/`node_executions`/`run_events` + **migration `0005`**; the state machines, the pure scheduler, node invocation, crash recovery, suspension with durable resume tokens, `core.wait@1`, the `AT_MOST_ONCE` safety refusal, and **the Runs HTTP API** (six routes under `/api/v1/runs`). `Container.run_service()` is wired. Authoritative description: **[docs/execution-engine.md](docs/execution-engine.md)**.
+- **Still [Planned] — do not describe any of these as existing:** control flow (conditions/loops/joins/scopes/pruning, `SKIPPED`), queue/worker/`SKIP LOCKED`/reapers, retry policy/backoff/timeouts, cancellation, parallel dispatch or concurrency, scheduling and triggers, human-in-the-loop, connections and secrets, I/O nodes, the AI agent node, LangChain, `AgentRunner`, LLM/provider integrations, API keys, memory/RAG, SSE/WebSockets, and **any frontend**.
+- Remaining placeholder packages (`infrastructure/{llm,vector,queue,worker,tools}`) are empty or contain only a docstring describing future intent — **do not treat them as implemented.** `domain/engine` is fully implemented and is no longer among them.
+- **Migrations `0001`–`0005` are applied.** Tests (verified 2026-08-16): **1318 default + 257 integration = 1575**, 0 failures, 0 skips; ruff/mypy/architecture all green.
 
 Always distinguish **[Implemented] / [Planned] / [Future]** (defined in [docs/glossary.md](docs/glossary.md)). Do not describe planned features as if they exist.
 
 ---
 
-## Phase 5 — Workflow Authoring API (current phase)
+## Phase 6 — Durable Execution Core (complete; Phase 7 is next)
 
-**Goal:** complete and harden the HTTP authoring layer over the Phase 4 foundations. Phase 5 ends with a **complete, tested, documented workflow authoring API**. **It does not implement execution.**
+**Phase 6 is finished.** A workflow can be published, run, inspected, suspended, and resumed entirely over HTTP. All nine milestones are done: state machines (M1), persistence + migration `0005` (M2), repositories (M3), run materialization and the event log (M4), the pure scheduler (M5), node invocation (M6), suspension/resume (M7), documentation (M8), and the Runs API (M9).
 
-| Milestone | Scope | Status | Commit |
-|---|---|---|---|
-| M1 | API contracts & schemas | ✅ COMPLETE | `3649719` |
-| M2 | Workflow authoring HTTP API (11 routes under `/api/v1/workflows`) | ✅ COMPLETE | `01f0e3e` |
-| M3 | API boundary hardening (dangling edges rejected at the boundary) | ✅ COMPLETE | `e3c1cbb` |
-| M4 | API contract & consistency review | ⬜ NOT STARTED | — |
-| M5 | API architecture & production hardening | ⬜ NOT STARTED | — |
-| M6 | Phase 5 final verification & documentation | ⬜ NOT STARTED | — |
+**The six execution routes:**
 
-**M4** is primarily **review and tests**: prove the shipped surface conforms to the frozen M1 contract, and add functionality *only* where that contract is genuinely unmet — M4 is not a place to extend the API. **M5** is API boundary/architecture hardening and production-readiness work **actually justified by the existing architecture and contracts**, not a generic hardening checklist. **M6** is the closing verification/documentation gate.
+```
+POST   /api/v1/runs                        start a run                  201
+GET    /api/v1/runs                        list, tenant-scoped, paged
+GET    /api/v1/runs/{run_id}               run + node executions
+POST   /api/v1/runs/{run_id}/advance       drive it forward             200
+POST   /api/v1/runs/{run_id}/resume        resolve a resume token       200
+GET    /api/v1/runs/{run_id}/events        the timeline, in sequence
+```
 
-**What is NOT Phase 5 — do not pull any of these in merely because it is the logical next step:** execution engine · runs · node execution records · execution events · queues · workers · scheduling · retries/state machines · LangChain execution · `AgentRunner` execution · LLM providers · provider configuration · API keys · runtime tool execution · execution WebSockets · execution observability. These are Phases 6+. The standing no-scaffolding rule applies to every item: an empty `runs` table or a `TaskQueue` stub added "while we're in here" is a scope violation regardless of size.
+**Five built-in node types:** `trigger.manual@1`, `core.constant@1`, `core.noop@1`, `core.log@1`, `core.wait@1`.
+
+**Things to know before changing execution code:**
+
+- The **scheduler is pure** — `tick(snapshot) → decisions`, stdlib only, no I/O, no node-type knowledge. An architecture test enforces that the engine names no node type.
+- **`advance_run` uses several transactions**, deliberately: a node is marked `RUNNING` and *committed before its runner is called*, which is what makes a crash decidable (ADR-024). Do not collapse them.
+- **Crash recovery increments `attempt`; deliberate resume does not** — so a resumed invocation keeps the same idempotency key.
+- **Resume invokes the node directly** before re-entering the loop. A tick would treat the `RUNNING` node as stranded, recover it, and lose the token.
+- Six approved deviations from the frozen plan are recorded in [phase-6-implementation-spec.md](docs/phase-6-implementation-spec.md) §0.10. **The code is the source of truth.**
+
+**Phase 7 is control flow** — Condition, Merge, Loop scopes, structural parallelism, branch pruning, join policies (ADR-018, ADR-028). Not started. Do not scaffold it.
 
 **Phase numbering (mapping note, 2026-08-10).** Phase 5 is the Workflow Authoring API; **execution begins at Phase 6**. Where a document written before 2026-08-10 names a phase number 5 or higher, **add one** — ADR-018's "Phase 6" scopes are Phase 7, ADR-032's "Phase 5" is Phase 6, and `phase-4-implementation-spec.md` is offset from §5 upward. Those documents are **deliberately not rewritten**; they record decisions taken at a point in time. Full reasoning: [docs/roadmap.md §1](docs/roadmap.md#mapping-note).
-
-The workflow HTTP API was specified as Phase 4 **M12** in the frozen Phase 4 spec, but Phase 4 closed at the service layer (M11). M12 shipped as Phase 5 M1–M2, and M13's documentation sign-off is now Phase 5 M6.
 
 ---
 
 ## Architecture (summary)
 
-Layered + hexagonal (ports & adapters). Layers: **API** (`app.api`) → **Services** (`app.services` — `auth_service`, `workflow_service`) → **Domain** (`app.domain`, pure) ← **Infrastructure** (`app.infrastructure`, adapters). Cross-cutting **core** (`app.core`) and composition root (`app.container`).
+Layered + hexagonal (ports & adapters). Layers: **API** (`app.api`) → **Services** (`app.services` — `auth_service`, `workflow_service`, `run_service`) → **Domain** (`app.domain`, pure) ← **Infrastructure** (`app.infrastructure`, adapters). Cross-cutting **core** (`app.core`) and composition root (`app.container`).
 
 - **Ports** (domain abstractions): `UnitOfWork`, `PasswordHasher`, `TokenService` [Implemented]; `AgentRunner`, `LLMProvider`, `TaskQueue`, `VectorStore` [Planned].
 - **Adapters** (infrastructure): `SqlAlchemyUnitOfWork`, `Argon2PasswordHasher`, `JwtTokenService` [Implemented]; mock/LangChain runners, Chroma, queue/worker [Planned].

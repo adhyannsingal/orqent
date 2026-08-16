@@ -3,13 +3,13 @@
 ```
 Project:        Orqent — Visual Workflow Automation Platform (backend)
 Version:        0.1.0
-Current Phase:  Phase 5 — Workflow Authoring API 🟡 in progress (M1–M3 complete, M4–M6 not started)
-Last Updated:   2026-08-10
-Status:         Healthy — Phase 4 complete (authoring domain, persistence, service layer,
-                migrations 0001–0004 applied). Phase 5 has shipped the workflow HTTP API
-                through M3 on the `phase-5` branch, not yet merged to `main`.
-                No execution of any kind exists.
-Next Milestone: Phase 5 M4 — API contract & consistency review — NOT STARTED
+Current Phase:  Phase 6 — Durable Execution Core ✅ COMPLETE (M1–M9)
+Last Updated:   2026-08-16  ·  `main` @ 5709655, working tree clean
+Status:         Healthy — Phases 1–6 complete, migrations 0001–0005 applied.
+                A workflow can be published, run, inspected, suspended, and
+                resumed entirely over HTTP. 1575 tests (1318 default + 257
+                integration), 0 failures, 0 skips; ruff/mypy/architecture green.
+Next Milestone: Phase 7 — Control flow (Condition, Merge, Loop scopes) — NOT STARTED
 ```
 
 > **Phase renumbering (2026-08-10).** Phase 5 is the **Workflow Authoring API**;
@@ -783,17 +783,13 @@ execution engine (Phase 6) is tested against a **mock `AgentRunner`**.
 - [x] **Phase 3 — Authentication & tenancy** ✅ (3A + 3B, migrations `0002`–`0003`)
 - [x] **Phase 4 — Workflow authoring, node contract & graph validation** ✅
   (M1–M11, migration `0004`) · see §6
-- [ ] **Phase 5 — Workflow Authoring API** 🟡 *in progress* · *Objective:*
-  complete and harden the HTTP authoring layer over Phase 4; ends with a
-  complete, tested, documented authoring API and **no execution**. M1–M3
-  complete, M4–M6 not started — see §11 and
-  [roadmap.md §3](roadmap.md#3-phase-5--workflow-authoring-api).
-  *Depends on:* 4. *Complexity:* **Medium**.
-- [ ] **Phase 6 — Durable execution core** · *Objective:* reentrant scheduler
-  over persisted state, run and node-execution state machines, event log,
-  sequential and in-process, **including suspension from day one** (ADR-019).
-  *Depends on:* 5. *Complexity:* **Highest**.
-- [ ] **Phase 7 — Control flow** · *Objective:* Condition, Merge, Loop scopes
+- [x] **Phase 5 — Workflow Authoring API** ✅ (M1–M6 plus audit fixes, merged
+  `db4f754`) · eleven routes over `WorkflowService`, no execution · see
+  [roadmap.md §3](roadmap.md#3-phase-5--workflow-authoring-api)
+- [x] **Phase 6 — Durable execution core** ✅ (M1–M9, migration `0005`) ·
+  scheduler, invocation, crash recovery, suspension/resume, event timeline, and
+  the Runs API · see §11 and [execution-engine.md](execution-engine.md)
+- [ ] **Phase 7 — Control flow** 🟢 *next* · *Objective:* Condition, Merge, Loop scopes
   (`for_each`/`while`), structural parallelism, branch pruning, join policies
   (ADR-018, ADR-028). *Depends on:* 6. *Complexity:* **High**.
 - [ ] **Phase 8 — Queue & workers** · *Objective:* per-node dispatch, DB-backed
@@ -825,91 +821,116 @@ it is a frozen record — so treat its M12/M13 as delivered under Phase 5 number
 
 ---
 
-## 11. Current Milestone: Phase 5 — Workflow Authoring API 🟡 IN PROGRESS
+## 11. Current State: Phase 6 — Durable Execution Core ✅ COMPLETE
 
-**Goal.** Complete and harden the HTTP authoring layer over the Phase 4
-foundations. Phase 5 ends with a **complete, tested, documented workflow
-authoring API**. **It does not implement execution.**
+**Verified 2026-08-16 on `main` @ `5709655`, working tree clean.**
 
-| Milestone | Scope | Status | Commit |
-|---|---|---|---|
-| **M1** | API contracts & schemas | ✅ **COMPLETE** | `3649719` |
-| **M2** | Workflow authoring HTTP API | ✅ **COMPLETE** | `01f0e3e` |
-| **M3** | API boundary hardening | ✅ **COMPLETE** | `e3c1cbb` |
-| **M4** | API contract & consistency review | ⬜ **NOT STARTED** | — |
-| **M5** | API architecture & production hardening | ⬜ **NOT STARTED** | — |
-| **M6** | Phase 5 final verification & documentation | ⬜ **NOT STARTED** | — |
+### What the product does today
 
-**Branch state.** M1–M3 are committed on the **`phase-5` branch and are not yet
-merged into `main`**. `main` carries this plan (from 2026-08-10) but not the code:
-`main`'s `src/app/api/v1/routes/` holds `health`, `auth`, and `node_types` only.
-Both facts hold simultaneously — check out `phase-5` to see the API.
+A user can register, create a workflow, edit its draft graph, validate it,
+publish it, **start a run, watch it execute, and resume it after a suspension** —
+all over HTTP, all tenant-scoped. That is the proof-of-concept path end to end.
 
-M1 froze the request/response contract; M2 added the eleven routes under
-`/api/v1/workflows` (create, list, get, update, soft-delete, read draft, replace
-draft, validate draft, publish, list versions, get version) over the existing
-`WorkflowService`; M3 closed a boundary gap by rejecting dangling edges before
-they reach the service.
+### Phase 6 milestones
 
-**M4** is primarily **review and tests** — prove the shipped surface conforms to
-the frozen M1 contract, and add functionality *only* where that contract is
-genuinely unmet. **M5** covers API boundary/architecture hardening and
-production-readiness concerns **actually justified by the existing architecture
-and contracts**, not a generic checklist. **M6** is the closing verification and
-documentation gate.
+| Milestone | Scope | Status |
+|---|---|---|
+| **M1** | Execution state machines and transition guards | ✅ |
+| **M2** | `runs`, `node_executions`, `run_events` + migration `0005` | ✅ |
+| **M3** | Execution repositories on the unit of work, tenant-scoped | ✅ |
+| **M4** | Run materialization, `RunEventType`, the event log | ✅ |
+| **M5** | Pure scheduler, snapshot/decision boundary, conformance suite | ✅ |
+| **M6** | Node invocation, idempotency key, trigger payload, results | ✅ |
+| **M7** | Suspension, resume, `core.wait@1`, `AT_MOST_ONCE` refusal | ✅ |
+| **M8** | Documentation reconciliation (`execution-engine.md`) | ✅ |
+| **M9** | Runs HTTP API, service read layer, container wiring | ✅ |
 
-### What is NOT Phase 5
+### Capabilities delivered
 
-Not Phase 5 work, and not to be pulled in as a "logical next step": the
-execution engine · runs · node execution records · execution events · queues ·
-workers · scheduling · retries/state machines · LangChain execution ·
-`AgentRunner` execution · LLM providers · provider configuration · API keys ·
-runtime tool execution · execution WebSockets · execution observability. These
-are Phases 6+ (§10). The no-scaffolding rule applies to every one of them.
+- **Pure scheduler** — `tick(snapshot) → decisions`, stdlib-only, no I/O. The
+  imperative shell (`RunService`) owns every transaction.
+- **Durable execution** — a node is marked `RUNNING` and **committed before its
+  runner is called**, so a crash is decidable and recovery re-attempts it
+  (at-least-once, ADR-024). Several transactions per `advance_run`, deliberately.
+- **Suspension and resume** — `WAITING` node, `SUSPENDED` run, single-use resume
+  token, and a **full process restart** in between. Deliberate resume preserves
+  `attempt`; crash recovery increments it.
+- **Append-only event timeline** — written in the same transaction as the state
+  change it describes, never reconstructed.
+- **`AT_MOST_ONCE` safety refusal** — a node that must not repeat is failed
+  rather than re-invoked after an ambiguous interruption.
+- **Runs API** — six routes, described below.
 
-### What Phase 4 leaves ready to build on
+### API surface (verified against the OpenAPI schema)
 
-The node contract (`NodeDescriptor`, `NodeRunner`, and crucially the
-`Suspended` result, which ADR-019 requires to exist before the engine does); the
-node registry, which the engine will resolve runners through without importing a
-concrete node; `WorkflowGraph` plus a validation pipeline that guarantees a
-published version is structurally sound before anything runs; the workflow /
-version / node / edge tables with published versions immutable; and
-`WorkflowService`, which shows the transaction and authorization shape every
-later service copies.
+```
+POST   /api/v1/runs                        start a run                  201
+GET    /api/v1/runs                        list, tenant-scoped, paged
+GET    /api/v1/runs/{run_id}               run + node executions
+POST   /api/v1/runs/{run_id}/advance       drive it forward             200
+POST   /api/v1/runs/{run_id}/resume        resolve a resume token       200
+GET    /api/v1/runs/{run_id}/events        the timeline, in sequence
+```
 
-### Explicitly NOT implemented (do not assume otherwise)
+Plus Phase 3's five `/auth` routes, Phase 4's `/node-types`, Phase 5's eleven
+`/workflows` routes, and the two health probes. **20 paths in total.**
 
-| Not built | Where it belongs |
+`advance` and `resume` return `200`, not `202`: execution is synchronous and
+finished when the response is written.
+
+### Node catalogue — five built-ins
+
+`trigger.manual@1` · `core.constant@1` · `core.noop@1` · `core.log@1` ·
+`core.wait@1`. Registered in code (ADR-022); there is no `node_types` table.
+
+### Migrations
+
+`0001` foundation · `0002` refresh tokens · `0003` role seed · `0004` workflow
+authoring · **`0005` execution**.
+
+### Quality gates — verified 2026-08-16
+
+| Gate | Result |
 |---|---|
-| Workflow execution of any kind | Phase 6 |
-| Run / node-execution records and the event log | Phase 6 |
-| Control flow (Condition, Merge, Loop scopes) | Phase 7 |
-| Queues, workers, dispatch | Phase 8 |
-| Scheduling and triggers | Phase 9 |
-| Human-in-the-loop / approval | Phase 10 |
-| Connections and secrets | Phase 11 (ADR-027) |
-| LangChain integration | Phase 12 (ADR-013) |
-| `AgentRunner` implementation | Phase 12 |
-| LLM / provider integrations, provider configuration, API keys | Phase 12 |
-| Memory / RAG | Phase 13 (ADR-003) |
-| Execution observability, quotas, retention | Phase 14 |
-| Frontend workflow editor | Out of scope for this repository |
+| `pytest` (default) | **1318 passed** |
+| `pytest -m integration` (real MySQL) | **257 passed** |
+| **Total** | **1575, 0 failures, 0 skips** |
+| `ruff format --check .` | 170 files formatted |
+| `ruff check .` | All checks passed |
+| `mypy src` | Success, 111 source files |
+| Architecture boundaries | 103 passed |
+| `git diff --check` | clean |
 
-The **workflow HTTP API and its schemas are built** (Phase 5 M1–M3) but live on
-the `phase-5` branch, not on `main` — the one entry that is neither "implemented
-on `main`" nor "not built". Everything else in the table above genuinely does not
-exist on any branch.
+### Approved deviations from the frozen Phase 6 plan
 
-The `domain/engine` and `infrastructure/{llm,vector,queue,worker,tools}` packages
-contain **docstrings only**. They are intent, not implementation.
+Six, recorded in [phase-6-implementation-spec.md](phase-6-implementation-spec.md)
+§0.10 and explained in [execution-engine.md](execution-engine.md): the bounded
+execution loop (D1), multiple transaction boundaries (D2), the `resume_token`
+context field (D3), the invocation-time `AT_MOST_ONCE` gate (D4), two-transaction
+suspension (D5), direct resumed-node invocation (D6), and `POST /runs` replacing
+the nested create route (D7). **The code is the source of truth.**
 
-### Carried forward
+### Explicitly NOT implemented
 
-No rate limiting on login or refresh (§12.15), and `email_verified_at` is still
-never set (§12.16).
+Control flow — Condition, Merge, Loop, scopes, branch pruning, `SKIPPED`,
+join policies (Phase 7) · queue, workers, `SKIP LOCKED`, leases, heartbeats,
+reapers (Phase 8) · retry policy, backoff, timeouts (Phase 8) · cancellation ·
+concurrency or parallel dispatch · triggers, webhooks, schedules (Phase 9) ·
+human tasks and inbox (Phase 10) · connections, secrets, HTTP/Email/Database/File
+nodes, egress policy (Phase 11) · LangChain, LLM providers, API keys, the AI
+agent node (Phase 12) · vector storage / RAG (Phase 13) · metrics, quotas,
+retention, purge jobs, SSE streaming (Phase 14) · **frontend**.
 
----
+### What remains before the proof of concept is demonstrable
+
+The backend path is complete. What is left is **not backend work**:
+
+1. **A frontend** that drives the existing API — the visual builder and a run
+   view. Nothing in the backend blocks it; every route it needs exists.
+2. **Optional richness for the demo** — Phase 7's Condition/Loop would make a
+   demonstrated workflow more interesting than a linear chain, and Phase 11's
+   HTTP node would make it do something externally visible. Neither is required
+   for the path to work.
 
 ## 12. Known Technical Debt
 
