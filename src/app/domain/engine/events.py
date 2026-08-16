@@ -10,9 +10,10 @@ The whole Phase 6 set is declared at once, the same way
 that adds it uses one. A vocabulary revealed a member at a time is a vocabulary
 nobody can read, and ``match`` over it is only exhaustive if it is closed.
 
-Excluded until the phase that can produce them: ``NodeReady`` and ``NodeSkipped``
-need branch pruning (Phase 7), ``RunCancelled`` needs something able to request
-a cancellation, and the human-task events need Phase 10.
+``NodeSkipped`` joined the set with branch pruning in Phase 7. Still excluded
+until the phase that can produce them: ``NodeReady``, ``RunCancelled`` (which
+needs something able to request a cancellation), and the human-task events of
+Phase 10.
 """
 
 from __future__ import annotations
@@ -41,3 +42,10 @@ class RunEventType(StrEnum):
     NODE_SUCCEEDED = "NodeSucceeded"
     NODE_FAILED = "NodeFailed"
     NODE_SUSPENDED = "NodeSuspended"
+
+    NODE_SKIPPED = "NodeSkipped"
+    """The node will never run: every path to it was dead (ADR-028).
+
+    Distinct from ``NodeFailed`` on purpose. Nothing went wrong — the branch was
+    simply not taken — and a timeline that called that a failure would be
+    describing something that did not happen."""

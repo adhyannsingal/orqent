@@ -663,12 +663,25 @@ class RunService:
                         await self._append(uow, run, event_type)
 
                 case SkipNode(node_key):
-                    # Emitted from Phase 7 M2 onwards; applied in M3. Refusing
-                    # beats letting it fall through, which would leave the node
-                    # PENDING and stall the run short of a terminal state — the
-                    # exact failure pruning exists to prevent.
-                    raise DomainRuleError(
-                        f"Node {node_key!r} was pruned, which this version cannot record yet."
+                    execution = executions[node_key]
+                    # The guard is the point: only a PENDING node may be pruned.
+                    # A node that has already started may have reached the
+                    # outside world, so "it turned out not to matter" is not
+                    # something that can be said about it afterwards (ADR-028).
+                    ensure_node_execution_transition(
+                        NodeExecutionStatus(execution.status), NodeExecutionStatus.SKIPPED
+                    )
+                    execution.status = NodeExecutionStatus.SKIPPED
+                    # Terminal, so it is stamped finished — but nothing else is
+                    # touched. No runner is invoked, `attempt` stays where it
+                    # was because nothing was attempted, and `output` stays NULL
+                    # because a node that never ran produced nothing. That last
+                    # one is load-bearing: the scheduler reads emitted handles to
+                    # decide liveness, so a skipped node emitting anything would
+                    # keep a dead branch alive.
+                    execution.finished_at = _utcnow()
+                    await self._append(
+                        uow, run, RunEventType.NODE_SKIPPED, payload={"node_key": node_key}
                     )
 
                 case _ as unhandled:

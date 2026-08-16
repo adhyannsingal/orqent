@@ -15,8 +15,15 @@ from __future__ import annotations
 import pytest
 
 from app.domain.engine.events import RunEventType
+from app.domain.engine.snapshot import SkipNode
 from app.domain.engine.state import NodeExecutionStatus, RunStatus
-from app.domain.errors import AuthenticationError, ConflictError, DomainRuleError, NotFoundError
+from app.domain.errors import (
+    AuthenticationError,
+    ConflictError,
+    DomainRuleError,
+    InvalidStateTransitionError,
+    NotFoundError,
+)
 from app.domain.graph.model import GraphEdge
 from app.domain.nodes import handles
 from app.domain.nodes.descriptor import (
@@ -45,6 +52,7 @@ from tests.unit.fakes import (
     FakeNodeExecutionRepository,
     FakeRunEventRepository,
     FakeRunRepository,
+    FakeUnitOfWork,
     FakeUnitOfWorkFactory,
     integrity_error,
 )
@@ -1250,3 +1258,222 @@ async def test_a_pure_node_is_still_re_attempted_after_a_crash(
 
     assert stranded.status == NodeExecutionStatus.SUCCEEDED
     assert stranded.attempt == 2
+
+
+# --- Branch pruning applied (Phase 7, M3) -----------------------------------
+
+
+class _CountingWrapper(NodeRunner):
+    """Forwards to a real runner and records that it was called."""
+
+    def __init__(self, inner: NodeRunner, log: list[str], node_type: str) -> None:
+        self._inner = inner
+        self._log = log
+        self._node_type = node_type
+
+    async def run(self, context: NodeRunContext) -> NodeResult:
+        self._log.append(self._node_type)
+        return await self._inner.run(context)
+
+
+class _Branching(NodeRunner):
+    """Emits on exactly one of two handles, chosen by the run's payload.
+
+    Stands in for `core.condition@1`, which is M4. Written here as a plain
+    `NodeRunner` because that is the whole point: the engine prunes on *which
+    handle produced a value*, and never learns what kind of node decided.
+    """
+
+    def __init__(self, log: list[str]) -> None:
+        self._log = log
+
+    async def run(self, context: NodeRunContext) -> NodeResult:
+        self._log.append("branch")
+        taken = "true" if context.trigger_payload.get("flag") else "false"
+        return Completed(outputs={taken: context.inputs.get("main")})
+
+
+def _branching_tenant(db: FakeDatabase) -> _Tenant:
+    """trigger -> branch -{true}-> taken ; -{false}-> dropped -> after."""
+
+    tenant = _Tenant(db, node_keys=("trigger", "branch", "taken", "dropped", "after"))
+    nodes, _ = db.graphs[tenant.version.id]
+    # Its own type, so the ordinary no-ops downstream stay ordinary.
+    nodes[1].node_type = "test.branch"
+    db.graphs[tenant.version.id] = (
+        nodes,
+        [
+            GraphEdge("trigger", "main", "branch", "main"),
+            GraphEdge("branch", "true", "taken", "main"),
+            GraphEdge("branch", "false", "dropped", "main"),
+            GraphEdge("dropped", "main", "after", "main"),
+        ],
+    )
+    return tenant
+
+
+def _branching_service(db: FakeDatabase) -> tuple[RunService, list[str]]:
+    """A registry whose second node branches, and which records every call."""
+
+    invoked: list[str] = []
+    registry = InMemoryNodeRegistry()
+    registry.register(
+        trigger_manual.DESCRIPTOR,
+        _CountingWrapper(trigger_manual.RUNNER, invoked, "trigger.manual"),
+    )
+    registry.register(
+        NodeDescriptor(
+            node_type="test.branch",
+            version=1,
+            category=NodeCategory.ACTION,
+            config_model=core_noop.NoOpConfig,
+            display=NodeDisplay(label="Branch", description="Picks a path.", icon="x"),
+            inputs=(InputHandle(name="main", type=handles.ANY, required=False),),
+            outputs=(
+                OutputHandle(name="true", type=handles.ANY),
+                OutputHandle(name="false", type=handles.ANY),
+                OutputHandle(name="main", type=handles.ANY),
+            ),
+            side_effect=SideEffect.PURE,
+        ),
+        _Branching(invoked),
+    )
+    registry.register(
+        core_noop.DESCRIPTOR, _CountingWrapper(core_noop.RUNNER, invoked, "core.noop")
+    )
+    return RunService(FakeUnitOfWorkFactory(db), registry), invoked  # type: ignore[arg-type]
+
+
+def _execution(db: FakeDatabase, tenant: _Tenant, index: int) -> object:
+    node_id = tenant.nodes[index].id
+    return next(e for e in db.node_executions if e.workflow_node_id == node_id)
+
+
+async def test_the_untaken_branch_is_skipped(db: FakeDatabase) -> None:
+    tenant = _branching_tenant(db)
+    service, _ = _branching_service(db)
+    run = await service.create_run(
+        tenant.current_user, tenant.workflow.public_id, trigger_payload={"flag": True}
+    )
+
+    await service.advance_run(tenant.current_user, run.public_id)
+
+    assert _execution(db, tenant, 2).status == NodeExecutionStatus.SUCCEEDED  # taken
+    assert _execution(db, tenant, 3).status == NodeExecutionStatus.SKIPPED  # dropped
+
+
+async def test_pruning_propagates_to_a_node_only_that_branch_could_reach(
+    db: FakeDatabase,
+) -> None:
+    tenant = _branching_tenant(db)
+    service, _ = _branching_service(db)
+    run = await service.create_run(
+        tenant.current_user, tenant.workflow.public_id, trigger_payload={"flag": True}
+    )
+
+    await service.advance_run(tenant.current_user, run.public_id)
+
+    assert _execution(db, tenant, 4).status == NodeExecutionStatus.SKIPPED  # after
+
+
+async def test_a_run_with_a_pruned_branch_completes(db: FakeDatabase) -> None:
+    """The reason SKIPPED is terminal: the run finishes rather than stalling."""
+
+    tenant = _branching_tenant(db)
+    service, _ = _branching_service(db)
+    run = await service.create_run(
+        tenant.current_user, tenant.workflow.public_id, trigger_payload={"flag": True}
+    )
+
+    await service.advance_run(tenant.current_user, run.public_id)
+
+    assert db.runs[0].status == RunStatus.COMPLETED
+    assert db.runs[0].finished_at is not None
+
+
+async def test_a_skipped_node_is_never_invoked(db: FakeDatabase) -> None:
+    """The runner for the dropped branch is never called at all."""
+
+    tenant = _branching_tenant(db)
+    service, invoked = _branching_service(db)
+    run = await service.create_run(
+        tenant.current_user, tenant.workflow.public_id, trigger_payload={"flag": True}
+    )
+
+    await service.advance_run(tenant.current_user, run.public_id)
+
+    # trigger, branch, taken — and nothing for `dropped` or `after`.
+    assert invoked == ["trigger.manual", "branch", "core.noop"]
+
+
+async def test_a_skipped_node_produces_no_output_and_no_attempt(
+    db: FakeDatabase,
+) -> None:
+    """`output` must stay NULL: the scheduler reads emitted handles to decide
+    liveness, so a skipped node emitting anything would keep a dead branch
+    alive."""
+
+    tenant = _branching_tenant(db)
+    service, _ = _branching_service(db)
+    run = await service.create_run(
+        tenant.current_user, tenant.workflow.public_id, trigger_payload={"flag": True}
+    )
+
+    await service.advance_run(tenant.current_user, run.public_id)
+
+    dropped = _execution(db, tenant, 3)
+    assert dropped.output is None
+    assert dropped.error is None
+    assert dropped.started_at is None
+    assert dropped.attempt == 1
+
+
+async def test_skipping_emits_node_skipped_naming_the_node(db: FakeDatabase) -> None:
+    tenant = _branching_tenant(db)
+    service, _ = _branching_service(db)
+    run = await service.create_run(
+        tenant.current_user, tenant.workflow.public_id, trigger_payload={"flag": True}
+    )
+
+    await service.advance_run(tenant.current_user, run.public_id)
+
+    skipped = [e for e in db.run_events if e.event_type == RunEventType.NODE_SKIPPED]
+    assert {e.payload["node_key"] for e in skipped} == {"dropped", "after"}
+    # Not a failure: nothing went wrong, the branch was simply not taken.
+    assert all(e.event_type != RunEventType.NODE_FAILED for e in db.run_events)
+
+
+async def test_the_other_payload_prunes_the_other_branch(db: FakeDatabase) -> None:
+    """The same published workflow, the opposite path."""
+
+    tenant = _branching_tenant(db)
+    service, _ = _branching_service(db)
+    run = await service.create_run(
+        tenant.current_user, tenant.workflow.public_id, trigger_payload={"flag": False}
+    )
+
+    await service.advance_run(tenant.current_user, run.public_id)
+
+    assert _execution(db, tenant, 2).status == NodeExecutionStatus.SKIPPED  # taken
+    assert _execution(db, tenant, 3).status == NodeExecutionStatus.SUCCEEDED  # dropped
+    assert _execution(db, tenant, 4).status == NodeExecutionStatus.SUCCEEDED  # after
+    assert db.runs[0].status == RunStatus.COMPLETED
+
+
+async def test_skipping_a_node_that_already_started_is_refused(
+    db: FakeDatabase, tenant: _Tenant
+) -> None:
+    """Enforced by the M1 guard, not by a check in the service."""
+
+    service, _ = _service(db)
+    run = await service.create_run(tenant.current_user, tenant.workflow.public_id)
+    execution = db.node_executions[0]
+    execution.status = NodeExecutionStatus.RUNNING
+
+    with pytest.raises(InvalidStateTransitionError):
+        await service._apply(
+            FakeUnitOfWork(db),  # type: ignore[arg-type]
+            run,
+            {tenant.nodes[0].node_key: execution},
+            [SkipNode(tenant.nodes[0].node_key)],
+        )
