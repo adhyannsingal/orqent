@@ -20,6 +20,7 @@ from app.domain.engine.snapshot import (
     RunSnapshot,
     SchedulerDecision,
     SetRunStatus,
+    SkipNode,
     StartNode,
 )
 from app.domain.engine.state import NodeExecutionStatus, RunStatus
@@ -31,6 +32,7 @@ RUNNING = NodeExecutionStatus.RUNNING
 WAITING = NodeExecutionStatus.WAITING
 SUCCEEDED = NodeExecutionStatus.SUCCEEDED
 FAILED = NodeExecutionStatus.FAILED
+SKIPPED = NodeExecutionStatus.SKIPPED
 
 
 def _graph(
@@ -66,12 +68,32 @@ def _snapshot(
     statuses: dict[str, NodeExecutionStatus],
     *,
     run_status: RunStatus = RunStatus.PENDING,
+    emitted: dict[str, tuple[str, ...]] | None = None,
 ) -> RunSnapshot:
+    """A snapshot in which every succeeded node emitted on ``main``.
+
+    That default is what a plain data node does — `core.noop` forwards on
+    `main`, and readiness is handle-aware, so a succeeded node that emitted
+    nothing would leave its outgoing edges dead. ``emitted`` names the handles a
+    node produced on instead, which is how a branch is expressed: a node that
+    emitted only ``true`` leaves the ``false`` edge dead.
+    """
+
+    handles = emitted or {}
     return RunSnapshot(
         status=run_status,
         graph=graph,
         node_executions={
-            key: NodeExecutionSnapshot(node_key=key, status=status, attempt=1)
+            key: NodeExecutionSnapshot(
+                node_key=key,
+                status=status,
+                attempt=1,
+                outputs=(
+                    dict.fromkeys(handles.get(key, ("main",)))
+                    if status is NodeExecutionStatus.SUCCEEDED
+                    else None
+                ),
+            )
             for key, status in statuses.items()
         },
     )
@@ -90,6 +112,52 @@ _FAN_IN = _graph(
     # the thing Phase 6 has no join policy for.
     target_handles=("first", "second"),
 )
+
+
+def _branching() -> WorkflowGraph:
+    """A fork and a rejoin, built by hand because the edges carry real handles.
+
+        cond --true--> b --> join.a --> tail
+             --false-> c --> join.b
+
+    Nothing here says which node type `cond` is. The scheduler only ever sees
+    that one of its two output handles produced a value.
+    """
+
+    keys = ("cond", "b", "c", "join", "tail")
+    return WorkflowGraph(
+        nodes=tuple(GraphNode(key=key, node_type="core.noop", version=1) for key in keys),
+        edges=(
+            GraphEdge(
+                source_key="cond", source_handle="true", target_key="b", target_handle="main"
+            ),
+            GraphEdge(
+                source_key="cond", source_handle="false", target_key="c", target_handle="main"
+            ),
+            GraphEdge(source_key="b", source_handle="main", target_key="join", target_handle="a"),
+            GraphEdge(source_key="c", source_handle="main", target_key="join", target_handle="b"),
+            GraphEdge(
+                source_key="join", source_handle="main", target_key="tail", target_handle="main"
+            ),
+        ),
+    )
+
+
+_BRANCHING = _branching()
+
+# cond --true--> b, cond --false--> c --> d.  `d` hangs off the dead branch only,
+# so pruning has somewhere to propagate to.
+_CHAINED_BRANCH = WorkflowGraph(
+    nodes=tuple(
+        GraphNode(key=key, node_type="core.noop", version=1) for key in ("cond", "b", "c", "d")
+    ),
+    edges=(
+        GraphEdge(source_key="cond", source_handle="true", target_key="b", target_handle="main"),
+        GraphEdge(source_key="cond", source_handle="false", target_key="c", target_handle="main"),
+        GraphEdge(source_key="c", source_handle="main", target_key="d", target_handle="main"),
+    ),
+)
+
 
 _FIXTURES: tuple[tuple[str, RunSnapshot, tuple[SchedulerDecision, ...]], ...] = (
     (
@@ -205,6 +273,88 @@ _FIXTURES: tuple[tuple[str, RunSnapshot, tuple[SchedulerDecision, ...]], ...] = 
             run_status=RunStatus.SUSPENDED,
         ),
         (),
+    ),
+    (
+        # 11. The true branch was taken: its successor starts, and the branch
+        #     that was not taken is pruned. Nothing in the engine knows that
+        #     `cond` is a condition — only that it emitted on `true` and not on
+        #     `false`.
+        "true_branch_taken_prunes_the_other",
+        _snapshot(
+            _BRANCHING,
+            {"cond": SUCCEEDED, "b": PENDING, "c": PENDING, "join": PENDING, "tail": PENDING},
+            run_status=RunStatus.RUNNING,
+            emitted={"cond": ("true",)},
+        ),
+        (SkipNode("c"), StartNode("b")),
+    ),
+    (
+        # 12. The mirror image, from the same graph.
+        "false_branch_taken_prunes_the_other",
+        _snapshot(
+            _BRANCHING,
+            {"cond": SUCCEEDED, "b": PENDING, "c": PENDING, "join": PENDING, "tail": PENDING},
+            run_status=RunStatus.RUNNING,
+            emitted={"cond": ("false",)},
+        ),
+        (SkipNode("b"), StartNode("c")),
+    ),
+    (
+        # 13. A rejoin fed by one live and one dead branch **runs**, on the
+        #     branch that was taken. ADR-028's "stopping at any node already
+        #     satisfied by a live branch": it is not pruned, so it must be
+        #     runnable. A dead edge is settled, not satisfying — which is what
+        #     makes a rejoin work with no join policy to configure.
+        "a_rejoin_runs_on_the_live_branch",
+        _snapshot(
+            _BRANCHING,
+            {"cond": SUCCEEDED, "b": SUCCEEDED, "c": SKIPPED, "join": PENDING, "tail": PENDING},
+            run_status=RunStatus.RUNNING,
+            emitted={"cond": ("true",)},
+        ),
+        (StartNode("join"),),
+    ),
+    (
+        # 14. Transitive: a node reachable only through a pruned branch is
+        #     pruned in turn. No descendant walk — a skipped node emits nothing,
+        #     so the edge leaving it is dead, so the generic rule fires again.
+        "pruning_propagates_down_a_dead_branch",
+        _snapshot(
+            _CHAINED_BRANCH,
+            {"cond": SUCCEEDED, "b": PENDING, "c": SKIPPED, "d": PENDING},
+            run_status=RunStatus.RUNNING,
+            emitted={"cond": ("true",)},
+        ),
+        (SkipNode("d"), StartNode("b")),
+    ),
+    (
+        # 15. A run whose remaining nodes were pruned is finished, not stalled.
+        #     That is the whole reason SKIPPED is terminal.
+        "succeeded_and_skipped_together_complete_the_run",
+        _snapshot(
+            _BRANCHING,
+            {
+                "cond": SUCCEEDED,
+                "b": SUCCEEDED,
+                "c": SKIPPED,
+                "join": SUCCEEDED,
+                "tail": SUCCEEDED,
+            },
+            run_status=RunStatus.RUNNING,
+            emitted={"cond": ("true",)},
+        ),
+        (SetRunStatus(RunStatus.COMPLETED),),
+    ),
+    (
+        # 16. An undecided upstream is neither live nor dead: nothing is pruned
+        #     while the branch could still go either way.
+        "nothing_is_pruned_before_the_branch_resolves",
+        _snapshot(
+            _BRANCHING,
+            {"cond": RUNNING, "b": PENDING, "c": PENDING, "join": PENDING, "tail": PENDING},
+            run_status=RunStatus.RUNNING,
+        ),
+        (RecoverNode("cond"), StartNode("cond")),
     ),
     (
         # 10. A suspended node parks the run rather than finishing it.

@@ -50,13 +50,25 @@ def _snapshot(
     *,
     run_status: RunStatus = RunStatus.RUNNING,
     attempts: dict[str, int] | None = None,
+    emitted: dict[str, tuple[str, ...]] | None = None,
 ) -> RunSnapshot:
+    """A snapshot in which every succeeded node emitted on ``main`` unless
+    ``emitted`` says which handles it produced on instead."""
+
+    handles = emitted or {}
     return RunSnapshot(
         status=run_status,
         graph=graph,
         node_executions={
             key: NodeExecutionSnapshot(
-                node_key=key, status=status, attempt=(attempts or {}).get(key, 1)
+                node_key=key,
+                status=status,
+                attempt=(attempts or {}).get(key, 1),
+                outputs=(
+                    dict.fromkeys(handles.get(key, ("main",)))
+                    if status is NodeExecutionStatus.SUCCEEDED
+                    else None
+                ),
             )
             for key, status in statuses.items()
         },
@@ -313,3 +325,94 @@ def test_a_skip_decision_names_only_the_node() -> None:
 
     assert decision.node_key == "pruned"
     assert decision == SkipNode("pruned")
+
+
+# --- Edge resolution (Phase 7, M2 addendum) ---------------------------------
+#
+# Two inbound edges into one node, one per handle, driven through every
+# combination of live / dead / undecided. This is the whole readiness rule in
+# one table.
+
+_REJOIN = WorkflowGraph(
+    nodes=tuple(
+        GraphNode(key=key, node_type="core.noop", version=1) for key in ("left", "right", "join")
+    ),
+    edges=(
+        GraphEdge(source_key="left", source_handle="main", target_key="join", target_handle="a"),
+        GraphEdge(source_key="right", source_handle="main", target_key="join", target_handle="b"),
+    ),
+)
+
+# How to make one upstream live, dead, or undecided.
+_LIVE = (SUCCEEDED, ("main",))
+_DEAD_SKIPPED = (NodeExecutionStatus.SKIPPED, ())
+_DEAD_SILENT = (SUCCEEDED, ("other",))
+_UNDECIDED = (PENDING, ())
+
+
+def _rejoin(
+    left: tuple[NodeExecutionStatus, tuple[str, ...]],
+    right: tuple[NodeExecutionStatus, tuple[str, ...]],
+) -> RunSnapshot:
+    statuses = {"left": left[0], "right": right[0], "join": PENDING}
+    return _snapshot(
+        _REJOIN,
+        statuses,
+        emitted={"left": left[1], "right": right[1]},
+    )
+
+
+@pytest.mark.parametrize(
+    ("left", "right"),
+    [
+        (_LIVE, _LIVE),
+        (_LIVE, _DEAD_SKIPPED),
+        (_DEAD_SKIPPED, _LIVE),
+        (_LIVE, _DEAD_SILENT),
+        (_DEAD_SILENT, _LIVE),
+    ],
+)
+def test_a_node_runs_when_every_edge_is_resolved_and_one_is_live(
+    left: tuple[NodeExecutionStatus, tuple[str, ...]],
+    right: tuple[NodeExecutionStatus, tuple[str, ...]],
+) -> None:
+    """Including one live and one dead — that shape is a rejoin."""
+
+    assert StartNode("join") in tick(_rejoin(left, right))
+
+
+@pytest.mark.parametrize(
+    ("left", "right"),
+    [
+        (_DEAD_SKIPPED, _DEAD_SKIPPED),
+        (_DEAD_SKIPPED, _DEAD_SILENT),
+        (_DEAD_SILENT, _DEAD_SILENT),
+    ],
+)
+def test_a_node_is_pruned_when_every_edge_is_dead(
+    left: tuple[NodeExecutionStatus, tuple[str, ...]],
+    right: tuple[NodeExecutionStatus, tuple[str, ...]],
+) -> None:
+    assert SkipNode("join") in tick(_rejoin(left, right))
+
+
+@pytest.mark.parametrize(
+    ("left", "right"),
+    [
+        (_UNDECIDED, _LIVE),
+        (_LIVE, _UNDECIDED),
+        (_UNDECIDED, _DEAD_SKIPPED),
+        (_DEAD_SKIPPED, _UNDECIDED),
+        (_UNDECIDED, _UNDECIDED),
+    ],
+)
+def test_an_undecided_edge_leaves_the_node_neither_started_nor_pruned(
+    left: tuple[NodeExecutionStatus, tuple[str, ...]],
+    right: tuple[NodeExecutionStatus, tuple[str, ...]],
+) -> None:
+    """Pruning a branch before its condition has run would be guessing."""
+
+    decisions = tick(_rejoin(left, right))
+
+    assert StartNode("join") not in decisions
+    assert SkipNode("join") not in decisions

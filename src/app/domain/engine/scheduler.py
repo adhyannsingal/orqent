@@ -24,8 +24,11 @@ function is what leaves it a pure function of one snapshot: a loop in here would
 need to know what the invocations it triggered had done, which means reading the
 database.
 
-No control flow, no branch pruning, no loops, no joins, no scopes, no parallel
-dispatch, no queue: Phases 7 and 8.
+Branch pruning arrived in Phase 7 (ADR-028) and is entirely generic: it reads
+which handles produced values, never which node type produced them.
+
+No loops, no scopes, no configurable join policies, no parallel dispatch, no
+queue: still Phases 7-and-later and Phase 8.
 """
 
 from __future__ import annotations
@@ -36,19 +39,20 @@ from app.domain.engine.snapshot import (
     RunSnapshot,
     SchedulerDecision,
     SetRunStatus,
+    SkipNode,
     StartNode,
 )
 from app.domain.engine.state import NodeExecutionStatus, RunStatus
 from app.domain.errors import DomainRuleError
-from app.domain.graph.model import WorkflowGraph
+from app.domain.graph.model import GraphEdge, WorkflowGraph
 
 
 def tick(snapshot: RunSnapshot) -> tuple[SchedulerDecision, ...]:
     """Decide what should happen next to this run.
 
-    Returns decisions in a fixed order — recoveries, then starts in graph
-    declaration order, then the run's status — so a tick is reproducible and a
-    test can assert the sequence rather than a set. The status comes last
+    Returns decisions in a fixed order — recoveries, then prunings, then starts,
+    each in graph declaration order, then the run's status — so a tick is
+    reproducible and a test can assert the sequence rather than a set. The status comes last
     because it is a conclusion about the other decisions: a node recovered and
     restarted in this tick is what makes the run ``RUNNING``.
 
@@ -70,6 +74,12 @@ def tick(snapshot: RunSnapshot) -> tuple[SchedulerDecision, ...]:
     # it to PENDING lets the rest of this same tick pick it up again.
     recovered = _stranded(snapshot)
     decisions.extend(RecoverNode(node_key) for node_key in recovered)
+
+    # Pruned before started, so a node whose branch died is never briefly
+    # considered runnable. Both sets are disjoint by construction: readiness
+    # needs every inbound edge live, pruning needs every one dead, and a node
+    # with no inbound edges has neither.
+    decisions.extend(SkipNode(node_key) for node_key in _prunable(snapshot))
 
     ready = _ready(snapshot, recovered=recovered)
     decisions.extend(StartNode(node_key) for node_key in ready)
@@ -94,8 +104,8 @@ def _stranded(snapshot: RunSnapshot) -> tuple[str, ...]:
 def _ready(snapshot: RunSnapshot, *, recovered: tuple[str, ...]) -> tuple[str, ...]:
     """Node keys that may start now, in graph declaration order.
 
-    A node is ready when it is ``PENDING`` and **every** inbound edge starts at a
-    node that has ``SUCCEEDED``. A node with no inbound edges is therefore ready
+    A node is ready when it is ``PENDING`` and **every** inbound edge is *live*
+    (see :func:`_is_live`). A node with no inbound edges is therefore ready
     immediately — which is how a trigger starts, without the engine knowing what
     a trigger *is* (ADR-014). A graph may legitimately have several such nodes:
     ``core.constant`` declares no inputs, so it sits at in-degree zero beside the
@@ -120,12 +130,103 @@ def _ready(snapshot: RunSnapshot, *, recovered: tuple[str, ...]) -> tuple[str, .
     )
 
 
-def _upstream_satisfied(snapshot: RunSnapshot, node_key: str) -> bool:
-    """Whether every inbound edge of ``node_key`` starts at a succeeded node."""
+def _prunable(snapshot: RunSnapshot) -> tuple[str, ...]:
+    """Node keys that can never run, in graph declaration order.
 
-    return all(
-        _status(snapshot, edge.source_key) is NodeExecutionStatus.SUCCEEDED
-        for edge in snapshot.graph.incoming(node_key)
+    A ``PENDING`` node whose **every** inbound edge is dead: nothing will ever
+    arrive, so waiting for it would stall the run short of a terminal state —
+    the classic failure ADR-028 exists to prevent.
+
+    A node with a mixture of live and dead inbound edges is *not* pruned. That is
+    the "stopping at any node already satisfied by a live branch" rule, and it is
+    what makes a rejoin work: a node fed by two branches, one taken and one not,
+    still runs.
+
+    Nodes with no inbound edges are never pruned — vacuous truth would otherwise
+    prune every trigger, since "all of nothing is dead" is as true as "all of
+    nothing is live".
+
+    Transitive by construction: a skipped node emits nothing, so every edge
+    leaving it is dead, so the next tick prunes onward. No descendant walk, and
+    nothing here knows which node type produced the branch.
+    """
+
+    return tuple(
+        node_key
+        for node_key in snapshot.graph.node_keys
+        if _status(snapshot, node_key) is NodeExecutionStatus.PENDING
+        and snapshot.graph.incoming(node_key)
+        and all(_is_dead(snapshot, edge) for edge in snapshot.graph.incoming(node_key))
+    )
+
+
+def _upstream_satisfied(snapshot: RunSnapshot, node_key: str) -> bool:
+    """Whether this node's inputs have settled in a way that lets it run.
+
+    Every inbound edge must be **resolved** — live or dead, nothing still
+    undecided — and **at least one must be live**, so the node has something to
+    work with.
+
+    Requiring every edge to be *live* would be the obvious rule and is wrong: a
+    node fed by two branches, one taken and one not, could then never run, and
+    a rejoin is exactly that shape. ADR-028 puts it as pruning "stopping at any
+    node already satisfied by a live branch" — the node is not pruned, so it
+    must be runnable. Accepting a dead edge as *settled* rather than *satisfying*
+    is what makes that true, and it needs no join policy to say so.
+
+    A node with no inbound edges is ready, since there is nothing to wait for —
+    the vacuous case is handled by the caller rather than by the ``any`` below,
+    which would otherwise be false for a trigger.
+    """
+
+    edges = snapshot.graph.incoming(node_key)
+    if not edges:
+        return True
+
+    resolved = all(_is_live(snapshot, edge) or _is_dead(snapshot, edge) for edge in edges)
+    return resolved and any(_is_live(snapshot, edge) for edge in edges)
+
+
+def _is_live(snapshot: RunSnapshot, edge: GraphEdge) -> bool:
+    """Whether this edge carried a value.
+
+    Live means the source succeeded **and emitted on the handle this edge leaves
+    from** — not merely that the source succeeded. That distinction is the whole
+    of branching: a node that chooses between two outputs emits on one of them,
+    and ``Completed.outputs`` already documents that "a handle absent from the
+    mapping produced nothing, which is how a conditional output stays silent".
+
+    The engine reads *which handles produced values*, never which node type
+    produced them (ADR-014, ADR-020).
+    """
+
+    execution = snapshot.node_executions.get(edge.source_key)
+    if execution is None or execution.status is not NodeExecutionStatus.SUCCEEDED:
+        return False
+    return execution.outputs is not None and edge.source_handle in execution.outputs
+
+
+def _is_dead(snapshot: RunSnapshot, edge: GraphEdge) -> bool:
+    """Whether this edge will never carry a value.
+
+    Two ways to be certain: the source was skipped, so it never ran at all; or
+    the source succeeded without emitting on this handle, so it ran and chose not
+    to.
+
+    Deliberately **not** the negation of :func:`_is_live`. An edge from a node
+    that is still ``PENDING`` is neither — it is undecided, and treating undecided
+    as dead would prune a branch before its condition had run.
+    """
+
+    execution = snapshot.node_executions.get(edge.source_key)
+    if execution is None:
+        return False
+    if execution.status is NodeExecutionStatus.SKIPPED:
+        return True
+    return (
+        execution.status is NodeExecutionStatus.SUCCEEDED
+        and execution.outputs is not None
+        and edge.source_handle not in execution.outputs
     )
 
 
@@ -138,11 +239,13 @@ def _run_status(snapshot: RunSnapshot, *, starting: tuple[str, ...]) -> RunStatu
     conclusion — suspended before failed before completed, so a run parked on a
     human decision is never reported as finished.
 
-    ``None`` covers the stalled case that Phase 6 leaves open: nothing running,
-    nothing ready, nothing waiting, no failure, yet not everything is terminal.
-    Downstream nodes of a failure sit here — there is no ``SKIPPED`` until branch
-    pruning arrives (ADR-028, Phase 7) — and inventing a terminal state for them
-    would be guessing.
+    ``SKIPPED`` counts as terminal, so a run whose remaining nodes were all
+    pruned completes rather than hanging — that is what the state is for.
+
+    ``None`` covers the stalled case that remains open: nothing running, nothing
+    ready, nothing waiting, no failure, yet not everything is terminal. Nodes
+    downstream of a *failure* sit here, because a failed node is not the same as
+    an untaken branch and inventing a terminal state for them would be guessing.
     """
 
     statuses = [_status(snapshot, node_key) for node_key in snapshot.graph.node_keys]
