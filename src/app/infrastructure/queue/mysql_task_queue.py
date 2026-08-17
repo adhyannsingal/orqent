@@ -21,16 +21,16 @@ owns the work rather than quietly overwriting the worker that does.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta
 
 from sqlalchemy import ColumnElement, CursorResult, select, update
-from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.domain.ports.task_queue import TaskQueue
 from app.domain.value_objects.lease import ClaimedTask, Lease, WorkerId
 from app.infrastructure.db.models.queue_task import QueueTask
 from app.infrastructure.db.models.run import Run
+from app.infrastructure.repositories.queue_task_repository import QueueTaskRepository
 
 QUEUED = "QUEUED"
 LEASED = "LEASED"
@@ -74,24 +74,14 @@ class MySqlTaskQueue(TaskQueue):
         ``run_after`` withholds the task until a moment; ``None`` means now.
         """
 
-        moment = run_after if run_after is not None else datetime.now(UTC)
         async with self._session_factory() as session:
-            session.add(
-                QueueTask(
-                    organization_id=organization_id,
-                    run_id=run_id,
-                    status=QUEUED,
-                    run_after=moment,
-                    attempts=0,
-                )
-            )
-            try:
-                await session.commit()
-            except IntegrityError:
-                # The run already has outstanding work. Two signals would mean
-                # one wasted claim, since a claim advances the run as far as it
-                # can go — so the duplicate is the correct thing to discard.
-                await session.rollback()
+            # Delegated so the insert and its duplicate handling have **one**
+            # spelling. The other caller is a use case enqueuing inside its own
+            # transaction (M4), which is where the atomicity of ADR-015(c)
+            # actually comes from; this path exists so the port stays whole for
+            # a worker that wants to enqueue outside one.
+            await QueueTaskRepository(session).enqueue(run_id, organization_id, run_after=run_after)
+            await session.commit()
 
     async def claim(
         self, worker: WorkerId, *, now: datetime, lease_seconds: int

@@ -235,6 +235,13 @@ class RunService:
                 )
             )
 
+            # The signal that this run has work, in **the same transaction** as
+            # the run itself (ADR-015(c)). Neither order of a two-transaction
+            # version is safe: commit the run first and a crash leaves a run
+            # nothing will ever pick up; commit the task first and a crash
+            # leaves a task pointing at a run that does not exist.
+            await uow.queue_tasks.enqueue(run.id, caller.organization_id)
+
             await uow.commit()
 
             log.info(
@@ -535,6 +542,14 @@ class RunService:
 
             await self._append(uow, run, RunEventType.RUN_RESUMED)
             await self._append(uow, run, RunEventType.NODE_STARTED, payload={"node_key": node_key})
+
+            # Atomic with the un-suspension, for the same reason as creation. A
+            # resumed run with no queue task would be parked forever with
+            # nothing waiting on it — the one failure a suspended run cannot
+            # recover from by itself, since the token that would have restarted
+            # it has already been consumed just above.
+            await uow.queue_tasks.enqueue(run.id, caller.organization_id)
+
             await uow.commit()
 
             run_id, organization_id = run.id, caller.organization_id
@@ -657,6 +672,18 @@ class RunService:
                         run.started_at = _utcnow()
                     if status.is_terminal:
                         run.finished_at = _utcnow()
+
+                    # A run that will not move again on its own must not keep
+                    # claimable work. Suspended is the case Phase 8 cares about
+                    # — a parked run holds no resources (ADR-019), and an
+                    # outstanding task is a resource — but terminal states go
+                    # the same way for the same reason, and leaving them out
+                    # would hand M5's worker a completed run to claim forever.
+                    #
+                    # In this transaction, so the run's status and the queue's
+                    # view of it can never disagree.
+                    if status is RunStatus.SUSPENDED or status.is_terminal:
+                        await uow.queue_tasks.finish_outstanding(run.id, run.organization_id)
 
                     event_type = _RUN_EVENTS[(previous, status)]
                     if event_type is not None:

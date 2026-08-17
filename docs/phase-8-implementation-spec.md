@@ -1,6 +1,6 @@
 # Phase 8 — Queue & Workers: Implementation Specification
 
-**Status:** 🟡 **In progress** — M1, M2, and M3 complete.
+**Status:** 🟡 **In progress** — M1, M2, M3, and M4 complete.
 **Date:** 2026-08-17 · **Branch:** `phase-8`
 **Authority:** `roadmap.md` §2 (Phase 8 row), ADR-015, ADR-016, ADR-019,
 ADR-024, ADR-030. Behaviour as built is described here; the code is the source
@@ -149,14 +149,16 @@ Unchanged from Phase 6: `attempt` semantics, the idempotency key, the
 | **M1** | `TaskQueue` / `LeasePolicy` ports; `WorkerId`, `Lease`, `ClaimedTask` | ✅ |
 | **M2** | `queue_tasks` model + **migration `0006`** | ✅ |
 | **M3** | `MySqlTaskQueue` adapter — `SELECT … FOR UPDATE SKIP LOCKED` claim, release, expiry reclaim, heartbeat | ✅ |
-| **M4** | Enqueue from `RunService` in the same transaction as the state change | ⬜ |
+| **M4** | Enqueue from `RunService` in the same transaction as the state change | ✅ |
 | **M5** | Worker loop and entrypoint | ⬜ |
 | **M6** | Concurrency within a run | ⬜ |
 | **M7** | Acceptance and documentation | ⬜ |
 
-**M3 is the adapter only.** The queue can now be driven, but nothing drives it:
-there is no worker loop, no entrypoint, and no call site that enqueues a run.
-Those are M4 and M5.
+**M4 fills the queue; nothing drains it.** Creating or resuming a run now writes
+a queue task in the same transaction, and a run that suspends or finishes closes
+it. There is still no worker loop and no entrypoint, so execution continues to
+happen through `POST /runs/{id}/advance` exactly as in Phase 7. M5 is what turns
+the queue from a record into a driver.
 
 ## 10. Deferred
 
@@ -229,23 +231,103 @@ make those assertions vacuous.
 The execution guarantee remains **at-least-once**: a worker can claim, do the
 work, and die before releasing, and the lease then lapses for someone else.
 
-## 12. Note for M4
+## 12. The transaction design (M4)
 
-The claim query must treat these as one eligible set, so reclaiming a dead
-worker's task and taking a fresh one are the same operation:
+M3 left `enqueue` committing on its own, which contradicted M1's "called inside
+the caller's transaction" and cost ADR-015(c) its whole point. M4 closes it.
 
-```sql
-(status = 'QUEUED' AND run_after <= NOW(6))
-OR (status = 'LEASED' AND lease_expires_at <= NOW(6))
+### The queue is reached through two objects, because it has two owners
+
+| | Reached through | Transaction |
+|---|---|---|
+| `enqueue`, `finish_outstanding` | `uow.queue_tasks` — `QueueTaskRepository` | **the caller's** |
+| `claim`, `extend`, `release`, `requeue` | `MySqlTaskQueue` (the `TaskQueue` port) | its own, one per call |
+
+This is **not** two implementations of one idea. Enqueuing must commit with the
+state change that justifies it; claiming must commit *immediately* or a second
+worker cannot see the task is taken. Those are opposite requirements, so they
+are opposite objects. The split follows the existing architecture rather than
+adding to it: every other table is written through a session-bound repository on
+the unit of work, and `queue_tasks` is a table.
+
+The insert itself has one spelling — `MySqlTaskQueue.enqueue` delegates to the
+same repository, around a session it opened — so the port stays whole for a
+worker that wants to enqueue outside a transaction.
+
+### `create_run` and `resume_run`
+
+```
+BEGIN                                  BEGIN
+  create run                             node WAITING → RUNNING, token consumed
+  create node executions                 run SUSPENDED → RUNNING
+  append RunStarted                      append RunResumed, NodeStarted
+  enqueue task                           enqueue task
+COMMIT                                 COMMIT
 ```
 
-**`enqueue` currently commits on its own.** M1's port documents it as "called
-inside the caller's transaction", which is what gives ADR-015(c) its
-enqueue-and-state-change atomicity. The M3 adapter opens its own session, so a
-run could commit without its task, or vice versa. **M4 must close this**, either
-by putting a queue-task accessor on the `UnitOfWork` for the enqueue path, or by
-constructing the adapter with the caller's session. Nothing else in Phase 8
-depends on the choice.
+Neither order of a two-transaction version is safe. Commit the run first and a
+crash leaves a run nothing will ever pick up; commit the task first and a crash
+leaves a task pointing at a run that does not exist. Resume is the sharper case:
+the token that would restart the run is consumed in the same transaction, so a
+resume that committed the state change without the task would park the run
+permanently with nothing able to reach it.
 
-Also for M4: a `LeasePolicy` implementation does not exist yet — `claim` takes
-`lease_seconds` directly, so M3 did not need one. The worker loop (M5) will.
+### The duplicate needs a SAVEPOINT
+
+`enqueue` is idempotent per run, and the database is what enforces it —
+`uq_queue_tasks_pending_key` raises `IntegrityError` on a second outstanding
+task. Absorbing that the way the worker-side adapter does, with
+`session.rollback()`, would **discard the caller's run as well**.
+
+`QueueTaskRepository.enqueue` therefore stages the insert inside
+`session.begin_nested()`. The failure unwinds to the savepoint; the surrounding
+unit of work is still usable and commits intact. MySQL's own behaviour is a trap
+here: InnoDB does not abort a transaction on a duplicate key, so a bare
+`try/except` looks like it should work — but SQLAlchemy puts the session in a
+needs-rollback state after a failed flush regardless.
+
+There is no check-then-insert anywhere. A `SELECT` first would be correct only
+until two requests interleaved.
+
+### Suspension and completion close the signal
+
+```
+RUNNING/PENDING run   →  a task may be outstanding
+SUSPENDED run         →  no outstanding task
+COMPLETED/FAILED run  →  no outstanding task
+```
+
+Applied where the scheduler's `SetRunStatus` decision lands, in the same
+transaction as the status itself, so the run and the queue's view of it can
+never disagree. A parked run holds no resources (ADR-019) and a claimable task
+is a resource; leaving one open would also block the *resume* from enqueuing,
+since the run would already have outstanding work.
+
+Terminal states go the same way. The milestone brief named only suspension, but
+the same line covers both and omitting terminal would hand M5's worker a
+finished run to claim forever.
+
+Tasks are marked `DONE`, never deleted — `pending_key` already hides them from
+the uniqueness rule, so a run accumulates its full history.
+
+## 13. Note for M5
+
+- **No `LeasePolicy` implementation exists.** `claim` takes `lease_seconds`
+  directly, so neither M3 nor M4 needed one. The worker loop does.
+- **`Container.task_queue` resolves a `TaskQueue`** and nothing consumes it yet.
+- **Nothing drains the queue.** After M4 a run reliably *has* a task; execution
+  still happens through `POST /runs/{id}/advance`.
+- **⚠️ `finish_outstanding` will close a worker's own leased task.** It matches
+  `QUEUED` *or* `LEASED`, so when a worker claims a task and calls `advance_run`,
+  a run that then suspends or finishes marks that worker's task `DONE` from
+  inside the advance. The worker's subsequent `release` then returns `False` —
+  which the M1 port documents as "your lease was taken away, discard your
+  result". Here that reading is **wrong**: the worker did the work and the work
+  is what closed the task.
+
+  Today the two are indistinguishable because nothing leases anything, so M4
+  deliberately does not choose between the fixes. M5 must, and the options are:
+  have the worker treat a settled run as a successful outcome and not call
+  `release` at all; or narrow `finish_outstanding` to `QUEUED` and let the
+  worker's own `release` close a leased task — at the cost of a suspended run
+  briefly retaining a leased task until the worker releases it.
