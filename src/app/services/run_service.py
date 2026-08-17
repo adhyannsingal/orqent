@@ -26,6 +26,7 @@ forbidden.
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -59,7 +60,7 @@ from app.domain.errors import (
 )
 from app.domain.nodes.descriptor import SideEffect
 from app.domain.nodes.registry import NodeRegistry
-from app.domain.nodes.result import Completed, Failed, Suspended
+from app.domain.nodes.result import Completed, Failed, NodeResult, Suspended
 from app.domain.value_objects.authenticated_user import AuthenticatedUser
 from app.infrastructure.db.identifiers import PUBLIC_ID_LENGTH
 from app.infrastructure.db.models.node_execution import NodeExecution
@@ -112,6 +113,25 @@ def _utcnow() -> datetime:
     """Application-managed "now" (ADR-017), matching the ORM mixins."""
 
     return datetime.now(UTC)
+
+
+@dataclass(frozen=True, slots=True)
+class _RepeatRefused:
+    """This node was **not invoked**, because repeating it would be unsafe.
+
+    Distinct from ``Failed``: the node did not run and produced nothing. It is
+    a value rather than an immediate write so that deciding and recording stay
+    separable — the decision is made where invocation happens, and the record
+    is written where every other outcome is written, in order (M6).
+    """
+
+
+_REFUSED = _RepeatRefused()
+
+# What one node invocation can come back as. `Failed` and `Suspended` are
+# ordinary results, not exceptions — which is why a sibling failing needs no
+# special handling when a batch runs concurrently.
+_Outcome = NodeResult | _RepeatRefused
 
 
 @dataclass(frozen=True, slots=True)
@@ -342,16 +362,58 @@ class RunService:
                 node_ids = {key: executions[key].workflow_node_id for key in started}
                 attempts = {key: executions[key].attempt for key in started}
 
-            for node_key in started:
-                await self._execute(
-                    run_public_id,
-                    snapshot,
-                    node_key,
-                    run_id=run_id,
-                    organization_id=organization_id,
-                    workflow_node_id=node_ids[node_key],
-                    attempt=attempts[node_key],
-                )
+            # --- Invocation: concurrent. Nothing here touches the database ---
+            #
+            # Everything the scheduler just started is independent *by
+            # construction*: a node whose dependency has not finished has an
+            # unresolved inbound edge and is not in `started` at all. So the
+            # batch can run together without the engine needing any new opinion
+            # about what depends on what (Phase 8, M6).
+            #
+            # `return_exceptions=True` for two reasons. It stops one sibling's
+            # exception discarding results the others already produced — and,
+            # less obviously, plain `gather` leaves the remaining children
+            # *running* after it propagates, which is precisely the orphaned
+            # task this must not create. A node's own bug is not an exception
+            # here anyway: `invoke` records it as `Failed`.
+            outcomes = await asyncio.gather(
+                *(
+                    self._invoke(
+                        snapshot,
+                        node_key,
+                        run_id=run_id,
+                        organization_id=organization_id,
+                        workflow_node_id=node_ids[node_key],
+                        attempt=attempts[node_key],
+                    )
+                    for node_key in started
+                ),
+                return_exceptions=True,
+            )
+
+            # --- Persistence: serialized, in the scheduler's order ---
+            #
+            # **Ready-order, never completion-order.** Two things demand it.
+            # `run_events.seq` is allocated as `MAX(seq) + 1`, so concurrent
+            # appends would race and collide on `uq_run_events_run_id_seq`; and
+            # a timeline ordered by whichever node happened to finish first
+            # would not be reproducible. Each result still gets its own short
+            # transaction, so no two of these ever share a session.
+            failure: BaseException | None = None
+            for node_key, outcome in zip(started, outcomes, strict=True):
+                if isinstance(outcome, BaseException):
+                    # Not this node's own failure — that would have been a
+                    # `Failed` result. Something stopped the invocation from
+                    # happening at all, so the node stays RUNNING and ordinary
+                    # recovery re-attempts it (ADR-024). Its siblings' results
+                    # are still written first; losing them would be inventing a
+                    # failure mode concurrency does not have.
+                    failure = failure or outcome
+                    continue
+                await self._settle(run_public_id, organization_id, node_key, outcome)
+
+            if failure is not None:
+                raise failure
 
     async def _execute(
         self,
@@ -376,11 +438,48 @@ class RunService:
         ``RUNNING`` in durable storage, so the next call recovers and re-attempts
         it — the at-least-once duplicate ADR-024 describes, rather than a
         silently lost node.
+
+        One node at a time. ``_advance`` invokes a whole ready batch together
+        (M6) and settles the outcomes itself; this remains the path a *resume*
+        takes, where there is exactly one node by definition.
+        """
+
+        outcome = await self._invoke(
+            snapshot,
+            node_key,
+            run_id=run_id,
+            organization_id=organization_id,
+            workflow_node_id=workflow_node_id,
+            attempt=attempt,
+            resume_token=resume_token,
+        )
+        await self._settle(run_public_id, organization_id, node_key, outcome)
+
+    async def _invoke(
+        self,
+        snapshot: RunSnapshot,
+        node_key: str,
+        *,
+        run_id: int,
+        organization_id: int,
+        workflow_node_id: int,
+        attempt: int,
+        resume_token: str | None = None,
+    ) -> _Outcome:
+        """Run one node and report what it did. **Touches no database.**
+
+        That is what makes a batch of these safe to run concurrently: there is
+        no session to share, no transaction to hold open across work of unknown
+        duration, and nothing here that two nodes could contend over. The
+        snapshot it reads is immutable and the registry is read-only.
+
+        ``organization_id`` is unused today and taken anyway, so that the
+        signature says what a node invocation is scoped to rather than leaving
+        the tenant implicit in whoever happened to call it.
         """
 
         if self._repeat_would_be_unsafe(snapshot, node_key, attempt):
-            await self._refuse_repeat(run_public_id, organization_id, node_key)
-            return
+            return _REFUSED
 
         context = build_context(
             snapshot,
@@ -391,8 +490,26 @@ class RunService:
             attempt=attempt,
             resume_token=resume_token,
         )
-        result = await invoke(snapshot, self._node_registry, node_key, context)
+        return await invoke(snapshot, self._node_registry, node_key, context)
 
+    async def _settle(
+        self,
+        run_public_id: str,
+        organization_id: int,
+        node_key: str,
+        outcome: _Outcome,
+    ) -> None:
+        """Record what one node did, in a transaction of its own.
+
+        Called **serially**, even when the invocations that produced these
+        outcomes ran together: see the ordering note in ``_advance``.
+        """
+
+        if isinstance(outcome, _RepeatRefused):
+            await self._refuse_repeat(run_public_id, organization_id, node_key)
+            return
+
+        result = outcome
         async with self._unit_of_work_factory() as uow:
             run = await self._run(uow, organization_id, run_public_id)
             _, executions = await self._snapshot(uow, run, organization_id)

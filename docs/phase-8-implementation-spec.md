@@ -1,6 +1,6 @@
 # Phase 8 — Queue & Workers: Implementation Specification
 
-**Status:** 🟡 **In progress** — M1–M5 complete. M6 and M7 untouched.
+**Status:** 🟡 **In progress** — M1–M6 complete. M7 untouched.
 **Date:** 2026-08-17 · **Branch:** `phase-8`
 **Authority:** `roadmap.md` §2 (Phase 8 row), ADR-015, ADR-016, ADR-019,
 ADR-024, ADR-030. Behaviour as built is described here; the code is the source
@@ -151,14 +151,14 @@ Unchanged from Phase 6: `attempt` semantics, the idempotency key, the
 | **M3** | `MySqlTaskQueue` adapter — `SELECT … FOR UPDATE SKIP LOCKED` claim, release, expiry reclaim, heartbeat | ✅ |
 | **M4** | Enqueue from `RunService` in the same transaction as the state change | ✅ |
 | **M5** | Worker loop and entrypoint | ✅ |
-| **M6** | Concurrency within a run | ⬜ |
+| **M6** | Concurrency within a run | ✅ |
 | **M7** | Acceptance and documentation | ⬜ |
 
 **M5 drains it.** A worker process now claims queued runs and advances them, so
 a run finishes with nobody calling `POST /runs/{id}/advance`. That route still
 works and is unchanged — it is simply no longer required.
 
-Still open: concurrency *within* a run (M6) and acceptance (M7).
+Still open: acceptance and final documentation (M7).
 
 ## 10. Deferred
 
@@ -332,7 +332,7 @@ python -m app.infrastructure.worker
 
 The worker holds **one task at a time**. Concurrency in Phase 8 comes from
 running more workers, which is exactly what `SKIP LOCKED` makes safe. Running a
-single run's independently-ready nodes concurrently is M6.
+single run's independently-ready nodes concurrently is M6, and is now done (§14).
 
 There is no SQL in the worker and no node-type knowledge; it speaks only to the
 `TaskQueue` port and `RunService` (ADR-014).
@@ -443,16 +443,100 @@ two workers never claiming one task, a stale worker unable to finish another's
 lease, Phase 7 branching through the worker, and shutdown leaving queued work
 untouched.
 
-## 14. Note for M6
+## 14. Concurrency within a run (M6)
 
-- **M6 is concurrency *within* a run** — running independently-ready nodes
-  together. Worker-level concurrency across runs already exists and is just
-  "start more processes".
-- **One task per run is what makes this safe.** Exactly one worker is ever inside
-  a run (§2), so M6 parallelises inside a lease and does not have to revisit the
-  scheduler's crash-recovery rule.
-- **`advance_run` invokes started nodes sequentially** in `_advance`'s final
-  loop. That loop is M6's target; everything above it already commits the
-  scheduling decision before any node runs, and must keep doing so.
-- Still deferred and out of scope: fairness, quotas, priority, retry/backoff,
-  node timeouts (§10).
+Independently-ready nodes of one run now execute **together**.
+
+```
+tick ─▶ apply + commit ─▶ invoke the batch concurrently ─▶ settle in order ─▶ tick
+```
+
+### The boundary
+
+Exactly one line changed shape: the loop in `_advance` that used to `await` each
+ready node in turn. `_execute` was split into the two halves it always had —
+
+| | Concurrency | Database |
+|---|---|---|
+| `_invoke` | **concurrent**, one task per ready node | none at all |
+| `_settle` | **serialized**, scheduler order | one short transaction each |
+
+`_execute` remains as the composition of the two, and is still what `resume_run`
+calls — a resume has exactly one node by definition, so that path is untouched.
+
+**The scheduler did not change.** It already emitted the right batch: a node
+whose dependency has not finished has an unresolved inbound edge and never
+appears in `_ready`. Independence is a property of the readiness rule, not a new
+opinion the engine had to acquire — which is why M6 needed no scheduler edit and
+no node-type knowledge.
+
+### Why persistence stays serialized
+
+Two independent reasons, either sufficient:
+
+- `run_events.seq` is allocated as `MAX(seq) + 1`. Concurrent appends would race
+  and collide on `uq_run_events_run_id_seq`.
+- A timeline ordered by whichever node happened to finish first is not
+  reproducible.
+
+**Ordering rule: results are persisted in the scheduler's ready-order — graph
+declaration order — never completion order.** Two runs of the same graph
+therefore produce the same timeline whatever the wall clock did.
+
+### Transactions
+
+Unchanged from Phase 6. No transaction is open while a node runs; the tick and
+its decisions commit before anything is invoked; each result is written in its
+own short transaction. Because `_settle` calls are sequential, **no two
+concurrent tasks ever share an `AsyncSession`** — the invoking half owns no
+session to share in the first place.
+
+### Failure, suspension, cancellation
+
+A node's own bug is not an exception here: `invoke` catches `Exception` and
+returns `Failed`, and `Suspended` is likewise an ordinary result. So a sibling
+failing or parking needs **no concurrency-specific handling** — it is just
+another outcome to record, through the existing Phase 6 semantics.
+
+`gather(..., return_exceptions=True)` covers the genuinely exceptional case (an
+invocation that could not happen at all). It is not only about not discarding
+siblings' results: plain `gather` propagates the first exception while leaving
+the other children **running**, which is exactly the orphaned task M6 must not
+create. The offending node stays `RUNNING` and ordinary recovery re-attempts it;
+its siblings' results are written first, and the exception is re-raised
+afterwards in scheduler order.
+
+`invoke` deliberately does not catch `BaseException`, so cancellation still
+propagates: cancelling the worker cancels the `gather`, which cancels its
+children. M5's shutdown behaviour is unchanged and needed no edit.
+
+### Phase 7 is untouched
+
+`SkipNode` decisions are applied in the prologue and never enter the batch, so
+skipped nodes are still never invoked, still emit nothing, and pruning is still
+transitive. Proven directly rather than assumed — a pruned branch is asserted
+absent from the invocation record.
+
+### Proving overlap
+
+An "A succeeded, B succeeded" assertion is worthless here: a sequential engine
+passes it. The tests use a **barrier** — each node announces arrival and waits
+for its siblings, so it *cannot finish alone*. Concurrent, they meet in
+milliseconds; sequential, the first waits out its timeout and returns `Failed`,
+failing the run. A sequential implementation therefore fails deterministically
+rather than hanging.
+
+Verified by reverting `_advance` to the M5 code: **4 of the 9 tests fail**,
+including both barrier tests. The two negative tests — dependent nodes must not
+overlap, a pruned node must not be invoked — correctly pass either way, since
+they assert the *absence* of overlap.
+
+`tests/integration/test_concurrency.py`, 9 tests against real MySQL.
+
+## 15. Note for M7
+
+- M6 deferred nothing from its own scope. Still out of scope Phase-wide:
+  fairness, quotas, priority, retry/backoff, and node timeouts (§10).
+- **Concurrency is unbounded within a batch.** Every ready node is invoked at
+  once. Correct, and deliberately un-tuned — a per-run ceiling belongs with the
+  quota work of ADR-030, not here.
