@@ -5,11 +5,14 @@ Project:        Orqent — Visual Workflow Automation Platform (backend)
 Version:        0.1.0
 Current Phase:  Phase 6 — Durable Execution Core ✅ COMPLETE (M1–M9)
 Last Updated:   2026-08-16  ·  `main` @ 5709655, working tree clean
-Status:         Healthy — Phases 1–6 complete, migrations 0001–0005 applied.
+Status:         Healthy — Phases 1–8 complete, migrations 0001–0006 applied.
                 A workflow can be published, run, inspected, suspended, and
-                resumed entirely over HTTP. 1575 tests (1318 default + 257
-                integration), 0 failures, 0 skips; ruff/mypy/architecture green.
-Next Milestone: Phase 7 — Control flow (Condition, Merge, Loop scopes) — NOT STARTED
+                resumed over HTTP — and now runs **self-driving**: a worker
+                process claims queued runs and advances them, so nothing has to
+                call `POST /runs/{id}/advance`. 1877 tests (1526 default + 351
+                integration), 0 failures, 0 skips; ruff/mypy/alembic/
+                architecture green.
+Next Milestone: Phase 9 — Triggers (manual → webhook → schedule) — NOT STARTED
 ```
 
 > **Phase renumbering (2026-08-10).** Phase 5 is the **Workflow Authoring API**;
@@ -789,13 +792,18 @@ execution engine (Phase 6) is tested against a **mock `AgentRunner`**.
 - [x] **Phase 6 — Durable execution core** ✅ (M1–M9, migration `0005`) ·
   scheduler, invocation, crash recovery, suspension/resume, event timeline, and
   the Runs API · see §11 and [execution-engine.md](execution-engine.md)
-- [ ] **Phase 7 — Control flow** 🟢 *next* · *Objective:* Condition, Merge, Loop scopes
-  (`for_each`/`while`), structural parallelism, branch pruning, join policies
-  (ADR-018, ADR-028). *Depends on:* 6. *Complexity:* **High**.
-- [ ] **Phase 8 — Queue & workers** · *Objective:* per-node dispatch, DB-backed
-  queue with `SKIP LOCKED`, reaper, concurrency limits, per-org fairness
-  (ADR-015, ADR-030). *Depends on:* 6. *Complexity:* **High**.
-- [ ] **Phase 9 — Triggers** · *Objective:* manual → webhook → schedule;
+- [x] **Phase 7 — Control flow** ✅ · Condition, Merge, branch pruning, join
+  policies, `SKIPPED` (ADR-018, ADR-028). Loop scopes remain deferred.
+- [x] **Phase 8 — Queue & workers** ✅ · DB-backed queue with
+  `SKIP LOCKED`, leases and heartbeats, a self-driving worker process, and
+  concurrent invocation of independently-ready nodes within a run (ADR-015,
+  ADR-024) · see [phase-8-implementation-spec.md](phase-8-implementation-spec.md).
+  **As built it differs from this line's original wording:** the unit of dispatch
+  is the **run**, not the node — an approved deviation from ADR-015(a), recorded
+  in §2 of the spec — and there is **no reaper**, because reclaiming a lapsed
+  lease is what an ordinary claim already does. Concurrency limits and per-org
+  fairness (ADR-030) stay deferred.
+- [ ] **Phase 9 — Triggers** 🟢 *next* · *Objective:* manual → webhook → schedule;
   registration lifecycle tied to publish. *Depends on:* 6. *Complexity:*
   **Medium**.
 - [ ] **Phase 10 — Human-in-the-loop** · *Objective:* approval node, inbox API,

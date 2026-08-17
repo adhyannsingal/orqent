@@ -29,6 +29,7 @@ from app.domain.value_objects.token import IssuedToken, TokenClaims, TokenType
 from app.infrastructure.db.identifiers import new_public_id
 from app.infrastructure.db.models.node_execution import NodeExecution
 from app.infrastructure.db.models.organization import Organization
+from app.infrastructure.db.models.queue_task import QueueTask
 from app.infrastructure.db.models.refresh_token import RefreshToken
 from app.infrastructure.db.models.role import Role
 from app.infrastructure.db.models.run import Run
@@ -70,6 +71,7 @@ class FakeDatabase:
     runs: list[Run] = field(default_factory=list)
     node_executions: list[NodeExecution] = field(default_factory=list)
     run_events: list[RunEvent] = field(default_factory=list)
+    queue_tasks: list[QueueTask] = field(default_factory=list)
 
     pending_organizations: list[Organization] = field(default_factory=list)
     pending_users: list[User] = field(default_factory=list)
@@ -80,6 +82,7 @@ class FakeDatabase:
     pending_runs: list[Run] = field(default_factory=list)
     pending_node_executions: list[NodeExecution] = field(default_factory=list)
     pending_run_events: list[RunEvent] = field(default_factory=list)
+    pending_queue_tasks: list[QueueTask] = field(default_factory=list)
 
     _next_id: int = 1
 
@@ -126,6 +129,10 @@ class FakeDatabase:
     def visible_run_events(self) -> list[RunEvent]:
         return [*self.run_events, *self.pending_run_events]
 
+    @property
+    def visible_queue_tasks(self) -> list[QueueTask]:
+        return [*self.queue_tasks, *self.pending_queue_tasks]
+
     def commit(self) -> None:
         self.organizations.extend(self.pending_organizations)
         self.users.extend(self.pending_users)
@@ -136,6 +143,7 @@ class FakeDatabase:
         self.runs.extend(self.pending_runs)
         self.node_executions.extend(self.pending_node_executions)
         self.run_events.extend(self.pending_run_events)
+        self.queue_tasks.extend(self.pending_queue_tasks)
         self.clear_pending()
 
     def rollback(self) -> None:
@@ -151,6 +159,7 @@ class FakeDatabase:
         self.pending_runs.clear()
         self.pending_node_executions.clear()
         self.pending_run_events.clear()
+        self.pending_queue_tasks.clear()
 
 
 # --- Repositories -----------------------------------------------------------
@@ -570,6 +579,52 @@ class FakeRunEventRepository:
         return max(seqs, default=0) + 1
 
 
+class FakeQueueTaskRepository:
+    """Queue writes that share the caller's transaction.
+
+    Models the *effect* of ``uq_queue_tasks_pending_key`` — at most one
+    outstanding task per run — rather than the constraint. The constraint's real
+    value is that it holds when two requests interleave, which a single-threaded
+    double cannot demonstrate either way; that is proven against MySQL in
+    ``tests/integration/test_run_queue_integration.py``. What this double is for
+    is letting the service's *decisions* be tested without a database: whether it
+    enqueues at all, and whether it closes the signal when a run stops.
+    """
+
+    def __init__(self, db: FakeDatabase) -> None:
+        self._db = db
+
+    def _outstanding(self, run_id: int) -> list[QueueTask]:
+        return [
+            task
+            for task in self._db.visible_queue_tasks
+            if task.run_id == run_id and task.status in ("QUEUED", "LEASED")
+        ]
+
+    async def enqueue(
+        self, run_id: int, organization_id: int, *, run_after: datetime | None = None
+    ) -> None:
+        if self._outstanding(run_id):
+            return
+        task = QueueTask(
+            organization_id=organization_id,
+            run_id=run_id,
+            status="QUEUED",
+            run_after=run_after or datetime.now(UTC),
+            attempts=0,
+        )
+        task.id = self._db.next_id()
+        self._db.pending_queue_tasks.append(task)
+
+    async def finish_outstanding(self, run_id: int, organization_id: int) -> int:
+        found = [
+            task for task in self._outstanding(run_id) if task.organization_id == organization_id
+        ]
+        for task in found:
+            task.status = "DONE"
+        return len(found)
+
+
 class FakeUnitOfWork:
     """Mirrors ``SqlAlchemyUnitOfWork``: exit rolls back what was not committed."""
 
@@ -592,6 +647,7 @@ class FakeUnitOfWork:
         self.runs = run_repository or FakeRunRepository(db)
         self.node_executions = node_execution_repository or FakeNodeExecutionRepository(db)
         self.run_events = run_event_repository or FakeRunEventRepository(db)
+        self.queue_tasks = FakeQueueTaskRepository(db)
         self.commit_calls = 0
         self.rollback_calls = 0
         self.entered = 0

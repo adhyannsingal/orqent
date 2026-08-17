@@ -26,6 +26,7 @@ forbidden.
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -59,7 +60,7 @@ from app.domain.errors import (
 )
 from app.domain.nodes.descriptor import SideEffect
 from app.domain.nodes.registry import NodeRegistry
-from app.domain.nodes.result import Completed, Failed, Suspended
+from app.domain.nodes.result import Completed, Failed, NodeResult, Suspended
 from app.domain.value_objects.authenticated_user import AuthenticatedUser
 from app.infrastructure.db.identifiers import PUBLIC_ID_LENGTH
 from app.infrastructure.db.models.node_execution import NodeExecution
@@ -112,6 +113,25 @@ def _utcnow() -> datetime:
     """Application-managed "now" (ADR-017), matching the ORM mixins."""
 
     return datetime.now(UTC)
+
+
+@dataclass(frozen=True, slots=True)
+class _RepeatRefused:
+    """This node was **not invoked**, because repeating it would be unsafe.
+
+    Distinct from ``Failed``: the node did not run and produced nothing. It is
+    a value rather than an immediate write so that deciding and recording stay
+    separable — the decision is made where invocation happens, and the record
+    is written where every other outcome is written, in order (M6).
+    """
+
+
+_REFUSED = _RepeatRefused()
+
+# What one node invocation can come back as. `Failed` and `Suspended` are
+# ordinary results, not exceptions — which is why a sibling failing needs no
+# special handling when a batch runs concurrently.
+_Outcome = NodeResult | _RepeatRefused
 
 
 @dataclass(frozen=True, slots=True)
@@ -235,6 +255,13 @@ class RunService:
                 )
             )
 
+            # The signal that this run has work, in **the same transaction** as
+            # the run itself (ADR-015(c)). Neither order of a two-transaction
+            # version is safe: commit the run first and a crash leaves a run
+            # nothing will ever pick up; commit the task first and a crash
+            # leaves a task pointing at a run that does not exist.
+            await uow.queue_tasks.enqueue(run.id, caller.organization_id)
+
             await uow.commit()
 
             log.info(
@@ -247,6 +274,30 @@ class RunService:
             return run
 
     async def advance_run(self, current_user: AuthenticatedUser, run_public_id: str) -> Run:
+        """Advance a run on behalf of an authenticated member of its tenant."""
+
+        async with self._unit_of_work_factory() as uow:
+            caller = await self._caller(uow, current_user)
+            organization_id = caller.organization_id
+        return await self._advance(run_public_id, organization_id)
+
+    async def advance_claimed_run(self, run_public_id: str, organization_id: int) -> Run:
+        """Advance a run a worker has claimed from the queue (Phase 8, M5).
+
+        **No caller, deliberately.** A worker is not a user: it holds a lease on
+        a queue task, and that task already names the tenant. Authorization
+        happened when a member of that organization created or resumed the run;
+        re-deriving it from an identity the worker does not have would mean
+        inventing one, which is a worse answer than admitting there is none.
+
+        Tenancy is *not* relaxed. ``organization_id`` comes from the claimed
+        task and scopes every read exactly as a caller's would, so a worker
+        cannot reach a run outside the tenant that queued it.
+        """
+
+        return await self._advance(run_public_id, organization_id)
+
+    async def _advance(self, run_public_id: str, organization_id: int) -> Run:
         """Drive this run forward until it can go no further.
 
         Alternates scheduling and execution: a tick decides what should start,
@@ -274,15 +325,22 @@ class RunService:
 
         while True:
             async with self._unit_of_work_factory() as uow:
-                caller = await self._caller(uow, current_user)
-                run = await self._run(uow, caller, run_public_id)
-                snapshot, executions = await self._snapshot(uow, run, caller.organization_id)
+                run = await self._run(uow, organization_id, run_public_id)
+                snapshot, executions = await self._snapshot(uow, run, organization_id)
 
                 if limit is None:
                     limit = len(snapshot.graph) + 1
 
                 decisions = tick(snapshot)
                 if not decisions:
+                    # Ended without deciding anything, so this transaction only
+                    # ever read. Close it the way every other read closes: the
+                    # unit of work rolls back on the way out, which **expires
+                    # every loaded attribute**, and the caller would be handed a
+                    # run it cannot read a single field from. The worker reads
+                    # `status` off exactly this object to decide how its task
+                    # settled (Phase 8, M5).
+                    await self._close_read(uow)
                     return run
 
                 cycles += 1
@@ -300,25 +358,65 @@ class RunService:
                 started = [
                     decision.node_key for decision in decisions if isinstance(decision, StartNode)
                 ]
-                run_id, organization_id = run.id, caller.organization_id
+                run_id = run.id
                 node_ids = {key: executions[key].workflow_node_id for key in started}
                 attempts = {key: executions[key].attempt for key in started}
 
-            for node_key in started:
-                await self._execute(
-                    current_user,
-                    run_public_id,
-                    snapshot,
-                    node_key,
-                    run_id=run_id,
-                    organization_id=organization_id,
-                    workflow_node_id=node_ids[node_key],
-                    attempt=attempts[node_key],
-                )
+            # --- Invocation: concurrent. Nothing here touches the database ---
+            #
+            # Everything the scheduler just started is independent *by
+            # construction*: a node whose dependency has not finished has an
+            # unresolved inbound edge and is not in `started` at all. So the
+            # batch can run together without the engine needing any new opinion
+            # about what depends on what (Phase 8, M6).
+            #
+            # `return_exceptions=True` for two reasons. It stops one sibling's
+            # exception discarding results the others already produced — and,
+            # less obviously, plain `gather` leaves the remaining children
+            # *running* after it propagates, which is precisely the orphaned
+            # task this must not create. A node's own bug is not an exception
+            # here anyway: `invoke` records it as `Failed`.
+            outcomes = await asyncio.gather(
+                *(
+                    self._invoke(
+                        snapshot,
+                        node_key,
+                        run_id=run_id,
+                        organization_id=organization_id,
+                        workflow_node_id=node_ids[node_key],
+                        attempt=attempts[node_key],
+                    )
+                    for node_key in started
+                ),
+                return_exceptions=True,
+            )
+
+            # --- Persistence: serialized, in the scheduler's order ---
+            #
+            # **Ready-order, never completion-order.** Two things demand it.
+            # `run_events.seq` is allocated as `MAX(seq) + 1`, so concurrent
+            # appends would race and collide on `uq_run_events_run_id_seq`; and
+            # a timeline ordered by whichever node happened to finish first
+            # would not be reproducible. Each result still gets its own short
+            # transaction, so no two of these ever share a session.
+            failure: BaseException | None = None
+            for node_key, outcome in zip(started, outcomes, strict=True):
+                if isinstance(outcome, BaseException):
+                    # Not this node's own failure — that would have been a
+                    # `Failed` result. Something stopped the invocation from
+                    # happening at all, so the node stays RUNNING and ordinary
+                    # recovery re-attempts it (ADR-024). Its siblings' results
+                    # are still written first; losing them would be inventing a
+                    # failure mode concurrency does not have.
+                    failure = failure or outcome
+                    continue
+                await self._settle(run_public_id, organization_id, node_key, outcome)
+
+            if failure is not None:
+                raise failure
 
     async def _execute(
         self,
-        current_user: AuthenticatedUser,
         run_public_id: str,
         snapshot: RunSnapshot,
         node_key: str,
@@ -340,11 +438,48 @@ class RunService:
         ``RUNNING`` in durable storage, so the next call recovers and re-attempts
         it — the at-least-once duplicate ADR-024 describes, rather than a
         silently lost node.
+
+        One node at a time. ``_advance`` invokes a whole ready batch together
+        (M6) and settles the outcomes itself; this remains the path a *resume*
+        takes, where there is exactly one node by definition.
+        """
+
+        outcome = await self._invoke(
+            snapshot,
+            node_key,
+            run_id=run_id,
+            organization_id=organization_id,
+            workflow_node_id=workflow_node_id,
+            attempt=attempt,
+            resume_token=resume_token,
+        )
+        await self._settle(run_public_id, organization_id, node_key, outcome)
+
+    async def _invoke(
+        self,
+        snapshot: RunSnapshot,
+        node_key: str,
+        *,
+        run_id: int,
+        organization_id: int,
+        workflow_node_id: int,
+        attempt: int,
+        resume_token: str | None = None,
+    ) -> _Outcome:
+        """Run one node and report what it did. **Touches no database.**
+
+        That is what makes a batch of these safe to run concurrently: there is
+        no session to share, no transaction to hold open across work of unknown
+        duration, and nothing here that two nodes could contend over. The
+        snapshot it reads is immutable and the registry is read-only.
+
+        ``organization_id`` is unused today and taken anyway, so that the
+        signature says what a node invocation is scoped to rather than leaving
+        the tenant implicit in whoever happened to call it.
         """
 
         if self._repeat_would_be_unsafe(snapshot, node_key, attempt):
-            await self._refuse_repeat(current_user, run_public_id, organization_id, node_key)
-            return
+            return _REFUSED
 
         context = build_context(
             snapshot,
@@ -355,11 +490,28 @@ class RunService:
             attempt=attempt,
             resume_token=resume_token,
         )
-        result = await invoke(snapshot, self._node_registry, node_key, context)
+        return await invoke(snapshot, self._node_registry, node_key, context)
 
+    async def _settle(
+        self,
+        run_public_id: str,
+        organization_id: int,
+        node_key: str,
+        outcome: _Outcome,
+    ) -> None:
+        """Record what one node did, in a transaction of its own.
+
+        Called **serially**, even when the invocations that produced these
+        outcomes ran together: see the ordering note in ``_advance``.
+        """
+
+        if isinstance(outcome, _RepeatRefused):
+            await self._refuse_repeat(run_public_id, organization_id, node_key)
+            return
+
+        result = outcome
         async with self._unit_of_work_factory() as uow:
-            caller = await self._caller(uow, current_user)
-            run = await self._run(uow, caller, run_public_id)
+            run = await self._run(uow, organization_id, run_public_id)
             _, executions = await self._snapshot(uow, run, organization_id)
             execution = executions[node_key]
 
@@ -448,7 +600,6 @@ class RunService:
 
     async def _refuse_repeat(
         self,
-        current_user: AuthenticatedUser,
         run_public_id: str,
         organization_id: int,
         node_key: str,
@@ -456,8 +607,7 @@ class RunService:
         """Fail a node that must not be repeated, without invoking it."""
 
         async with self._unit_of_work_factory() as uow:
-            caller = await self._caller(uow, current_user)
-            run = await self._run(uow, caller, run_public_id)
+            run = await self._run(uow, organization_id, run_public_id)
             _, executions = await self._snapshot(uow, run, organization_id)
             execution = executions[node_key]
 
@@ -502,7 +652,7 @@ class RunService:
 
         async with self._unit_of_work_factory() as uow:
             caller = await self._caller(uow, current_user)
-            run = await self._run(uow, caller, run_public_id)
+            run = await self._run(uow, caller.organization_id, run_public_id)
 
             execution = await uow.node_executions.get_by_resume_token(
                 resume_token, caller.organization_id
@@ -535,6 +685,14 @@ class RunService:
 
             await self._append(uow, run, RunEventType.RUN_RESUMED)
             await self._append(uow, run, RunEventType.NODE_STARTED, payload={"node_key": node_key})
+
+            # Atomic with the un-suspension, for the same reason as creation. A
+            # resumed run with no queue task would be parked forever with
+            # nothing waiting on it — the one failure a suspended run cannot
+            # recover from by itself, since the token that would have restarted
+            # it has already been consumed just above.
+            await uow.queue_tasks.enqueue(run.id, caller.organization_id)
+
             await uow.commit()
 
             run_id, organization_id = run.id, caller.organization_id
@@ -542,7 +700,6 @@ class RunService:
 
         # Outside the transaction, exactly as advance_run invokes.
         await self._execute(
-            current_user,
             run_public_id,
             snapshot,
             node_key,
@@ -556,7 +713,9 @@ class RunService:
         # The graph is re-evaluated as a whole rather than the resumed node being
         # nudged along by hand: whatever the completed node unlocked is the
         # scheduler's decision, not this method's.
-        return await self.advance_run(current_user, run_public_id)
+        # The caller was already resolved above; re-resolving would be a second
+        # authentication decision inside one use case.
+        return await self._advance(run_public_id, organization_id)
 
     async def _snapshot(
         self, uow: SqlAlchemyUnitOfWork, run: Run, organization_id: int
@@ -598,10 +757,15 @@ class RunService:
         )
         return snapshot, execution_by_key
 
-    async def _run(self, uow: SqlAlchemyUnitOfWork, caller: User, public_id: str) -> Run:
-        """Load a run the caller's organization owns, or raise."""
+    async def _run(self, uow: SqlAlchemyUnitOfWork, organization_id: int, public_id: str) -> Run:
+        """Load a run this organization owns, or raise.
 
-        run = await uow.runs.get_by_public_id(public_id, caller.organization_id)
+        Takes the organization rather than the caller because not every path
+        here has a caller: a worker advancing a claimed task acts on behalf of
+        the tenant the queue task names, with no user involved (Phase 8, M5).
+        """
+
+        run = await uow.runs.get_by_public_id(public_id, organization_id)
         if run is None:
             raise NotFoundError("This run does not exist.")
         return run
@@ -657,6 +821,18 @@ class RunService:
                         run.started_at = _utcnow()
                     if status.is_terminal:
                         run.finished_at = _utcnow()
+
+                    # A run that will not move again on its own must not keep
+                    # claimable work. Suspended is the case Phase 8 cares about
+                    # — a parked run holds no resources (ADR-019), and an
+                    # outstanding task is a resource — but terminal states go
+                    # the same way for the same reason, and leaving them out
+                    # would hand M5's worker a completed run to claim forever.
+                    #
+                    # In this transaction, so the run's status and the queue's
+                    # view of it can never disagree.
+                    if status is RunStatus.SUSPENDED or status.is_terminal:
+                        await uow.queue_tasks.finish_outstanding(run.id, run.organization_id)
 
                     event_type = _RUN_EVENTS[(previous, status)]
                     if event_type is not None:
@@ -729,7 +905,7 @@ class RunService:
 
         async with self._unit_of_work_factory() as uow:
             caller = await self._caller(uow, current_user)
-            run = await self._run(uow, caller, run_public_id)
+            run = await self._run(uow, caller.organization_id, run_public_id)
             view = await self._detail(uow, run, caller.organization_id)
             await self._close_read(uow)
             return view
@@ -781,7 +957,7 @@ class RunService:
 
         async with self._unit_of_work_factory() as uow:
             caller = await self._caller(uow, current_user)
-            run = await self._run(uow, caller, run_public_id)
+            run = await self._run(uow, caller.organization_id, run_public_id)
             events = await uow.run_events.list_for_run(run.id, caller.organization_id)
             await self._close_read(uow)
             return events

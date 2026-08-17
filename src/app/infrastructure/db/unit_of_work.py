@@ -23,6 +23,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from app.domain.ports.unit_of_work import UnitOfWork
 from app.infrastructure.repositories.node_execution_repository import NodeExecutionRepository
 from app.infrastructure.repositories.organization_repository import OrganizationRepository
+from app.infrastructure.repositories.queue_task_repository import QueueTaskRepository
 from app.infrastructure.repositories.refresh_token_repository import RefreshTokenRepository
 from app.infrastructure.repositories.role_repository import RoleRepository
 from app.infrastructure.repositories.run_event_repository import RunEventRepository
@@ -49,6 +50,7 @@ class SqlAlchemyUnitOfWork(UnitOfWork):
         self._runs: RunRepository | None = None
         self._node_executions: NodeExecutionRepository | None = None
         self._run_events: RunEventRepository | None = None
+        self._queue_tasks: QueueTaskRepository | None = None
 
     @property
     def session(self) -> AsyncSession:
@@ -119,6 +121,21 @@ class SqlAlchemyUnitOfWork(UnitOfWork):
             self._run_events = RunEventRepository(self.session)
         return self._run_events
 
+    @property
+    def queue_tasks(self) -> QueueTaskRepository:
+        """The queue, as seen from inside this transaction.
+
+        Here rather than behind the ``TaskQueue`` port because enqueuing is not
+        a worker operation: it must commit with the run state change that
+        warrants it (ADR-015(c)), which means it must share this session. The
+        worker's side of the queue — claim, extend, release, requeue — owns its
+        own short transactions and is reached through the port instead.
+        """
+
+        if self._queue_tasks is None:
+            self._queue_tasks = QueueTaskRepository(self.session)
+        return self._queue_tasks
+
     # --- Lifecycle ----------------------------------------------------------
 
     async def __aenter__(self) -> Self:
@@ -149,6 +166,7 @@ class SqlAlchemyUnitOfWork(UnitOfWork):
             self._runs = None
             self._node_executions = None
             self._run_events = None
+            self._queue_tasks = None
 
     async def commit(self) -> None:
         await self.session.commit()

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from app.infrastructure.db.models.node_execution import NodeExecution
 from app.infrastructure.db.models.organization import Organization
+from app.infrastructure.db.models.queue_task import QueueTask
 from app.infrastructure.db.models.refresh_token import RefreshToken
 from app.infrastructure.db.models.role import Role
 from app.infrastructure.db.models.run import Run
@@ -23,6 +24,7 @@ from app.infrastructure.db.models.workflow_version import WorkflowVersion
 __all__ = [
     "NodeExecution",
     "Organization",
+    "QueueTask",
     "RefreshToken",
     "Role",
     "Run",
