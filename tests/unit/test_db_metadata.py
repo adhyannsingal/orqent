@@ -27,6 +27,8 @@ def test_exactly_the_expected_tables_exist() -> None:
         "runs",
         "node_executions",
         "run_events",
+        # Phase 8 queue; its own metadata lives in tests/unit/test_queue_metadata.py.
+        "queue_tasks",
     }
 
 
