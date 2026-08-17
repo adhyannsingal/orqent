@@ -16,8 +16,9 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 from app.core.config import Settings, get_settings
 from app.domain.nodes.registry import NodeRegistry
 from app.domain.ports.password_hasher import PasswordHasher
-from app.domain.ports.task_queue import TaskQueue
+from app.domain.ports.task_queue import LeasePolicy, TaskQueue
 from app.domain.ports.token_service import TokenService
+from app.domain.value_objects.lease import WorkerId
 from app.infrastructure.db.engine import create_engine
 from app.infrastructure.db.session import create_session_factory
 from app.infrastructure.db.unit_of_work import SqlAlchemyUnitOfWork
@@ -25,6 +26,7 @@ from app.infrastructure.nodes import build_registry
 from app.infrastructure.queue.mysql_task_queue import MySqlTaskQueue
 from app.infrastructure.security.password_hasher import Argon2PasswordHasher
 from app.infrastructure.security.token_service import JwtTokenService
+from app.infrastructure.worker import FixedLeasePolicy, Worker, new_worker_id
 from app.services.auth_service import AuthService
 from app.services.run_service import RunService
 from app.services.workflow_service import WorkflowService
@@ -44,6 +46,7 @@ class Container:
         self._workflow_service: WorkflowService | None = None
         self._run_service: RunService | None = None
         self._task_queue: TaskQueue | None = None
+        self._lease_policy: LeasePolicy | None = None
 
     @property
     def settings(self) -> Settings:
@@ -107,7 +110,7 @@ class Container:
         ``unit_of_work().queue_tasks``, which is what makes a run and its queue
         task commit together (ADR-015(c)).
 
-        Nothing consumes this yet: the worker loop that will is M5.
+        Consumed by ``worker()`` (M5).
         """
 
         if self._task_queue is None:
@@ -179,6 +182,43 @@ class Container:
         if self._run_service is None:
             self._run_service = RunService(self.unit_of_work, self.node_registry)
         return self._run_service
+
+    @property
+    def lease_policy(self) -> LeasePolicy:
+        """How long a worker's lease lasts and when it renews.
+
+        Annotated with the port so the worker cannot bind to the fixed
+        implementation. Shared and stateless, like the hasher.
+        """
+
+        if self._lease_policy is None:
+            self._lease_policy = FixedLeasePolicy(
+                ttl_seconds=self._settings.worker_lease_ttl_seconds,
+                heartbeat_interval_seconds=self._settings.worker_heartbeat_interval_seconds,
+            )
+        return self._lease_policy
+
+    def worker(self, worker_id: WorkerId | None = None) -> Worker:
+        """Build a worker. **Not** shared: each is one running identity.
+
+        A factory rather than a property for that reason — two workers in one
+        process sharing an identity could complete each other's leases, which is
+        the one thing the ownership checks exist to prevent.
+
+        The policy and the worker's heartbeat cadence come from the same two
+        settings, and the settings validator is what keeps them consistent — so
+        the composition root reads them once here rather than either object
+        inferring the other's timing.
+        """
+
+        return Worker(
+            self.task_queue,
+            self.run_service,
+            self.lease_policy,
+            worker_id or new_worker_id(),
+            poll_interval_seconds=self._settings.worker_poll_interval_seconds,
+            heartbeat_interval_seconds=self._settings.worker_heartbeat_interval_seconds,
+        )
 
     async def dispose(self) -> None:
         """Release the connection pool. Safe to call if never initialised."""

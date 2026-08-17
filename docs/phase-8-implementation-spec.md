@@ -1,6 +1,6 @@
 # Phase 8 — Queue & Workers: Implementation Specification
 
-**Status:** 🟡 **In progress** — M1, M2, M3, and M4 complete.
+**Status:** 🟡 **In progress** — M1–M5 complete. M6 and M7 untouched.
 **Date:** 2026-08-17 · **Branch:** `phase-8`
 **Authority:** `roadmap.md` §2 (Phase 8 row), ADR-015, ADR-016, ADR-019,
 ADR-024, ADR-030. Behaviour as built is described here; the code is the source
@@ -150,15 +150,15 @@ Unchanged from Phase 6: `attempt` semantics, the idempotency key, the
 | **M2** | `queue_tasks` model + **migration `0006`** | ✅ |
 | **M3** | `MySqlTaskQueue` adapter — `SELECT … FOR UPDATE SKIP LOCKED` claim, release, expiry reclaim, heartbeat | ✅ |
 | **M4** | Enqueue from `RunService` in the same transaction as the state change | ✅ |
-| **M5** | Worker loop and entrypoint | ⬜ |
+| **M5** | Worker loop and entrypoint | ✅ |
 | **M6** | Concurrency within a run | ⬜ |
 | **M7** | Acceptance and documentation | ⬜ |
 
-**M4 fills the queue; nothing drains it.** Creating or resuming a run now writes
-a queue task in the same transaction, and a run that suspends or finishes closes
-it. There is still no worker loop and no entrypoint, so execution continues to
-happen through `POST /runs/{id}/advance` exactly as in Phase 7. M5 is what turns
-the queue from a record into a driver.
+**M5 drains it.** A worker process now claims queued runs and advances them, so
+a run finishes with nobody calling `POST /runs/{id}/advance`. That route still
+works and is unchanged — it is simply no longer required.
+
+Still open: concurrency *within* a run (M6) and acceptance (M7).
 
 ## 10. Deferred
 
@@ -310,24 +310,149 @@ finished run to claim forever.
 Tasks are marked `DONE`, never deleted — `pending_key` already hides them from
 the uniqueness rule, so a run accumulates its full history.
 
-## 13. Note for M5
 
-- **No `LeasePolicy` implementation exists.** `claim` takes `lease_seconds`
-  directly, so neither M3 nor M4 needed one. The worker loop does.
-- **`Container.task_queue` resolves a `TaskQueue`** and nothing consumes it yet.
-- **Nothing drains the queue.** After M4 a run reliably *has* a task; execution
-  still happens through `POST /runs/{id}/advance`.
-- **⚠️ `finish_outstanding` will close a worker's own leased task.** It matches
-  `QUEUED` *or* `LEASED`, so when a worker claims a task and calls `advance_run`,
-  a run that then suspends or finishes marks that worker's task `DONE` from
-  inside the advance. The worker's subsequent `release` then returns `False` —
-  which the M1 port documents as "your lease was taken away, discard your
-  result". Here that reading is **wrong**: the worker did the work and the work
-  is what closed the task.
+## 13. The worker (M5)
 
-  Today the two are indistinguishable because nothing leases anything, so M4
-  deliberately does not choose between the fixes. M5 must, and the options are:
-  have the worker treat a settled run as a successful outcome and not call
-  `release` at all; or narrow `finish_outstanding` to `QUEUED` and let the
-  worker's own `release` close a leased task — at the cost of a suspended run
-  briefly retaining a leased task until the worker releases it.
+Runs are now **self-driving**: a worker process claims queued runs and advances
+them, and `POST /runs/{id}/advance` is no longer required for normal execution.
+The route is unchanged and still works.
+
+```
+python -m app.infrastructure.worker
+```
+
+### Shape
+
+| Piece | Where | Job |
+|---|---|---|
+| `Worker` | `infrastructure/worker/loop.py` | claim → advance → settle, and shutdown |
+| `FixedLeasePolicy` | `infrastructure/worker/lease_policy.py` | the M1 `LeasePolicy`, finally implemented |
+| `new_worker_id` | `infrastructure/worker/__init__.py` | one opaque ULID identity per process |
+| `__main__` | `infrastructure/worker/__main__.py` | container, signals, clean shutdown |
+
+The worker holds **one task at a time**. Concurrency in Phase 8 comes from
+running more workers, which is exactly what `SKIP LOCKED` makes safe. Running a
+single run's independently-ready nodes concurrently is M6.
+
+There is no SQL in the worker and no node-type knowledge; it speaks only to the
+`TaskQueue` port and `RunService` (ADR-014).
+
+### A worker is not a user
+
+`advance_run` required an `AuthenticatedUser`, and a worker has none. Rather
+than fabricate a synthetic identity — which the type system would have accepted
+and which would have been a lie — `RunService` gained
+`advance_claimed_run(run_public_id, organization_id)`, and the private helpers
+now thread `organization_id` instead of a caller.
+
+**Tenancy is not relaxed.** The organization comes from the claimed task and
+scopes every read exactly as a caller's would, so a worker cannot reach a run
+outside the tenant that queued it. Authorization already happened when a member
+of that organization created or resumed the run. `advance_run` keeps its
+signature and simply resolves the caller once, then delegates.
+
+### Settlement: resolving the M4 interaction
+
+M4 flagged that `finish_outstanding` closes a worker's *own* leased task when
+the advance suspends or finishes the run — so `release` reports `False` for a
+reason that is success, not theft. M5 resolves this **in the worker**, leaving
+M4's atomic behaviour untouched:
+
+| Signal | Meaning | Outcome |
+|---|---|---|
+| `release` → `True` | the worker closed it | `RELEASED` |
+| `release` → `False`, run settled | the advance closed it (M4) | `SETTLED` |
+| `release` → `False`, run not settled | the lease was taken | `LEASE_LOST` |
+| heartbeat refused | the lease was taken mid-run | `LEASE_LOST` |
+| advance raised | nothing was decided | `FAILED` |
+
+The **run's own state** is the tiebreaker, not a guess: a boolean alone cannot
+distinguish the two, which is why `TaskOutcome` is an enum rather than a bool.
+
+Narrowing `finish_outstanding` to `QUEUED` was the alternative and was rejected:
+it would leave a suspended run holding a leased task until its worker got round
+to releasing it, weakening the M4 invariant to simplify a caller.
+
+**`release` is always attempted**, even when the run settled. A worker can claim
+a task for a run that was already finished — the advance then decides nothing,
+`finish_outstanding` never runs, and only the worker's own release closes it.
+
+### Heartbeat
+
+Started **before** the advance and cancelled after it, so a node slower than one
+lease is not reclaimed for being slow.
+
+- Renewal goes through `TaskQueue.extend` with the worker's own `WorkerId`.
+- `should_extend` is the policy's decision; the wake cadence is the worker's.
+- The first refusal sets a lost-lease flag and stops the heartbeat — once the
+  lease is gone it stays gone, and asking again only produces more failures.
+- Cancellation is **awaited**, not merely requested: a task that is only asked to
+  stop is still scheduled, and a stale heartbeat could extend a lease the worker
+  no longer holds. This is also what prevents orphaned asyncio tasks.
+
+A worker that has lost its lease **writes nothing to the queue**. The run may
+still have progressed — that is at-least-once (ADR-024), not a claim of
+exactly-once.
+
+Defaults: TTL 60s, heartbeat 20s, poll 1s, all `APP_WORKER_*` settings. A
+settings validator refuses a heartbeat at or beyond the TTL, because that
+configuration makes every worker lose its lease mid-run.
+
+### Failure and recovery
+
+| Case | Behaviour |
+|---|---|
+| Worker dies before or during the advance | the lease lapses and `claim` reclaims it — no reaper |
+| Advance raises | not released, not requeued: the lease lapses, giving a TTL of backoff without inventing a retry policy |
+| Node raises | unchanged Phase 6 semantics — `invoke` records `Failed`, the run fails, and M4 closes the task |
+| Lease lost mid-run | the advance is allowed to finish (cancelling it mid-transaction is not safe); the worker simply does not settle |
+
+`RUNNING` recovery remains the scheduler's, exactly as in Phase 6. The worker
+adds no second recovery mechanism.
+
+### Shutdown
+
+`stop()` sets an event; it is safe from a signal handler because it does nothing
+else. The loop stops claiming, and the task in hand is allowed to finish — so
+nothing is left permanently leased by a process that was asked to stop. The idle
+wait is on the event rather than a flat sleep, so shutdown does not wait out the
+poll interval. Signal handlers are registered on the event loop, and a platform
+that cannot do so logs and continues.
+
+### A defect this milestone found
+
+`_advance` returned its run **without committing** when the scheduler had
+nothing left to decide. The unit of work then rolled back on the way out, which
+expires every loaded attribute, so the caller received a run it could not read a
+single field from. The worker reads `status` off exactly that object.
+
+Fixed by closing the read the way every other read in the file already closes it
+(`_close_read`). This was **not** worker-specific: the HTTP advance route had the
+same defect. Existing tests missed it because the shared integration fixture
+joins transactions with savepoints, which masks the expiry — the worker's own
+engine-bound sessions do not.
+
+### Tests
+
+23 unit (`tests/unit/test_worker.py`) and 13 integration
+(`tests/integration/test_worker.py`), the latter against real MySQL with
+independent engines — nothing fakes `SKIP LOCKED` or lease ownership. Covered:
+self-driving completion with no advance call, task reaching `DONE`, suspension
+leaving no outstanding task, resume producing new work, expired-lease reclaim,
+two workers never claiming one task, a stale worker unable to finish another's
+lease, Phase 7 branching through the worker, and shutdown leaving queued work
+untouched.
+
+## 14. Note for M6
+
+- **M6 is concurrency *within* a run** — running independently-ready nodes
+  together. Worker-level concurrency across runs already exists and is just
+  "start more processes".
+- **One task per run is what makes this safe.** Exactly one worker is ever inside
+  a run (§2), so M6 parallelises inside a lease and does not have to revisit the
+  scheduler's crash-recovery rule.
+- **`advance_run` invokes started nodes sequentially** in `_advance`'s final
+  loop. That loop is M6's target; everything above it already commits the
+  scheduling decision before any node runs, and must keep doing so.
+- Still deferred and out of scope: fairness, quotas, priority, retry/backoff,
+  node timeouts (§10).

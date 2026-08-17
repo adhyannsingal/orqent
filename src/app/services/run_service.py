@@ -254,6 +254,30 @@ class RunService:
             return run
 
     async def advance_run(self, current_user: AuthenticatedUser, run_public_id: str) -> Run:
+        """Advance a run on behalf of an authenticated member of its tenant."""
+
+        async with self._unit_of_work_factory() as uow:
+            caller = await self._caller(uow, current_user)
+            organization_id = caller.organization_id
+        return await self._advance(run_public_id, organization_id)
+
+    async def advance_claimed_run(self, run_public_id: str, organization_id: int) -> Run:
+        """Advance a run a worker has claimed from the queue (Phase 8, M5).
+
+        **No caller, deliberately.** A worker is not a user: it holds a lease on
+        a queue task, and that task already names the tenant. Authorization
+        happened when a member of that organization created or resumed the run;
+        re-deriving it from an identity the worker does not have would mean
+        inventing one, which is a worse answer than admitting there is none.
+
+        Tenancy is *not* relaxed. ``organization_id`` comes from the claimed
+        task and scopes every read exactly as a caller's would, so a worker
+        cannot reach a run outside the tenant that queued it.
+        """
+
+        return await self._advance(run_public_id, organization_id)
+
+    async def _advance(self, run_public_id: str, organization_id: int) -> Run:
         """Drive this run forward until it can go no further.
 
         Alternates scheduling and execution: a tick decides what should start,
@@ -281,15 +305,22 @@ class RunService:
 
         while True:
             async with self._unit_of_work_factory() as uow:
-                caller = await self._caller(uow, current_user)
-                run = await self._run(uow, caller, run_public_id)
-                snapshot, executions = await self._snapshot(uow, run, caller.organization_id)
+                run = await self._run(uow, organization_id, run_public_id)
+                snapshot, executions = await self._snapshot(uow, run, organization_id)
 
                 if limit is None:
                     limit = len(snapshot.graph) + 1
 
                 decisions = tick(snapshot)
                 if not decisions:
+                    # Ended without deciding anything, so this transaction only
+                    # ever read. Close it the way every other read closes: the
+                    # unit of work rolls back on the way out, which **expires
+                    # every loaded attribute**, and the caller would be handed a
+                    # run it cannot read a single field from. The worker reads
+                    # `status` off exactly this object to decide how its task
+                    # settled (Phase 8, M5).
+                    await self._close_read(uow)
                     return run
 
                 cycles += 1
@@ -307,13 +338,12 @@ class RunService:
                 started = [
                     decision.node_key for decision in decisions if isinstance(decision, StartNode)
                 ]
-                run_id, organization_id = run.id, caller.organization_id
+                run_id = run.id
                 node_ids = {key: executions[key].workflow_node_id for key in started}
                 attempts = {key: executions[key].attempt for key in started}
 
             for node_key in started:
                 await self._execute(
-                    current_user,
                     run_public_id,
                     snapshot,
                     node_key,
@@ -325,7 +355,6 @@ class RunService:
 
     async def _execute(
         self,
-        current_user: AuthenticatedUser,
         run_public_id: str,
         snapshot: RunSnapshot,
         node_key: str,
@@ -350,7 +379,7 @@ class RunService:
         """
 
         if self._repeat_would_be_unsafe(snapshot, node_key, attempt):
-            await self._refuse_repeat(current_user, run_public_id, organization_id, node_key)
+            await self._refuse_repeat(run_public_id, organization_id, node_key)
             return
 
         context = build_context(
@@ -365,8 +394,7 @@ class RunService:
         result = await invoke(snapshot, self._node_registry, node_key, context)
 
         async with self._unit_of_work_factory() as uow:
-            caller = await self._caller(uow, current_user)
-            run = await self._run(uow, caller, run_public_id)
+            run = await self._run(uow, organization_id, run_public_id)
             _, executions = await self._snapshot(uow, run, organization_id)
             execution = executions[node_key]
 
@@ -455,7 +483,6 @@ class RunService:
 
     async def _refuse_repeat(
         self,
-        current_user: AuthenticatedUser,
         run_public_id: str,
         organization_id: int,
         node_key: str,
@@ -463,8 +490,7 @@ class RunService:
         """Fail a node that must not be repeated, without invoking it."""
 
         async with self._unit_of_work_factory() as uow:
-            caller = await self._caller(uow, current_user)
-            run = await self._run(uow, caller, run_public_id)
+            run = await self._run(uow, organization_id, run_public_id)
             _, executions = await self._snapshot(uow, run, organization_id)
             execution = executions[node_key]
 
@@ -509,7 +535,7 @@ class RunService:
 
         async with self._unit_of_work_factory() as uow:
             caller = await self._caller(uow, current_user)
-            run = await self._run(uow, caller, run_public_id)
+            run = await self._run(uow, caller.organization_id, run_public_id)
 
             execution = await uow.node_executions.get_by_resume_token(
                 resume_token, caller.organization_id
@@ -557,7 +583,6 @@ class RunService:
 
         # Outside the transaction, exactly as advance_run invokes.
         await self._execute(
-            current_user,
             run_public_id,
             snapshot,
             node_key,
@@ -571,7 +596,9 @@ class RunService:
         # The graph is re-evaluated as a whole rather than the resumed node being
         # nudged along by hand: whatever the completed node unlocked is the
         # scheduler's decision, not this method's.
-        return await self.advance_run(current_user, run_public_id)
+        # The caller was already resolved above; re-resolving would be a second
+        # authentication decision inside one use case.
+        return await self._advance(run_public_id, organization_id)
 
     async def _snapshot(
         self, uow: SqlAlchemyUnitOfWork, run: Run, organization_id: int
@@ -613,10 +640,15 @@ class RunService:
         )
         return snapshot, execution_by_key
 
-    async def _run(self, uow: SqlAlchemyUnitOfWork, caller: User, public_id: str) -> Run:
-        """Load a run the caller's organization owns, or raise."""
+    async def _run(self, uow: SqlAlchemyUnitOfWork, organization_id: int, public_id: str) -> Run:
+        """Load a run this organization owns, or raise.
 
-        run = await uow.runs.get_by_public_id(public_id, caller.organization_id)
+        Takes the organization rather than the caller because not every path
+        here has a caller: a worker advancing a claimed task acts on behalf of
+        the tenant the queue task names, with no user involved (Phase 8, M5).
+        """
+
+        run = await uow.runs.get_by_public_id(public_id, organization_id)
         if run is None:
             raise NotFoundError("This run does not exist.")
         return run
@@ -756,7 +788,7 @@ class RunService:
 
         async with self._unit_of_work_factory() as uow:
             caller = await self._caller(uow, current_user)
-            run = await self._run(uow, caller, run_public_id)
+            run = await self._run(uow, caller.organization_id, run_public_id)
             view = await self._detail(uow, run, caller.organization_id)
             await self._close_read(uow)
             return view
@@ -808,7 +840,7 @@ class RunService:
 
         async with self._unit_of_work_factory() as uow:
             caller = await self._caller(uow, current_user)
-            run = await self._run(uow, caller, run_public_id)
+            run = await self._run(uow, caller.organization_id, run_public_id)
             events = await uow.run_events.list_for_run(run.id, caller.organization_id)
             await self._close_read(uow)
             return events

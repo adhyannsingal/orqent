@@ -11,7 +11,7 @@ from __future__ import annotations
 from enum import StrEnum
 from functools import lru_cache
 
-from pydantic import Field
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -62,6 +62,18 @@ class Settings(BaseSettings):
     # hashed store with rotation, added in Phase 3B.
     refresh_token_ttl_seconds: int = Field(default=2_592_000, gt=0)  # 30 days
 
+    # --- Worker (Phase 8, M5) ---
+    # How long a claimed task is owned before another worker may reclaim it.
+    # This is a presumption-of-death window, not a work budget: the heartbeat
+    # extends it for as long as the worker is alive, so it should be sized by
+    # how quickly a dead worker's run must be picked up, not by node duration.
+    worker_lease_ttl_seconds: int = Field(default=60, gt=0)
+    # How often a working worker renews. Must be comfortably shorter than the
+    # TTL, so a renewal has time to fail and be retried before the lease lapses.
+    worker_heartbeat_interval_seconds: int = Field(default=20, gt=0)
+    # How long an idle worker waits before asking for work again.
+    worker_poll_interval_seconds: float = Field(default=1.0, gt=0)
+
     # --- Reserved for later phases (declared, intentionally unused now) ---
     database_url: str | None = None
     chroma_host: str | None = None
@@ -70,6 +82,23 @@ class Settings(BaseSettings):
     @property
     def is_production(self) -> bool:
         return self.environment is Environment.PRODUCTION
+
+    @model_validator(mode="after")
+    def _heartbeat_must_outpace_expiry(self) -> Settings:
+        """Refuse a configuration where the lease lapses before it is renewed.
+
+        A heartbeat at or beyond the TTL means every worker loses its lease
+        mid-run and its work is reclaimed while it is still running — the exact
+        failure leasing exists to prevent, and one that would only show up under
+        load. Cheaper to refuse at startup than to diagnose in production.
+        """
+
+        if self.worker_heartbeat_interval_seconds >= self.worker_lease_ttl_seconds:
+            raise ValueError(
+                "worker_heartbeat_interval_seconds must be shorter than "
+                "worker_lease_ttl_seconds, or a lease lapses before it is renewed."
+            )
+        return self
 
 
 @lru_cache
