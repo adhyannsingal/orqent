@@ -1,6 +1,6 @@
 # Phase 8 — Queue & Workers: Implementation Specification
 
-**Status:** 🟡 **In progress** — M1 and M2 complete.
+**Status:** 🟡 **In progress** — M1, M2, and M3 complete.
 **Date:** 2026-08-17 · **Branch:** `phase-8`
 **Authority:** `roadmap.md` §2 (Phase 8 row), ADR-015, ADR-016, ADR-019,
 ADR-024, ADR-030. Behaviour as built is described here; the code is the source
@@ -148,14 +148,15 @@ Unchanged from Phase 6: `attempt` semantics, the idempotency key, the
 |---|---|---|
 | **M1** | `TaskQueue` / `LeasePolicy` ports; `WorkerId`, `Lease`, `ClaimedTask` | ✅ |
 | **M2** | `queue_tasks` model + **migration `0006`** | ✅ |
-| **M3** | `MySqlTaskQueue` adapter — `SELECT … FOR UPDATE SKIP LOCKED` claim, release, expiry reclaim, heartbeat | ⬜ |
+| **M3** | `MySqlTaskQueue` adapter — `SELECT … FOR UPDATE SKIP LOCKED` claim, release, expiry reclaim, heartbeat | ✅ |
 | **M4** | Enqueue from `RunService` in the same transaction as the state change | ⬜ |
 | **M5** | Worker loop and entrypoint | ⬜ |
 | **M6** | Concurrency within a run | ⬜ |
 | **M7** | Acceptance and documentation | ⬜ |
 
-**M2 is persistence only.** It stores the state M3 will operate on. There is no
-adapter, no claim, no locking, no worker, and no enqueue call site yet.
+**M3 is the adapter only.** The queue can now be driven, but nothing drives it:
+there is no worker loop, no entrypoint, and no call site that enqueues a run.
+Those are M4 and M5.
 
 ## 10. Deferred
 
@@ -167,7 +168,68 @@ node timeouts.
 agent nodes, tools, Chroma/vector retrieval, embeddings, and RAG — those are
 **Phase 10**. The frontend follows all ten backend phases.
 
-## 11. Note for M3
+## 11. The adapter (M3)
+
+`app.infrastructure.queue.mysql_task_queue.MySqlTaskQueue`. Takes a **session
+factory**, not a session: a worker's queue operations are not part of anyone
+else's unit of work, and a claim has to commit on its own or a second worker
+cannot see the task is taken. Each method owns one short transaction.
+
+### The claim
+
+```
+BEGIN
+  SELECT … WHERE status='QUEUED' AND run_after <= :now
+           ORDER BY run_after, id LIMIT 1 FOR UPDATE SKIP LOCKED
+  -- nothing? then the same, for status='LEASED' AND lease_expires_at <= :now
+  UPDATE … SET status='LEASED', locked_by=…, locked_at=…,
+               lease_expires_at=…, attempts = attempts + 1
+         WHERE id = :id AND status IN ('QUEUED','LEASED')
+COMMIT
+```
+
+Nothing is committed between the select and the update — that would drop the row
+lock and reopen the race it was taken to close. The affected-row count is checked
+anyway, so correctness does not rest solely on having read the isolation
+semantics right.
+
+### Why two queries rather than one `OR` — **measured, not assumed**
+
+The obvious form is one predicate: `(QUEUED AND due) OR (LEASED AND expired)`.
+**It does not work.** The `OR` defeats the `(status, run_after)` index, MySQL
+scans, and a scan under `FOR UPDATE` takes next-key locks across the range it
+walks — so `SKIP LOCKED` makes the other workers skip that whole swath and
+return empty.
+
+Measured on this schema: six workers racing six queued tasks produced **one**
+winner with the `OR` form, and **six distinct claims** when split into two
+indexed lookups. Both lookups run inside the *same transaction* of the *same*
+`claim` call, so reclaiming a dead worker's task is still claiming — there is
+still no reaper pass.
+
+### Stale-worker protection
+
+`extend`, `release`, and `requeue` share one private helper whose `WHERE` is
+always `public_id = … AND status = 'LEASED' AND locked_by = :worker`. Each
+returns whether it affected exactly one row. `False` means the task was
+reclaimed, already finished, or never this worker's — and the caller must treat
+its own work as stale rather than writing over the worker now doing it.
+
+`extend` additionally refuses to move a deadline backwards, matching
+`Lease.extended_to`: shortening is not a heartbeat.
+
+### Concurrency guarantee
+
+**A task is held by at most one worker at a time**, enforced by MySQL row locks
+and a conditional update — no asyncio lock, no in-process mutex, nothing that
+stops working across processes. Proven by tests using **independent engines**;
+the shared rolled-back-transaction fixture cannot exercise row locking and would
+make those assertions vacuous.
+
+The execution guarantee remains **at-least-once**: a worker can claim, do the
+work, and die before releasing, and the lease then lapses for someone else.
+
+## 12. Note for M4
 
 The claim query must treat these as one eligible set, so reclaiming a dead
 worker's task and taking a fresh one are the same operation:
@@ -177,6 +239,13 @@ worker's task and taking a fresh one are the same operation:
 OR (status = 'LEASED' AND lease_expires_at <= NOW(6))
 ```
 
-Both `release` and `extend` must match on `locked_by`, and check the affected
-row count: a worker whose lease was reclaimed must learn it no longer owns the
-task rather than silently overwriting the worker that does.
+**`enqueue` currently commits on its own.** M1's port documents it as "called
+inside the caller's transaction", which is what gives ADR-015(c) its
+enqueue-and-state-change atomicity. The M3 adapter opens its own session, so a
+run could commit without its task, or vice versa. **M4 must close this**, either
+by putting a queue-task accessor on the `UnitOfWork` for the enqueue path, or by
+constructing the adapter with the caller's session. Nothing else in Phase 8
+depends on the choice.
+
+Also for M4: a `LeasePolicy` implementation does not exist yet — `claim` takes
+`lease_seconds` directly, so M3 did not need one. The worker loop (M5) will.
