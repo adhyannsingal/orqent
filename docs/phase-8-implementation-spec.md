@@ -1,6 +1,6 @@
 # Phase 8 — Queue & Workers: Implementation Specification
 
-**Status:** 🟡 **In progress** — M1–M6 complete. M7 untouched.
+**Status:** ✅ **Complete** — M1–M7 done, accepted against real MySQL.
 **Date:** 2026-08-17 · **Branch:** `phase-8`
 **Authority:** `roadmap.md` §2 (Phase 8 row), ADR-015, ADR-016, ADR-019,
 ADR-024, ADR-030. Behaviour as built is described here; the code is the source
@@ -152,13 +152,13 @@ Unchanged from Phase 6: `attempt` semantics, the idempotency key, the
 | **M4** | Enqueue from `RunService` in the same transaction as the state change | ✅ |
 | **M5** | Worker loop and entrypoint | ✅ |
 | **M6** | Concurrency within a run | ✅ |
-| **M7** | Acceptance and documentation | ⬜ |
+| **M7** | Acceptance and documentation | ✅ |
 
 **M5 drains it.** A worker process now claims queued runs and advances them, so
 a run finishes with nobody calling `POST /runs/{id}/advance`. That route still
 works and is unchanged — it is simply no longer required.
 
-Still open: acceptance and final documentation (M7).
+Nothing is open. §16 records the acceptance run and checks the definition of done.
 
 ## 10. Deferred
 
@@ -533,10 +533,101 @@ they assert the *absence* of overlap.
 
 `tests/integration/test_concurrency.py`, 9 tests against real MySQL.
 
-## 15. Note for M7
+## 15. What Phase 8 changed, in one page
 
-- M6 deferred nothing from its own scope. Still out of scope Phase-wide:
-  fairness, quotas, priority, retry/backoff, and node timeouts (§10).
-- **Concurrency is unbounded within a batch.** Every ready node is invoked at
-  once. Correct, and deliberately un-tuned — a per-run ceiling belongs with the
-  quota work of ADR-030, not here.
+```
+POST /runs                     ── run + queue task, one transaction (M4)
+      │
+      ▼
+queue_tasks  QUEUED ──claim──▶ LEASED ──release──▶ DONE        (M2, M3)
+      │        ▲ SKIP LOCKED, two indexed lookups
+      ▼        └─ lapsed lease reclaimed by the ordinary claim
+worker process ── advance_claimed_run(run, org) ──▶ RunService  (M5)
+      │                                                │
+      └─ heartbeat extends the lease                   └─ ready batch invoked
+                                                          concurrently (M6)
+```
+
+`POST /runs/{id}/advance` still exists and still works. It is simply no longer
+required for a run to finish.
+
+## 16. Acceptance (M7)
+
+Every scenario below was run against real MySQL. Nothing about the queue, the
+locking, or the leases is faked anywhere in the acceptance suite.
+
+| # | Scenario | How it is proven | Result |
+|---|---|---|---|
+| 1 | **Self-driving end to end** | Publish + start over HTTP, then `python -m app.infrastructure.worker` as a **real OS process** sharing only the database. No `/advance` call. | ✅ |
+| 2 | Worker shuts down cleanly on `SIGTERM` | The process exits 0 rather than being killed. | ✅ |
+| 3 | **Distribution across workers** | Six workers race six queued runs; **all six claimed, once each**. | ✅ |
+| 4 | Two worker loops, four runs | Every run `COMPLETED`, every task `attempts == 1`. | ✅ |
+| 5 | **Lease expiry and recovery** | Lapsed lease reclaimed, `attempts` → 2, the run still finishes. | ✅ |
+| 6 | **Stale-worker rejection** | The dead worker's `release`, `extend`, *and* `requeue` all refused; owner unchanged. | ✅ |
+| 7 | Suspension releases queue capacity | Parked run holds no outstanding task; the task is `DONE`, not deleted. | ✅ |
+| 8 | Resume re-enqueues atomically | A second, distinct task row; the run then completes. | ✅ |
+| 9 | **Phase 7 branching through the worker** | Both `flag` values: live branch runs, other is `SKIPPED`, `NodeSkipped` present, no `NodeFailed`. | ✅ |
+| 10 | One published version takes both paths | Both runs pin the same `version_no`. | ✅ |
+| 11 | Tenancy on the queue | Task's `organization_id` == the run's. | ✅ |
+| 12 | A task cannot cross tenants | The same run id with another organization raises `NotFoundError`; the run is untouched. | ✅ |
+| 13 | M6 concurrency | Existing barrier suite, reused rather than duplicated. | ✅ |
+
+**The headline test is mutation-verified.** With `Worker._claim` stubbed to
+return `None`, the run stays `PENDING` and the test fails — so it genuinely
+depends on a worker claiming and advancing, and cannot pass against a broken
+queue.
+
+**What is simulated, and what is not.** Scenario 5 simulates the *death* of a
+worker by never letting it advance the run and judging the reclaim from a moment
+past its lease. The lease, its expiry, the reclaim, and the attempt counter are
+all MySQL's. Killing a real process at an exact instant would make the assertion
+a race without testing anything more. Scenario 1 uses no simulation at all.
+
+### Definition of done
+
+- [x] A run created over HTTP reaches `COMPLETED` with **no** `/advance` call.
+- [x] The queue task is claimed, leased, and finishes `DONE`.
+- [x] Node outputs and the event timeline are correct end to end.
+- [x] One task is never claimed by two workers; N tasks reach N workers.
+- [x] A lapsed lease is reclaimed and `attempts` increments.
+- [x] A stale worker cannot write to a task it no longer owns.
+- [x] A suspended run holds no outstanding queue task; resume enqueues a fresh
+      one in the same transaction as the state change.
+- [x] Phase 7 branching, pruning, and `SKIPPED` are unchanged under the worker.
+- [x] Independently-ready nodes overlap; dependent nodes never do.
+- [x] Tenancy holds on every worker path.
+- [x] `ruff format --check`, `ruff check`, `mypy src`, `alembic check`,
+      architecture tests, full default and integration suites, `git diff --check`.
+- [x] The integration suite is stable across repeated runs and leaves **no
+      database residue**.
+
+### Guarantee, stated plainly
+
+**At-least-once. Exactly-once is not claimed and is not achievable here.** A
+worker can claim a task, do the work, and die before releasing it; the lease
+lapses and another worker redoes it. That duplicate is the one ADR-024
+describes, and the idempotency key each node receives is how a node author
+copes with it.
+
+### Still deferred, deliberately
+
+Per-organization **fairness** and weighted dequeue, **quotas**, **priority**,
+**retry policy and backoff**, and **node-level timeout enforcement** (§10).
+Within-batch concurrency is also unbounded — a per-run ceiling belongs with
+ADR-030's quota work, not here.
+
+Phases 9 and 10 are untouched: no triggers, human tasks, connections, LangChain,
+agent nodes, Chroma, embeddings, or RAG.
+
+### Architecture, as reviewed
+
+- `src/app/domain/engine/` **does not appear in the Phase 8 diff at all** — the
+  scheduler is byte-identical and remains pure and node-type agnostic.
+- The only domain additions are two pure modules: the `TaskQueue`/`LeasePolicy`
+  ports and the lease value objects. Neither imports a framework or a driver.
+- Exactly one `with_for_update(skip_locked=True)` exists in the source; there is
+  no second queue implementation.
+- The worker **never fabricates a user**. It calls `advance_claimed_run`, which
+  scopes by the `organization_id` carried on the claimed task.
+- The queue adapter and the worker are infrastructure; `RunService` remains the
+  use-case and transaction boundary.
