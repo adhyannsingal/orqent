@@ -136,7 +136,7 @@ async def _published(service: WorkflowService, caller: AuthenticatedUser, name: 
     await service.replace_draft(
         caller, workflow.public_id, revision=draft.revision, nodes=nodes, edges=edges
     )
-    version = await service.publish(caller, workflow.public_id)
+    version = (await service.publish(caller, workflow.public_id)).version
     return workflow, version
 
 
@@ -636,7 +636,7 @@ async def test_publishing_promotes_the_draft_in_place(
         caller, workflow.public_id, revision=draft.revision, nodes=nodes, edges=edges
     )
 
-    version = await service.publish(caller, workflow.public_id)
+    version = (await service.publish(caller, workflow.public_id)).version
 
     assert version.id == draft.id
     assert version.status == "PUBLISHED"
@@ -669,7 +669,7 @@ async def test_version_numbers_are_sequential(service: WorkflowService, db: Fake
     workflow, first = await _published(service, caller)
 
     await service.get_draft(caller, workflow.public_id)
-    second = await service.publish(caller, workflow.public_id)
+    second = (await service.publish(caller, workflow.public_id)).version
 
     assert (first.version_no, second.version_no) == (1, 2)
 
@@ -683,7 +683,7 @@ async def test_publish_notes_are_recorded(service: WorkflowService, db: FakeData
         caller, workflow.public_id, revision=draft.revision, nodes=nodes, edges=edges
     )
 
-    version = await service.publish(caller, workflow.public_id, notes="First release")
+    version = (await service.publish(caller, workflow.public_id, notes="First release")).version
 
     assert version.notes == "First release"
 
@@ -802,7 +802,7 @@ async def test_warnings_do_not_block_publication(
     )
 
     report = await service.validate_draft(caller, workflow.public_id)
-    version = await service.publish(caller, workflow.public_id)
+    version = (await service.publish(caller, workflow.public_id)).version
 
     assert [i.code.value for i in report.issues] == ["UNREACHABLE_NODE"]
     assert report.is_valid
@@ -841,7 +841,7 @@ async def test_an_administrator_may_publish_someone_elses_workflow(
         organization_id=creator.organization_id,
         roles=frozenset({role}),
     )
-    version = await service.publish(administrator, workflow.public_id)
+    version = (await service.publish(administrator, workflow.public_id)).version
 
     assert version.status == "PUBLISHED"
 

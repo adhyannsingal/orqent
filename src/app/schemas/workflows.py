@@ -360,6 +360,25 @@ class VersionResponse(BaseModel):
     created_at: datetime
 
 
+class PublishResponse(VersionResponse):
+    """A published version, plus the webhook token if this publish minted one.
+
+    A separate schema rather than a field on :class:`VersionResponse` because a
+    token belongs to exactly one response in the API and listing versions must
+    not look as though it could ever carry a credential.
+    """
+
+    webhook_token: str | None = None
+    """**Shown once, and never again.**
+
+    The database stores only a digest, so this value cannot be recovered after
+    the response is sent — a client that needs the webhook URL must keep it now.
+    ``null`` on every republish: the address a workflow already has is reused
+    rather than rotated, so that a customer's configured integration keeps
+    working.
+    """
+
+
 def _first_duplicate[T](values: list[T]) -> T:
     """The first value that appears more than once. Only called when one does."""
 

@@ -42,11 +42,20 @@ from app.domain.graph.model import GraphEdge
 from app.domain.graph.validation import ValidationReport, validate_graph
 from app.domain.nodes.registry import NodeRegistry
 from app.domain.value_objects.authenticated_user import AuthenticatedUser
+from app.infrastructure.db.models.trigger_registration import ACTIVE, TriggerRegistration
 from app.infrastructure.db.models.user import User
 from app.infrastructure.db.models.workflow import Workflow
 from app.infrastructure.db.models.workflow_node import WorkflowNode
 from app.infrastructure.db.models.workflow_version import WorkflowVersion
 from app.infrastructure.db.unit_of_work import SqlAlchemyUnitOfWork
+
+# Named here, and nowhere in the engine: Phase 9's publish lifecycle is *about*
+# webhook triggers, while the scheduler stays node-type agnostic (ADR-014,
+# enforced by the architecture guard, which covers `domain/engine` and
+# `run_service` — not this module).
+from app.infrastructure.nodes.builtin import trigger_webhook
+from app.infrastructure.security.token_hashing import hash_token
+from app.infrastructure.security.webhook_token import new_webhook_token
 
 log = structlog.get_logger(__name__)
 
@@ -135,6 +144,22 @@ def _is_duplicate_name(error: IntegrityError) -> bool:
     """
 
     return _NAME_CONSTRAINT in str(getattr(error, "orig", error))
+
+
+@dataclass(frozen=True, slots=True)
+class PublishResult:
+    """A published version, and a webhook token if one was just minted.
+
+    ``publish`` returns this rather than the version alone because a webhook
+    token exists in readable form **exactly once**: the database stores only its
+    digest, so a value not handed back here can never be recovered. Carrying it
+    on the result is the one place the architecture has to surface it, and it is
+    ``None`` on every publish that did not create a registration — which is every
+    republish, and every workflow with no webhook trigger.
+    """
+
+    version: WorkflowVersion
+    webhook_token: str | None = None
 
 
 class WorkflowService:
@@ -375,7 +400,7 @@ class WorkflowService:
         public_id: str,
         *,
         notes: str | None = None,
-    ) -> WorkflowVersion:
+    ) -> PublishResult:
         """Promote the draft to a published version.
 
         Promotes **in place** rather than copying: the draft row becomes the
@@ -431,10 +456,71 @@ class WorkflowService:
             # the RESTRICT foreign key has something real to point at.
             workflow.active_version_id = draft.id
 
+            # In this transaction, deliberately. A published workflow whose
+            # webhook address is missing — or an address repointed at a version
+            # whose publication then rolled back — are both states the system
+            # must not be able to reach, and the only thing that guarantees it is
+            # sharing the unit of work publication already had.
+            webhook_token = await self._register_webhook_trigger(uow, workflow, draft)
+
             await uow.commit()
 
             log.info("workflow.published", workflow_id=public_id, version_no=draft.version_no)
-            return draft
+            return PublishResult(version=draft, webhook_token=webhook_token)
+
+    async def _register_webhook_trigger(
+        self, uow: SqlAlchemyUnitOfWork, workflow: Workflow, version: WorkflowVersion
+    ) -> str | None:
+        """Point this workflow's webhook address at the version just published.
+
+        Returns a freshly minted token when — and only when — the registration
+        did not exist before. A republish reuses the address it already has:
+        the token is a URL a customer has configured in some other system, so
+        rotating it on every publish would break a working integration for no
+        reason. What moves is the target node, nothing else.
+
+        Three cases, and the third is the one worth reading twice:
+
+        * **No webhook trigger in the published version.** Nothing happens. Any
+          existing registration is left pointing into the version it was last
+          published against, which is no longer the active one — so it stops
+          resolving on its own. That is how removing a webhook turns the address
+          off without a second status meaning "temporarily off", and without
+          claiming the credential was revoked.
+        * **A webhook trigger, and no registration yet.** Mint once, store the
+          digest, hand the raw token back.
+        * **A webhook trigger, and a registration already.** Repoint it. Its
+          ``status`` is *not* touched: a revoked address must not come back to
+          life because somebody published again.
+        """
+
+        nodes = await uow.workflow_versions.list_nodes(version.id)
+        hook = next(
+            (node for node in nodes if node.node_type == trigger_webhook.DESCRIPTOR.node_type),
+            None,
+        )
+        if hook is None:
+            return None
+
+        existing = await uow.trigger_registrations.get_for_workflow(
+            workflow.id, workflow.organization_id
+        )
+        if existing is not None:
+            existing.workflow_node_id = hook.id
+            return None
+
+        token = new_webhook_token()
+        await uow.trigger_registrations.add(
+            TriggerRegistration(
+                organization_id=workflow.organization_id,
+                workflow_node_id=hook.id,
+                status=ACTIVE,
+                # Only the digest is ever stored; `token` is returned to the
+                # caller and then gone.
+                token_digest=hash_token(token),
+            )
+        )
+        return token
 
     # --- Versions -----------------------------------------------------------
 

@@ -288,3 +288,60 @@ async def test_a_webhook_triggered_run_is_invisible_to_another_tenant(
     # Not found, never forbidden: a 403 would confirm the id names something.
     assert (await client.get(f"/api/v1/runs/{run_id}")).status_code == 404
     assert (await client.get(f"/api/v1/workflows/{workflow_id}")).status_code == 404
+
+
+# --- The one-time credential reveal (Phase 9, M3) -----------------------------
+
+
+async def test_publishing_reveals_the_webhook_token_exactly_once(
+    client: AsyncClient, tenant: AuthenticatedUser
+) -> None:
+    """The only response in the API that carries a credential.
+
+    The database stores a digest, so a value not returned here can never be
+    recovered — and a republish reuses the address rather than rotating it, so
+    there is nothing to reveal the second time.
+    """
+
+    workflow_id, _ = await _draft(client, _webhook_graph)
+
+    first = await client.post(f"/api/v1/workflows/{workflow_id}/publish", json={})
+    assert first.status_code == 201, first.text
+    token = first.json()["webhook_token"]
+    assert isinstance(token, str) and len(token) == 43
+
+    # Republish: same address, so no new credential.
+    draft = (await client.get(f"/api/v1/workflows/{workflow_id}/draft")).json()
+    await client.put(
+        f"/api/v1/workflows/{workflow_id}/draft", json=_webhook_graph(draft["revision"])
+    )
+    second = await client.post(f"/api/v1/workflows/{workflow_id}/publish", json={})
+
+    assert second.status_code == 201, second.text
+    assert second.json()["webhook_token"] is None
+
+
+async def test_a_manual_workflow_publishes_without_a_token(
+    client: AsyncClient, tenant: AuthenticatedUser
+) -> None:
+    """A manual trigger is not an address, so nothing is minted."""
+
+    created = await client.post("/api/v1/workflows", json={"name": f"Man {new_public_id()}"})
+    workflow_id = created.json()["public_id"]
+    draft = (await client.get(f"/api/v1/workflows/{workflow_id}/draft")).json()
+    await client.put(
+        f"/api/v1/workflows/{workflow_id}/draft",
+        json={
+            "revision": draft["revision"],
+            "nodes": [
+                _node("by_hand", "trigger.manual", x=0),
+                _node("step", "core.noop", x=100),
+            ],
+            "edges": [_edge("by_hand", "step")],
+        },
+    )
+
+    published = await client.post(f"/api/v1/workflows/{workflow_id}/publish", json={})
+
+    assert published.status_code == 201, published.text
+    assert published.json()["webhook_token"] is None
