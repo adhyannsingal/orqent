@@ -109,3 +109,25 @@ class TriggerRegistrationRepository:
             )
         )
         return result.scalars().first()
+
+    async def get_workflow_for(self, registration: TriggerRegistration) -> Workflow | None:
+        """The workflow whose graph contains this registration's trigger node.
+
+        A second query rather than a wider return from
+        :meth:`get_by_token_digest`, which stays exactly the seam M3 defined.
+        The join lives here because this repository is the only one that knows a
+        registration reaches a workflow through a node and a version; asking the
+        caller to walk it would either leak that shape or invite a lazy
+        relationship load, which raises ``MissingGreenlet`` under asyncio.
+
+        Not organization-scoped, and it does not need to be: the registration
+        handed in was already resolved, and it is what *supplies* the tenant.
+        """
+
+        result = await self._session.execute(
+            select(Workflow)
+            .join(WorkflowVersion, WorkflowVersion.workflow_id == Workflow.id)
+            .join(WorkflowNode, WorkflowNode.workflow_version_id == WorkflowVersion.id)
+            .where(WorkflowNode.id == registration.workflow_node_id)
+        )
+        return result.scalars().first()

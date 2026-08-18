@@ -17,6 +17,7 @@ from fastapi import FastAPI
 from starlette.middleware.cors import CORSMiddleware
 
 from app import __version__
+from app.api import routes_hooks
 from app.api.errors import register_exception_handlers
 from app.api.middleware import CorrelationIdMiddleware
 from app.api.v1.router import api_v1_router
@@ -43,6 +44,9 @@ def _register_middleware(app: FastAPI, settings: Settings) -> None:
 def _register_routers(app: FastAPI, settings: Settings) -> None:
     # Liveness/readiness live at the root, unversioned, for orchestrator probes.
     app.include_router(health.router)
+    # Inbound webhooks are also unversioned: the URL belongs to somebody else's
+    # system, and a version in it would mean asking them to change it (Phase 9).
+    app.include_router(routes_hooks.router)
     # Versioned business API.
     app.include_router(api_v1_router, prefix=settings.api_v1_prefix)
 

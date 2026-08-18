@@ -22,6 +22,7 @@ from app.core.config import Settings
 from app.domain.nodes.registry import NodeRegistry
 from app.services.auth_service import AuthService
 from app.services.run_service import RunService
+from app.services.webhook_service import WebhookService
 from app.services.workflow_service import WorkflowService
 
 
@@ -92,3 +93,12 @@ async def get_session(container: ContainerDep) -> AsyncIterator[AsyncSession]:
 
 
 SessionDep = Annotated[AsyncSession, Depends(get_session)]
+
+
+def get_webhook_service(container: ContainerDep) -> WebhookService:
+    """Expose the inbound-webhook use case to the public hooks route."""
+
+    return container.webhook_service
+
+
+WebhookServiceDep = Annotated[WebhookService, Depends(get_webhook_service)]

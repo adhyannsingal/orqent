@@ -27,7 +27,7 @@ forbidden.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import assert_never
@@ -208,14 +208,70 @@ class RunService:
         its active version is not ``PUBLISHED``.
         """
 
-        async with self._unit_of_work_factory() as uow:
+        async def whoever_asked(uow: SqlAlchemyUnitOfWork) -> int:
             caller = await self._caller(uow, current_user)
-            workflow = await self._workflow(uow, caller, workflow_public_id)
+            return caller.organization_id
+
+        return await self._create(
+            workflow_public_id, whoever_asked, trigger_payload=trigger_payload
+        )
+
+    async def create_triggered_run(
+        self,
+        workflow_public_id: str,
+        organization_id: int,
+        *,
+        trigger_payload: Mapping[str, object] | None = None,
+    ) -> Run:
+        """Materialize a run that something other than a person asked for.
+
+        The webhook receiver's entry point (Phase 9, M4), and the sibling of
+        :meth:`advance_claimed_run`: same use case, same transaction, no caller.
+
+        **No synthetic user, deliberately.** A request arriving at
+        ``POST /hooks/{token}`` has no user behind it — the credential is the
+        token, and the tenant comes from the registration it resolves. Inventing
+        an ``AuthenticatedUser`` to satisfy the signature would fail anyway
+        (``_caller`` looks the account up and refuses one that does not exist),
+        and inventing a *row* to make it succeed would put a person's name on a
+        run nobody started. The audit trail would then be a fiction, which is
+        worse than admitting there is no user.
+
+        Tenancy is not relaxed. ``organization_id`` comes from the registration
+        and scopes the workflow lookup exactly as a caller's would, so a token
+        cannot reach a workflow outside the tenant that registered it.
+        """
+
+        async def the_registrations_tenant(_: SqlAlchemyUnitOfWork) -> int:
+            return organization_id
+
+        return await self._create(
+            workflow_public_id, the_registrations_tenant, trigger_payload=trigger_payload
+        )
+
+    async def _create(
+        self,
+        workflow_public_id: str,
+        resolve_organization: Callable[[SqlAlchemyUnitOfWork], Awaitable[int]],
+        *,
+        trigger_payload: Mapping[str, object] | None,
+    ) -> Run:
+        """Materialize a run for a tenant, however it was asked for.
+
+        Takes a *resolver* rather than an organization id so that working out
+        whose run this is happens **inside** the transaction that creates it.
+        One use case, one unit of work — an invariant this service is tested on,
+        and one that resolving the caller separately would quietly break.
+        """
+
+        async with self._unit_of_work_factory() as uow:
+            organization_id = await resolve_organization(uow)
+            workflow = await self._workflow(uow, organization_id, workflow_public_id)
             version = await self._published_version(uow, workflow)
 
             run = await uow.runs.add(
                 Run(
-                    organization_id=caller.organization_id,
+                    organization_id=organization_id,
                     workflow_id=workflow.id,
                     workflow_version_id=version.id,
                     status=RunStatus.PENDING,
@@ -233,7 +289,7 @@ class RunService:
             await uow.node_executions.add_all(
                 [
                     NodeExecution(
-                        organization_id=caller.organization_id,
+                        organization_id=organization_id,
                         run_id=run.id,
                         workflow_node_id=node.id,
                         status=NodeExecutionStatus.PENDING,
@@ -245,7 +301,7 @@ class RunService:
 
             await uow.run_events.append(
                 RunEvent(
-                    organization_id=caller.organization_id,
+                    organization_id=organization_id,
                     run_id=run.id,
                     seq=await uow.run_events.next_seq(run.id),
                     event_type=RunEventType.RUN_STARTED,
@@ -260,7 +316,7 @@ class RunService:
             # version is safe: commit the run first and a crash leaves a run
             # nothing will ever pick up; commit the task first and a crash
             # leaves a task pointing at a run that does not exist.
-            await uow.queue_tasks.enqueue(run.id, caller.organization_id)
+            await uow.queue_tasks.enqueue(run.id, organization_id)
 
             await uow.commit()
 
@@ -1023,15 +1079,21 @@ class RunService:
             raise AuthenticationError("This account no longer exists.")
         return caller
 
-    async def _workflow(self, uow: SqlAlchemyUnitOfWork, caller: User, public_id: str) -> Workflow:
-        """Load a workflow the caller's organization owns, or raise.
+    async def _workflow(
+        self, uow: SqlAlchemyUnitOfWork, organization_id: int, public_id: str
+    ) -> Workflow:
+        """Load a workflow this organization owns, or raise.
+
+        Takes the organization rather than the caller because not every path
+        here has one: a webhook-triggered run acts for the tenant its
+        registration names, with no user involved (Phase 9, M4).
 
         Another tenant's workflow is reported as **not found**, never as
         forbidden: a 403 would confirm the ID names something real, which is
         exactly the fact tenant isolation exists to withhold.
         """
 
-        workflow = await uow.workflows.get_by_public_id(public_id, caller.organization_id)
+        workflow = await uow.workflows.get_by_public_id(public_id, organization_id)
         if workflow is None:
             raise NotFoundError("This workflow does not exist.")
         return workflow

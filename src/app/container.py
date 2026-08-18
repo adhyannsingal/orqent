@@ -29,6 +29,7 @@ from app.infrastructure.security.token_service import JwtTokenService
 from app.infrastructure.worker import FixedLeasePolicy, Worker, new_worker_id
 from app.services.auth_service import AuthService
 from app.services.run_service import RunService
+from app.services.webhook_service import WebhookService
 from app.services.workflow_service import WorkflowService
 
 
@@ -47,6 +48,7 @@ class Container:
         self._run_service: RunService | None = None
         self._task_queue: TaskQueue | None = None
         self._lease_policy: LeasePolicy | None = None
+        self._webhook_service: WebhookService | None = None
 
     @property
     def settings(self) -> Settings:
@@ -182,6 +184,19 @@ class Container:
         if self._run_service is None:
             self._run_service = RunService(self.unit_of_work, self.node_registry)
         return self._run_service
+
+    @property
+    def webhook_service(self) -> WebhookService:
+        """The inbound-webhook use case.
+
+        Given ``run_service`` rather than the queue: a webhook asks for a run
+        through exactly the boundary a person does, so there is one execution
+        path and Phase 8 keeps owning it.
+        """
+
+        if self._webhook_service is None:
+            self._webhook_service = WebhookService(self.unit_of_work, self.run_service)
+        return self._webhook_service
 
     @property
     def lease_policy(self) -> LeasePolicy:
