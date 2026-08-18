@@ -42,6 +42,7 @@ from app.domain.graph.model import GraphEdge
 from app.domain.graph.validation import ValidationReport, validate_graph
 from app.domain.nodes.registry import NodeRegistry
 from app.domain.value_objects.authenticated_user import AuthenticatedUser
+from app.infrastructure.db.models.schedule import Schedule
 from app.infrastructure.db.models.trigger_registration import ACTIVE, TriggerRegistration
 from app.infrastructure.db.models.user import User
 from app.infrastructure.db.models.workflow import Workflow
@@ -53,7 +54,7 @@ from app.infrastructure.db.unit_of_work import SqlAlchemyUnitOfWork
 # webhook triggers, while the scheduler stays node-type agnostic (ADR-014,
 # enforced by the architecture guard, which covers `domain/engine` and
 # `run_service` — not this module).
-from app.infrastructure.nodes.builtin import trigger_webhook
+from app.infrastructure.nodes.builtin import trigger_schedule, trigger_webhook
 from app.infrastructure.security.token_hashing import hash_token
 from app.infrastructure.security.webhook_token import new_webhook_token
 
@@ -457,11 +458,18 @@ class WorkflowService:
             workflow.active_version_id = draft.id
 
             # In this transaction, deliberately. A published workflow whose
-            # webhook address is missing — or an address repointed at a version
-            # whose publication then rolled back — are both states the system
-            # must not be able to reach, and the only thing that guarantees it is
-            # sharing the unit of work publication already had.
-            webhook_token = await self._register_webhook_trigger(uow, workflow, draft)
+            # webhook address is missing, an address repointed at a version whose
+            # publication then rolled back, a schedule that fires for a version
+            # that was never published — all states the system must not be able
+            # to reach, and the only thing that guarantees it is sharing the unit
+            # of work publication already had.
+            #
+            # Loaded once and handed to both: a version has one trigger node, and
+            # asking the database twice for the same list in the same transaction
+            # would only invite the two answers to differ.
+            nodes = await uow.workflow_versions.list_nodes(draft.id)
+            webhook_token = await self._register_webhook_trigger(uow, workflow, nodes)
+            await self._register_schedule_trigger(uow, workflow, nodes)
 
             await uow.commit()
 
@@ -469,7 +477,7 @@ class WorkflowService:
             return PublishResult(version=draft, webhook_token=webhook_token)
 
     async def _register_webhook_trigger(
-        self, uow: SqlAlchemyUnitOfWork, workflow: Workflow, version: WorkflowVersion
+        self, uow: SqlAlchemyUnitOfWork, workflow: Workflow, nodes: Sequence[WorkflowNode]
     ) -> str | None:
         """Point this workflow's webhook address at the version just published.
 
@@ -494,7 +502,6 @@ class WorkflowService:
           life because somebody published again.
         """
 
-        nodes = await uow.workflow_versions.list_nodes(version.id)
         hook = next(
             (node for node in nodes if node.node_type == trigger_webhook.DESCRIPTOR.node_type),
             None,
@@ -521,6 +528,67 @@ class WorkflowService:
             )
         )
         return token
+
+    async def _register_schedule_trigger(
+        self, uow: SqlAlchemyUnitOfWork, workflow: Workflow, nodes: Sequence[WorkflowNode]
+    ) -> None:
+        """Point this workflow's schedule at the version just published.
+
+        The same three cases as the webhook, and they resolve the same way — but
+        for a different reason worth stating, because the *reason* is what makes
+        the shapes match rather than a copied structure.
+
+        A registration is repointed rather than replaced because its token is a
+        URL a customer already configured. A schedule has no such external
+        identity; it is repointed because the alternative — a row per published
+        version — would leave every superseded schedule with a ``next_run_at``
+        permanently in the past, and the dispatcher's index is a range scan over
+        exactly that column. One row per workflow keeps that index containing
+        only schedules that can still fire.
+
+        * **No schedule trigger in the published version.** Nothing happens. Any
+          existing schedule is left pointing into a version that is no longer
+          active, so it stops being eligible on its own — the derived-liveness
+          rule, so there is no flag to forget to clear.
+        * **A schedule trigger, and no schedule yet.** Create one, due at the
+          expression's next occurrence.
+        * **A schedule trigger, and a schedule already.** Repoint it and
+          **recompute** ``next_run_at``.
+
+        Recomputed, not preserved, and that is the one real decision here. The
+        cron expression is part of the version being published, so a republish
+        may have changed it; keeping the old due time would run the workflow once
+        more on a schedule its author had already edited away. Publishing is a
+        deliberate act, and "next occurrence after this publish" is the only
+        answer that is true of the graph that now exists.
+        """
+
+        trigger = next(
+            (node for node in nodes if node.node_type == trigger_schedule.DESCRIPTOR.node_type),
+            None,
+        )
+        if trigger is None:
+            return
+
+        # Through the descriptor's own model, so the expression a schedule is
+        # seeded from is the one graph validation already accepted — and an
+        # invalid one could never reach here, because publishing validates first.
+        config = trigger_schedule.ScheduleTriggerConfig.model_validate(trigger.config)
+        due = trigger_schedule.next_occurrence(config.cron, datetime.now(UTC))
+
+        existing = await uow.schedules.get_for_workflow(workflow.id, workflow.organization_id)
+        if existing is not None:
+            existing.workflow_node_id = trigger.id
+            existing.next_run_at = due
+            return
+
+        await uow.schedules.add(
+            Schedule(
+                organization_id=workflow.organization_id,
+                workflow_node_id=trigger.id,
+                next_run_at=due,
+            )
+        )
 
     # --- Versions -----------------------------------------------------------
 

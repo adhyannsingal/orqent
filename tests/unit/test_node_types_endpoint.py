@@ -27,6 +27,7 @@ PATH = "/api/v1/node-types"
 EXPECTED_ORDER = [
     "trigger.manual@1",
     "trigger.webhook@1",
+    "trigger.schedule@1",
     "core.constant@1",
     "core.noop@1",
     "core.log@1",
@@ -194,6 +195,23 @@ def test_log_publishes_its_level_choices(catalogue: list[dict[str, object]]) -> 
 
     assert "$defs" in schema or "enum" in str(schema)
     assert "debug" in str(schema)
+
+
+def test_the_schedule_trigger_publishes_its_expression(
+    catalogue: list[dict[str, object]],
+) -> None:
+    # The builder renders the cron field from this, and its default is what a
+    # freshly dropped schedule node shows before anyone configures it.
+    schedule = next(i for i in catalogue if i["type"] == "trigger.schedule")
+    schema = schedule["config_schema"]
+    assert isinstance(schema, dict)
+
+    assert schema["properties"]["cron"]["type"] == "string"
+    assert schema["properties"]["cron"]["default"] == "0 0 * * *"
+    assert schema["properties"]["cron"]["maxLength"] == 128
+    # No timezone: the platform is UTC throughout, and a field here would
+    # promise a capability the schema does not have.
+    assert set(schema["properties"]) == {"cron"}
 
 
 # --- Handles ----------------------------------------------------------------

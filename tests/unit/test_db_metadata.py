@@ -29,9 +29,11 @@ def test_exactly_the_expected_tables_exist() -> None:
         "run_events",
         # Phase 8 queue; its own metadata lives in tests/unit/test_queue_metadata.py.
         "queue_tasks",
-        # Phase 9 triggers; its own metadata lives in
-        # tests/unit/test_trigger_registration_metadata.py.
+        # Phase 9 triggers; their own metadata lives in
+        # tests/unit/test_trigger_registration_metadata.py and
+        # tests/unit/test_schedule_metadata.py.
         "trigger_registrations",
+        "schedules",
     }
 
 

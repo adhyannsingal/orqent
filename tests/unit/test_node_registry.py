@@ -24,6 +24,7 @@ from app.infrastructure.nodes.builtin import (
     core_log,
     core_noop,
     trigger_manual,
+    trigger_schedule,
     trigger_webhook,
 )
 from app.infrastructure.nodes.registry import DuplicateNodeTypeError, InMemoryNodeRegistry
@@ -31,6 +32,7 @@ from app.infrastructure.nodes.registry import DuplicateNodeTypeError, InMemoryNo
 BUILT_IN_NAMES = (
     "trigger.manual@1",
     "trigger.webhook@1",
+    "trigger.schedule@1",
     "core.constant@1",
     "core.noop@1",
     "core.log@1",
@@ -238,9 +240,10 @@ def test_the_catalogue_spans_the_incompatibility_case() -> None:
 def test_the_built_in_triggers_are_the_ones_we_meant(registry: NodeRegistry) -> None:
     # Pinned so a new trigger type is a *deliberate* addition, exactly as the
     # single-trigger version of this test intended. `trigger.webhook@1` arrived
-    # in Phase 9 M1; a workflow still declares exactly one of them.
+    # in Phase 9 M1 and `trigger.schedule@1` in M5; a workflow still declares
+    # exactly one of them.
     triggers = [d.qualified_name for d in registry.all() if d.is_trigger]
-    assert triggers == ["trigger.manual@1", "trigger.webhook@1"]
+    assert triggers == ["trigger.manual@1", "trigger.webhook@1", "trigger.schedule@1"]
 
 
 # --- Runners ----------------------------------------------------------------
@@ -275,6 +278,53 @@ async def test_webhook_trigger_hands_over_the_payload_unchanged() -> None:
 
     assert isinstance(result, Completed)
     assert result.outputs["main"] == payload
+
+
+async def test_schedule_trigger_hands_over_the_payload_unchanged() -> None:
+    """Like every trigger, it carries data in rather than deciding anything.
+
+    In particular it consults no clock. By the time this runs, the schedule has
+    already fired and a run already exists — the runner is the ordinary first
+    node of an ordinary run, which is why it is deterministic and testable with
+    no database, no queue, and no time at all.
+    """
+
+    payload = {"fired_at": "2026-08-19T00:00:00Z"}
+    result = await trigger_schedule.RUNNER.run(
+        NodeRunContext(
+            config=trigger_schedule.ScheduleTriggerConfig(),
+            inputs={},
+            idempotency_key="1:1:1",
+            trigger_payload=payload,
+        )
+    )
+
+    assert isinstance(result, Completed)
+    assert result.outputs["main"] == payload
+
+
+async def test_the_schedule_runner_is_deterministic() -> None:
+    """Two invocations of the same context give the same answer.
+
+    Worth pinning rather than assuming: a scheduling node is exactly where a
+    ``datetime.now()`` would be tempting, and at-least-once delivery means this
+    runner *will* sometimes be invoked twice for one firing (ADR-024). If it read
+    a clock, the two attempts would disagree about what the run was started with.
+    """
+
+    context = NodeRunContext(
+        config=trigger_schedule.ScheduleTriggerConfig(),
+        inputs={},
+        idempotency_key="1:1:1",
+        trigger_payload={"n": 1},
+    )
+
+    first = await trigger_schedule.RUNNER.run(context)
+    second = await trigger_schedule.RUNNER.run(context)
+
+    assert isinstance(first, Completed)
+    assert isinstance(second, Completed)
+    assert first.outputs == second.outputs
 
 
 async def test_a_webhook_trigger_started_with_no_payload_emits_none() -> None:
