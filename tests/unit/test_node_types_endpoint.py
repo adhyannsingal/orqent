@@ -26,6 +26,7 @@ PATH = "/api/v1/node-types"
 
 EXPECTED_ORDER = [
     "trigger.manual@1",
+    "trigger.webhook@1",
     "core.constant@1",
     "core.noop@1",
     "core.log@1",

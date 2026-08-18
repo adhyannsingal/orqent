@@ -26,6 +26,7 @@ from app.infrastructure.nodes.builtin import (
     core_noop,
     core_wait,
     trigger_manual,
+    trigger_webhook,
 )
 from app.infrastructure.nodes.registry import InMemoryNodeRegistry
 
@@ -33,6 +34,7 @@ from app.infrastructure.nodes.registry import InMemoryNodeRegistry
 # things you connect to them.
 _BUILT_INS: Final[tuple[tuple[NodeDescriptor, NodeRunner], ...]] = (
     (trigger_manual.DESCRIPTOR, trigger_manual.RUNNER),
+    (trigger_webhook.DESCRIPTOR, trigger_webhook.RUNNER),
     (core_constant.DESCRIPTOR, core_constant.RUNNER),
     (core_noop.DESCRIPTOR, core_noop.RUNNER),
     (core_log.DESCRIPTOR, core_log.RUNNER),
