@@ -28,6 +28,8 @@ from pathlib import Path
 import pytest
 
 import app
+from app.infrastructure.db import models  # noqa: F401  (registers tables)
+from app.infrastructure.db.base import Base
 from app.infrastructure.nodes import build_registry
 
 SRC = Path(app.__file__).parent
@@ -338,3 +340,138 @@ def test_the_node_type_guard_actually_has_types_to_check() -> None:
 
     assert len(_NODE_TYPES) >= 5
     assert "core.wait" in _NODE_TYPES
+
+
+# --- Phase 9: triggers must not smuggle mechanics into the graph -------------
+#
+# Phase 9 gave the platform two ways to start a run without a user — an HTTP
+# request and a clock. Both are the kind of feature that leaks: the easy place to
+# put "fire at 10:00" is the node that says "I fire at 10:00", and the easy way to
+# start a run for nobody is to invent a nobody. These pin the boundaries that
+# were argued for instead.
+
+_TRIGGER_RUNNERS = (
+    "infrastructure/nodes/builtin/trigger_manual.py",
+    "infrastructure/nodes/builtin/trigger_webhook.py",
+    "infrastructure/nodes/builtin/trigger_schedule.py",
+)
+
+# What a *runner* must not do. A node is handed everything it needs in its
+# context; reaching past that makes it untestable, non-deterministic, or both —
+# and at-least-once delivery (ADR-024) means a runner that reads a clock gives
+# two different answers for one firing.
+_RUNNER_FORBIDDEN = (
+    "uow",
+    "session",
+    "queue",
+    "repositor",
+    "httpx",
+    "requests",
+    "Schedule",
+    "TriggerRegistration",
+)
+
+
+def _runner_body(path: Path) -> str:
+    """The source of every ``run`` method in a module, comments and docstrings
+    stripped — so prose *about* clocks does not count as touching one."""
+
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    bodies: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.AsyncFunctionDef | ast.FunctionDef) and node.name == "run":
+            stripped = ast.parse(ast.unparse(node))
+            for inner in ast.walk(stripped):
+                if isinstance(inner, ast.Expr) and isinstance(inner.value, ast.Constant):
+                    inner.value.value = ""
+            bodies.append(ast.unparse(stripped))
+    return "\n".join(bodies)
+
+
+@pytest.mark.parametrize("module", _TRIGGER_RUNNERS)
+def test_a_trigger_runner_contains_no_dispatch_mechanics(module: str) -> None:
+    """A trigger emits what it was given. It does not decide *that* it fires."""
+
+    body = _runner_body(SRC / module)
+    assert body, f"{module} has no run method to check"
+
+    found = [word for word in _RUNNER_FORBIDDEN if word in body]
+    assert not found, f"{module}'s runner reaches for {found}"
+
+
+@pytest.mark.parametrize("module", _TRIGGER_RUNNERS)
+def test_a_trigger_runner_does_not_read_the_clock(module: str) -> None:
+    """The one that would look most reasonable in a schedule trigger.
+
+    A run is invoked at least once and may be re-invoked after a crash
+    (ADR-024). A runner that read the clock would report a different
+    ``scheduled_for`` on the retry than the occurrence it was actually dispatched
+    for — so the moment is decided once, by the dispatcher, and carried in.
+    """
+
+    body = _runner_body(SRC / module)
+
+    for reading in ("now(", "utcnow", "time()", "monotonic"):
+        assert reading not in body, f"{module}'s runner reads the clock via {reading}"
+
+
+def _constructs(path: Path, name: str) -> bool:
+    """Whether this module *calls* ``name``.
+
+    Asked of the AST rather than the text, so an import or a type annotation does
+    not count — only actually building one does.
+    """
+
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    return any(
+        isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == name
+        for node in ast.walk(tree)
+    )
+
+
+def test_only_authentication_constructs_an_authenticated_user() -> None:
+    """No synthetic users on the webhook, worker, or dispatcher paths.
+
+    All three act for a tenant with no person behind them, and the tempting fix
+    is to invent an ``AuthenticatedUser`` to satisfy a signature. It would fail
+    anyway — the services look the account up — and inventing a *row* to make it
+    succeed would put someone's name on a run they did not start, turning the
+    audit trail into a fiction. The tenant comes from the registration, the
+    claimed task, or the schedule instead.
+    """
+
+    constructing = [
+        path.relative_to(SRC).as_posix()
+        for path in _modules("app")
+        if _constructs(path, "AuthenticatedUser")
+    ]
+
+    assert sorted(constructing) == [
+        # Rebuilt from a verified token.
+        "api/security.py",
+        # Issued after a password was checked.
+        "services/auth_service.py",
+    ], constructing
+
+
+def test_the_queue_and_worker_know_nothing_about_triggers() -> None:
+    """Phase 8 stayed generic. A scheduled run and a webhook-started run are
+    ordinary runs, so neither the queue nor the worker needed a word about
+    either — which is what "no second execution path" means in practice."""
+
+    for package in ("app.infrastructure.queue", "app.infrastructure.worker"):
+        for path in _modules(package):
+            code = _code_only(path)
+            for word in ("webhook", "schedule", "Schedule", "cron", "trigger"):
+                assert word not in code, f"{path.name} mentions {word}"
+
+
+def test_the_cron_expression_has_one_home() -> None:
+    """The schedule's definition lives in the published node's config, and the
+    ``schedules`` table holds only runtime state. Two copies could disagree about
+    when a workflow runs, and the row is the one that would silently win."""
+
+    columns = set(Base.metadata.tables["schedules"].c.keys())
+
+    assert "cron" not in columns
+    assert "timezone" not in columns

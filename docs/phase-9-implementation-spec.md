@@ -1,7 +1,9 @@
 # Phase 9 — Triggers: implementation specification
 
-> **Status:** M1–M6 complete. **M7 is not implemented.** Phase 9 is **not**
-> complete.
+> **Status:** **Phase 9 is COMPLETE.** All seven milestones are delivered,
+> accepted, and backed by tests. **Phase 10 — human-in-the-loop** is next per
+> `project_status.md` and is **not started**; the AI layer is Phase 12 and is
+> likewise untouched.
 >
 > This document is created at M5. M1–M4 shipped without one; their contracts are
 > summarised in §1 for context, and the authoritative record of their design is
@@ -35,7 +37,7 @@ in the registry (ADR-020, ADR-022).
 | **M4** | `POST /hooks/{token}` receiver | ✅ complete |
 | **M5** | **`trigger.schedule@1` + `schedules` + migration `0008`** | ✅ **complete** |
 | **M6** | **Schedule dispatcher — find due schedules, create and enqueue runs** | ✅ **complete** |
-| **M7** | Acceptance and documentation; close Phase 9 | ⬜ **not started** |
+| **M7** | **Acceptance, architectural review, phase closure** | ✅ **complete** |
 
 ---
 
@@ -522,3 +524,146 @@ pause/resume · timezone support · anything from Phase 10.
 
 `src/app/domain/`, `infrastructure/queue/`, and `infrastructure/worker/` are
 unchanged.
+
+
+---
+
+# M7 — acceptance and closure
+
+## 19. What M7 added
+
+No new product behaviour. One acceptance suite, nine mechanical architecture
+tests, one **corrected test**, and this section.
+
+| File | Role |
+|---|---|
+| `tests/integration/test_phase_9_acceptance.py` | Phase 9 as a system: 16 tests |
+| `tests/unit/test_architecture_boundaries.py` | +9 tests pinning §21's invariants |
+
+**Phase 9's headline claim, stated once:** Phase 8 proved a run *finishes*
+without anyone calling `advance`; Phase 9 proves a run *begins* without anyone
+calling `POST /runs`. Two things can now start one — an HTTP request carrying a
+token, and a clock — and neither has a user behind it. No acceptance test calls
+`POST /runs` or `POST /runs/{id}/advance`.
+
+The dispatcher is exercised as a **real operating-system process**
+(`python -m app.infrastructure.dispatcher`), SIGTERM'd, and asserted to exit `0`
+of its own accord. That the *child* dispatched is established from its own log
+output, not from a row appearing while it happened to be running — timing alone
+could not distinguish it from a stray process against the same database.
+
+## 20. The defect M7 found
+
+**One acceptance test was silently vacuous**, and only a deliberate mutation
+exposed it.
+
+The webhook log-redaction test first used `structlog.testing.capture_logs()`.
+That helper *replaces the processor chain*, so `merge_contextvars` never runs —
+and the bound request path, the very thing that carries the token, lives in
+contextvars. With the redaction removed from the middleware the test still
+passed. Rewritten to use `caplog`, which captures the rendered stdlib record
+including context, it now fails on the mutation.
+
+No production defect was found in M1–M6. The audit re-derived each milestone
+from the code and found the delivered behaviour matched.
+
+## 21. Architectural review
+
+Each row is enforced by a test, not asserted here.
+
+| Invariant | How it is held |
+|---|---|
+| Engine names no node type | `test_the_engine_names_no_node_type` over every engine module |
+| Engine imports no concrete node | Runners resolved through the `NodeRegistry` port |
+| Trigger runners carry no dispatch mechanics | `test_a_trigger_runner_contains_no_dispatch_mechanics` — no session, queue, repository, or HTTP in any `run` |
+| Trigger runners read no clock | `test_a_trigger_runner_does_not_read_the_clock` — at-least-once means a clock would give two answers for one firing |
+| Webhook receiving is application/infrastructure | `WebhookService` + `routes_hooks`; nothing in `domain/` |
+| Schedule dispatch is application/infrastructure | `ScheduleDispatchService` + `infrastructure/dispatcher` |
+| Queue and worker stay generic | `test_the_queue_and_worker_know_nothing_about_triggers` — neither package contains the words |
+| No synthetic users | `test_only_authentication_constructs_an_authenticated_user` — exactly two files may build one, both in authentication |
+| Published versions stay immutable | Runtime state lives in `schedules`; publishing writes new versions |
+| One home for the cron expression | `test_the_cron_expression_has_one_home` — no `cron`/`timezone` column |
+| Raw token never persisted | Only a SHA-256 digest is stored; asserted at acceptance level |
+| No second execution path | A triggered run is an ordinary run: same tables, same queue, same worker |
+
+## 22. Discrimination
+
+Seven mutations, each reverted afterwards. Every one is now caught.
+
+| Mutation | Acceptance result |
+|---|---|
+| Run is never enqueued | **6 failed** |
+| Dispatcher never claims a due schedule | **7 failed** |
+| Skip-forward degraded to one-step catch-up | **3 failed** |
+| Occurrence committed before the run is created | **1 failed** |
+| Superseded schedule stays dispatchable | **1 failed** |
+| Superseded webhook token still resolves | **2 failed** |
+| Token redaction removed | **1 failed** *(passed before the test was fixed — see §20)* |
+| Trigger runner reads the clock | **architecture suite failed** |
+| `ORDER BY` reinstated in the claim | **concurrency suite failed** (M6) |
+
+## 23. Migration review
+
+`0006 → 0007 → 0008 → 0007 → 0008`, all clean; `alembic check` reports no drift.
+Revision chain is linear and correct. Both tables verified against the **live**
+database: `utf8mb4_0900_ai_ci`, `ON DELETE CASCADE` on every foreign key, and
+exactly the intended indexes. Neither migration was modified — no defect
+warranted it.
+
+## 24. Guarantees, stated precisely
+
+**Webhook.** A delivery creates the run, its node executions, `RunStarted`, and
+the queue task in one transaction. Repeated deliveries create repeated runs —
+there is no deduplication, deliberately.
+
+**Schedule.** A claimed occurrence, the advanced `next_run_at`, the run, and the
+queue task commit together. This is **one committed run creation per claimed
+occurrence**.
+
+Neither is exactly-once execution of anything external. Delivery remains
+**at-least-once** (ADR-024): a worker may retry a run, and a node with side
+effects may therefore repeat them unless its side-effect class forbids it.
+
+## 25. Deferred, deliberately
+
+Webhook request-size limit · delivery deduplication/idempotency · registration
+management and revoke API · reverse-proxy and ASGI access-log credential
+handling · schedule timezone support · schedule management API · pause/resume ·
+catch-up policy beyond skip-forward · retry/backoff · fairness · quotas ·
+priority · node timeouts.
+
+**The one worth repeating:** a token in a URL is visible to whatever terminates
+TLS. The application no longer logs it, but a reverse proxy's access log is
+outside the application and outside M7. Fixing it means either a header-based
+credential — which many webhook senders cannot be configured for — or proxy
+configuration. It is a deployment concern, recorded rather than pretended away.
+
+## 26. Phase 9 definition of done
+
+**Webhook** — `trigger.webhook@1` · platform-generated 256-bit token · raw token
+never persisted · registration tied to publish · stable across republish ·
+inactive when removed from the active version · restored when the trigger
+returns · `POST /hooks/{token}` · body reaches the workflow · queued run · worker
+executes · tenant isolation · logs redacted. **All backed by tests.**
+
+**Schedule** — `trigger.schedule@1` · cron validated at authoring · `schedules`
+persistence · indexed `next_run_at` · lifecycle tied to publish · dispatcher
+process · `SKIP LOCKED` concurrency · skip-forward · `scheduled_for` payload ·
+atomic occurrence/run/queue transaction · worker executes · tenant isolation ·
+removal and restoration. **All backed by tests.**
+
+**Architecture** — scheduler node-type agnostic · queue generic · worker generic
+· trigger runners free of dispatch mechanics · no synthetic users · no Phase 10
+code. **All backed by architecture tests.**
+
+## 27. Phase 9 is complete
+
+Next is **Phase 10 — human-in-the-loop** (approval node, inbox API,
+authorization, timeouts) per `docs/project_status.md`. Nothing from it exists in
+this branch.
+
+The **AI layer is Phase 12**, not Phase 10, in the current plan — `ai.agent@1`,
+the `AgentRunner` port, and the LangChain adapter — with memory/RAG at Phase 13.
+Nothing from either exists here: `infrastructure/llm/` remains the empty stub
+Phase 1 created, and `langchain` appears nowhere in the source tree (an
+architecture test enforces that).

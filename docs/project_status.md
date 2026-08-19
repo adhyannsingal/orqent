@@ -3,16 +3,18 @@
 ```
 Project:        Orqent — Visual Workflow Automation Platform (backend)
 Version:        0.1.0
-Current Phase:  Phase 6 — Durable Execution Core ✅ COMPLETE (M1–M9)
-Last Updated:   2026-08-16  ·  `main` @ 5709655, working tree clean
-Status:         Healthy — Phases 1–8 complete, migrations 0001–0006 applied.
+Current Phase:  Phase 9 — Triggers ✅ COMPLETE (M1–M7)
+Last Updated:   2026-08-19  ·  `phase-9`, M7 in the working tree
+Status:         Healthy — Phases 1–9 complete, migrations 0001–0008 applied.
                 A workflow can be published, run, inspected, suspended, and
-                resumed over HTTP — and now runs **self-driving**: a worker
-                process claims queued runs and advances them, so nothing has to
-                call `POST /runs/{id}/advance`. 1877 tests (1526 default + 351
-                integration), 0 failures, 0 skips; ruff/mypy/alembic/
-                architecture green.
-Next Milestone: Phase 9 — Triggers (manual → webhook → schedule) — NOT STARTED
+                resumed over HTTP; it runs **self-driving** (a worker claims
+                queued runs); and it can now be **started by something other
+                than a person** — an inbound `POST /hooks/{token}` or a cron
+                schedule fired by a dispatcher process. 2135 tests (1641
+                default + 494 integration), 0 failures, 0 skips;
+                ruff/mypy/alembic/architecture green.
+Next Milestone: Phase 10 — Human-in-the-loop (approval node, inbox API) — NOT
+                STARTED
 ```
 
 > **Phase renumbering (2026-08-10).** Phase 5 is the **Workflow Authoring API**;
@@ -803,11 +805,19 @@ execution engine (Phase 6) is tested against a **mock `AgentRunner`**.
   in §2 of the spec — and there is **no reaper**, because reclaiming a lapsed
   lease is what an ordinary claim already does. Concurrency limits and per-org
   fairness (ADR-030) stay deferred.
-- [ ] **Phase 9 — Triggers** 🟢 *next* · *Objective:* manual → webhook → schedule;
-  registration lifecycle tied to publish. *Depends on:* 6. *Complexity:*
-  **Medium**.
-- [ ] **Phase 10 — Human-in-the-loop** · *Objective:* approval node, inbox API,
-  authorization, timeouts/escalation. *Depends on:* 6. *Complexity:* **Medium**.
+- [x] **Phase 9 — Triggers** ✅ **COMPLETE** · manual → webhook → schedule;
+  registration lifecycle tied to publish. Delivered as seven milestones:
+  `trigger.webhook@1` (M1), `trigger_registrations` + migration **0007** (M2),
+  registration lifecycle tied to publish (M3), the `POST /hooks/{token}`
+  receiver (M4), `trigger.schedule@1` + `schedules` + migration **0008** (M5),
+  the schedule dispatcher — `SKIP LOCKED`, skip-forward, atomic run creation
+  (M6), and acceptance + architectural review (M7). A third process joins the
+  API and the worker: `python -m app.infrastructure.dispatcher`.
+  Authoritative description:
+  **[phase-9-implementation-spec.md](phase-9-implementation-spec.md)**.
+- [ ] **Phase 10 — Human-in-the-loop** 🟢 *next* · *Objective:* approval node,
+  inbox API, authorization, timeouts/escalation. *Depends on:* 6.
+  *Complexity:* **Medium**.
 - [ ] **Phase 11 — Connections + I/O nodes** · *Objective:* encrypted
   connections (ADR-027); HTTP, Email, Database, File nodes behind the egress
   policy (ADR-029). *Depends on:* 6. *Complexity:* **High (security)**.
