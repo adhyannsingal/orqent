@@ -29,6 +29,23 @@ dependencies = [
     "croniter>=6.0",
     # Backs pydantic's EmailStr, which is not usable without it.
     "email-validator>=2.2",
+    # --- AI agent execution (Phase 10, M2) ---
+    # Gemini behind LangChain, and the ONLY provider dependency. `4.3` is the
+    # current major line and is the one that uses Google's current `google-genai`
+    # SDK rather than the superseded `google-generativeai`; it is pinned below
+    # `5` because a major bump may move the chat interface this adapter maps onto.
+    # Deliberately no `langchain-openai`, no Anthropic, and no LangGraph — one
+    # provider is what the POC needs, and `AgentRunner` is where a second would
+    # attach.
+    "langchain-google-genai>=4.3,<5",
+    # Arrives transitively with the above, and declared because this codebase
+    # imports its message types directly: a transitive dependency that is
+    # imported by name is a direct dependency that has not been written down.
+    "langchain-core>=1.5,<2",
+    # Same reasoning: the adapter names httpx's transport exceptions when
+    # classifying failures. It was previously a dev-only dependency because only
+    # the test client used it.
+    "httpx>=0.27",
 ]
 
 [project.optional-dependencies]
@@ -77,6 +94,14 @@ ignore = [
 
 [tool.ruff.lint.per-file-ignores]
 "tests/**" = ["PLR2004"] # magic values are fine in tests
+# The Gemini adapter imports LangChain *inside* the functions that use it. A
+# module-level import costs every process ~3 seconds of startup — the API, the
+# worker, and the dispatcher alike — and a SIGTERM arriving before the signal
+# handlers were installed then killed the process instead of stopping it
+# gracefully, which broke Phase 8's shutdown acceptance test. The deferral is
+# explained in the module docstring; this is where the linter is told it is
+# deliberate rather than an oversight.
+"src/app/infrastructure/llm/gemini_agent_runner.py" = ["PLC0415"]
 
 [tool.ruff.lint.isort]
 known-first-party = ["app"]
@@ -113,7 +138,11 @@ pythonpath = ["src"]
 # Integration tests need a live MySQL, so they are deselected by default: the
 # standard suite must stay fast and runnable with no external services.
 # Run them with: pytest -m integration
-addopts = "-q -m 'not integration'"
+addopts = "-q -m 'not integration and not gemini'"
 markers = [
     "integration: requires a live MySQL (deselected by default; run with -m integration)",
+    # Contacts Google and spends real quota, so it is never part of an ordinary
+    # run or of CI. Needs BOTH a credential and explicit opt-in — see
+    # tests/gemini/test_gemini_smoke.py.
+    "gemini: calls the real Gemini API (deselected by default; run with -m gemini)",
 ]

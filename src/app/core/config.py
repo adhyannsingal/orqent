@@ -11,7 +11,7 @@ from __future__ import annotations
 from enum import StrEnum
 from functools import lru_cache
 
-from pydantic import Field, model_validator
+from pydantic import AliasChoices, Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -32,6 +32,12 @@ class Settings(BaseSettings):
         env_file=".env",
         env_file_encoding="utf-8",
         extra="ignore",
+        # So a field carrying a `validation_alias` can still be set by its own
+        # name. Without this, `Settings(gemini_api_key=...)` is silently ignored
+        # — `extra="ignore"` swallows it — and the caller gets a default while
+        # believing they configured something. Aliases keep working; this only
+        # adds the field name alongside them.
+        populate_by_name=True,
     )
 
     # --- Core ---
@@ -82,6 +88,46 @@ class Settings(BaseSettings):
     # to match it — a dispatch is a short transaction holding a row lock, not
     # owned work that has to survive a crash.
     dispatcher_poll_interval_seconds: float = Field(default=5.0, gt=0)
+
+    # --- AI agent execution (Phase 10, M2) ---
+    gemini_api_key: SecretStr | None = Field(
+        default=None,
+        # **Deliberately not `APP_`-prefixed.** Every other setting here is
+        # Orqent's own; this one is the credential Google's own tooling, SDKs,
+        # and documentation all call `GEMINI_API_KEY`, and renaming it would mean
+        # every developer and deployment translating between two names for one
+        # secret. `validation_alias` overrides `env_prefix` for this field only.
+        validation_alias=AliasChoices("GEMINI_API_KEY"),
+    )
+    """The Gemini Developer API credential, or ``None`` when unconfigured.
+
+    ``SecretStr`` so it cannot be printed by accident: its ``repr`` and ``str``
+    are ``**********``, which means a settings dump, a traceback frame, or a
+    logged model object cannot leak it. Reading it requires
+    ``get_secret_value()``, and exactly one module does that.
+
+    **Optional, and that is a requirement rather than a convenience.** The
+    application must start, workflows must validate, the catalogue must serve,
+    and every non-AI node must run with no credential present — so this cannot be
+    mandatory. Only an attempted agent execution needs it, and that failure is
+    explicit (see ``Container.agent_runner``).
+    """
+
+    # Which model the `"default"` profile resolves to. Ordinary non-secret
+    # configuration, so it takes the `APP_` prefix like everything else.
+    #
+    # `gemini-3.5-flash`, chosen by **asking the API** rather than from memory.
+    # The first attempt used `gemini-2.5-flash`, which the credential-gated smoke
+    # test showed returns HTTP 404 — it is no longer served on this endpoint.
+    # Listing the models the Developer API actually offers, and calling the
+    # candidates, is the only way to establish that; a mocked test cannot.
+    #
+    # A *flash* model because this is a POC integration, not a quality benchmark,
+    # and it keeps smoke-test latency and quota negligible. Nothing in the code
+    # depends on the choice: it is one string, resolved in one place, and
+    # changing it is a deployment setting rather than a code change (ADR-013's
+    # provider neutrality applies to model identity too).
+    gemini_model: str = Field(default="gemini-3.5-flash", min_length=1)
 
     # --- Reserved for later phases (declared, intentionally unused now) ---
     database_url: str | None = None

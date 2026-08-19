@@ -13,6 +13,21 @@ services:
       APP_DATABASE_URL: mysql+asyncmy://app:app@mysql:3306/app
       APP_CHROMA_HOST: chroma
       APP_CHROMA_PORT: "8000"
+      # --- AI agent execution (Phase 10, M2) ---
+      # The credential is **substituted from the developer's environment or the
+      # repo-root .env**, which is git-ignored; only this placeholder is
+      # committed, so no secret ever enters the repository. Compose leaves it
+      # empty when unset, and an empty value is treated as absent — the API still
+      # starts, and only an attempted AI agent execution fails.
+      #
+      # Unprefixed, unlike every APP_ setting below it, because this is Google's
+      # own conventional variable name and translating between two names for one
+      # secret is how a developer ends up exporting the wrong one.
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      # Which model the "default" profile resolves to. Ordinary non-secret
+      # configuration, so it is committed and takes the APP_ prefix.
+      APP_GEMINI_MODEL: gemini-3.5-flash
+
       # LOCAL DEVELOPMENT PLACEHOLDER ONLY — this value is committed, so it is
       # public and must never be used anywhere real. Staging and production
       # inject their own secret from a secret manager.

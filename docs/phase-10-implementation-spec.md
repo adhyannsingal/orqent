@@ -1,7 +1,7 @@
 # Phase 10 — AI execution layer: implementation specification
 
-> **Status:** **M1 complete.** M2–M7 are **not started**. Phase 10 is **not**
-> complete.
+> **Status:** **M1 and M2 complete.** M3–M7 are **not started**. Phase 10 is
+> **not** complete.
 >
 > **Phase 10 is the final backend phase.** The frontend follows it. The backend
 > roadmap does not extend to Phase 11 or beyond.
@@ -75,7 +75,7 @@ they had already agreed. Nothing was invented.
 | Milestone | Scope | Status |
 |---|---|---|
 | **M1** | **AI execution contracts: `AgentRunner` port + `ai.agent@1` + mock adapter** | ✅ **complete** |
-| **M2** | LangChain adapter behind the port; provider credentials from settings | ⬜ not started |
+| **M2** | **LangChain + Gemini adapter behind the port; credential from settings** | ✅ **complete** |
 | **M3** | Real agent execution through the Phase 8 worker, end to end | ⬜ not started |
 | **M4** | Embeddings + document ingestion + Chroma retrieval | ⬜ not started |
 | **M5** | Agent + retrieval (RAG) through the same port | ⬜ not started |
@@ -240,3 +240,96 @@ migration was added; Phase 10 M1 touches no schema.
 | `test_the_agent_node_reaches_a_model_only_through_the_port` | The node is where a direct SDK import would be most convenient |
 | `test_no_node_configuration_can_carry_a_credential` | The whole catalogue, not just `ai.agent` — the HTTP node is next to want one |
 | `test_the_provider_detector_actually_detects` | A self-check: none of the forbidden packages is installed, so a mutation test on a real module fails at *collection* rather than at the assertion, which proves the package is absent and not that the rule works |
+
+
+---
+
+# M2 — Gemini behind the port
+
+Full detail in **[langchain.md](langchain.md)**, which ADR-013 and
+`architecture.md` referenced long before there was an implementation to describe.
+Summarised here.
+
+## 7. Provider and dependencies
+
+**Google Gemini**, via `langchain-google-genai >= 4.3, < 5` on the Gemini
+**Developer** API. That line uses Google's current `google-genai` SDK rather than
+the superseded `google-generativeai`.
+
+`langchain-core >= 1.5, < 2` and `httpx >= 0.27` are declared **directly**
+because the adapter imports their names — a transitive dependency that is
+imported by name is a direct dependency that has not been written down. `httpx`
+moved out of dev-only for that reason.
+
+No `langchain-openai`, no Anthropic, no LangGraph, no second provider.
+`AgentRunner` is where a second attaches.
+
+## 8. Credential
+
+`GEMINI_API_KEY`, unprefixed (Google's own name) via `validation_alias`, typed
+`SecretStr | None`, server-side only, and **optional** — the application starts,
+the catalogue serves, workflows validate, and every non-AI node runs without it.
+Only an agent execution needs it.
+
+Compose passes `${GEMINI_API_KEY:-}` from the developer's environment or the
+git-ignored repo-root `.env`; only the placeholder is committed.
+
+`populate_by_name=True` was added to `SettingsConfigDict`: without it,
+`Settings(gemini_api_key=...)` was **silently ignored** (`extra="ignore"` swallowed
+it) and the caller got a default while believing they had configured something.
+
+## 9. Model profile
+
+`model = "default"` in a workflow; `APP_GEMINI_MODEL` in the deployment. Unknown
+profiles are **refused, not forwarded** — forwarding would let a vendor string
+typed into a workflow reach the provider, which is the coupling the indirection
+exists to prevent.
+
+**`gemini-3.5-flash`**, chosen by asking the API. See §12.
+
+## 10. Adapter behaviour
+
+| Concern | Decision |
+|---|---|
+| Async | `ainvoke` end to end; client built **per request** so concurrent nodes cannot share mutable temperature |
+| Messages | `instructions → SystemMessage` (omitted when empty), `prompt → HumanMessage`, never concatenated |
+| Response | `AIMessage.text`, which flattens block content; empty stays empty |
+| Errors | Classified by **walking the cause chain**, never by exception type |
+| Retries | **`max_retries=0`** — the library defaults to 6, which would stack three retry layers |
+| Secrets | `SecretStr` throughout, provider message never forwarded, output scrubbed |
+
+## 11. Wiring
+
+Credential present → `GeminiAgentRunner`. Absent → `UnconfiguredAgentRunner`,
+which raises a non-retryable `AgentError`. **No fallback to the mock**: a
+deployment that forgot the credential would otherwise write plausible-looking
+text into runs, surfacing much later as output nobody could trace. A test asserts
+the container's choice — added after a mutation showed nothing else noticed when
+the wiring was changed to fall back.
+
+## 12. What the real smoke test found
+
+Gated on a credential **and** `ORQENT_GEMINI_SMOKE=1`; deselected by marker.
+It earned its place immediately by finding **two defects no mocked test could**:
+
+1. **`gemini-2.5-flash` returns HTTP 404** — retired on this endpoint. The
+   default was chosen from memory; it is now chosen by listing what the Developer
+   API actually offers and calling the candidates. Corrected to
+   `gemini-3.5-flash`.
+2. **Wrapped provider errors were misclassified.** `langchain-google-genai` wraps
+   failures in its own class with the real `APIError` as `__cause__`, so matching
+   on the outer type sent every provider rejection to "failed unexpectedly" with
+   no status code. The adapter now walks the cause chain — which also avoids
+   importing the wrapper, a private-module class free to be renamed. Three
+   regression tests pin it.
+
+**Result: 2 passed** against the live API after both fixes.
+
+## 13. Deferred
+
+Embeddings, ingestion, Chroma, RAG, tools, tool calling, LangGraph, memory,
+structured output, token accounting, streaming, a second provider, encrypted
+connections (ADR-027), and Orqent-level retry policy.
+
+M3 proves `queue → worker → scheduler → ai.agent → Gemini`; M2 stops at the node
+boundary.

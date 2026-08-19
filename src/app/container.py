@@ -24,7 +24,8 @@ from app.infrastructure.db.engine import create_engine
 from app.infrastructure.db.session import create_session_factory
 from app.infrastructure.db.unit_of_work import SqlAlchemyUnitOfWork
 from app.infrastructure.dispatcher.loop import ScheduleDispatcher
-from app.infrastructure.llm.mock_agent_runner import MockAgentRunner
+from app.infrastructure.llm.gemini_agent_runner import GeminiAgentRunner
+from app.infrastructure.llm.unconfigured_agent_runner import UnconfiguredAgentRunner
 from app.infrastructure.nodes import build_registry
 from app.infrastructure.queue.mysql_task_queue import MySqlTaskQueue
 from app.infrastructure.security.password_hasher import Argon2PasswordHasher
@@ -134,18 +135,33 @@ class Container:
     def agent_runner(self) -> AgentRunner:
         """How ``ai.agent@1`` reaches a model (ADR-013).
 
-        **A deterministic mock until M2 replaces it.** Named here rather than
-        left to ``build_registry``'s default so that the deployment's choice of
-        provider is one visible line in the composition root — when the LangChain
-        adapter arrives, this is the only place that changes, and forgetting to
-        change it is a diff, not a silence.
+        **Gemini when a credential is configured; an explicit refusal when not.**
 
-        Shared and stateless like the other ports; it holds no connection, so
-        there is nothing to isolate per request.
+        The tempting third option — fall back to the deterministic mock — is
+        deliberately absent. A deployment that simply forgot to set
+        ``GEMINI_API_KEY`` would then run agent workflows to completion and write
+        plausible-looking text into runs, and the mistake would surface much
+        later, in data, as output nobody could trace. Failing the node is worse
+        for one run and much better for everything after it. The mock remains
+        available to tests, which pass it explicitly.
+
+        Note what is *not* conditional: the application still starts, the
+        catalogue still serves, workflows still validate, and every non-AI node
+        still runs. Only invoking an agent needs the credential, so only that
+        fails.
+
+        Shared and stateless — the credential and model name are values, and the
+        provider client is built per request inside the adapter, so there is no
+        mutable client here for two concurrent agent nodes to race over.
         """
 
         if self._agent_runner is None:
-            self._agent_runner = MockAgentRunner()
+            key = self._settings.gemini_api_key
+            self._agent_runner = (
+                GeminiAgentRunner(key, self._settings.gemini_model)
+                if key is not None
+                else UnconfiguredAgentRunner()
+            )
         return self._agent_runner
 
     @property

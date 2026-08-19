@@ -26,8 +26,10 @@ from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
+from pydantic import SecretStr
 
 import app
+from app.core.config import Settings
 from app.infrastructure.db import models  # noqa: F401  (registers tables)
 from app.infrastructure.db.base import Base
 from app.infrastructure.nodes import build_registry
@@ -490,6 +492,9 @@ def test_the_cron_expression_has_one_home() -> None:
 # or the engine (ADR-003, rescoped).
 _AI_PACKAGES = (
     "langchain",
+    "langchain_google_genai",
+    "langchain_core",
+    "google",
     "langgraph",
     "openai",
     "anthropic",
@@ -600,3 +605,85 @@ def test_the_provider_detector_actually_detects(tmp_path: Path) -> None:
     innocent.write_text("from app.domain.ports.agent_runner import AgentRunner\n", encoding="utf-8")
 
     assert _ai_imports(innocent) == []
+
+
+# --- Phase 10 M2: the provider is installed now, so the guards must be real ---
+#
+# M1's guards were written while none of the forbidden packages existed in the
+# environment. That is no longer true: `langchain-google-genai` and `google-genai`
+# are installed, so an accidental import in the wrong layer would now *succeed*
+# and the guards are doing load-bearing work rather than describing an intention.
+
+_PROVIDER_FREE_PACKAGES = (
+    "app.domain",
+    "app.services",
+    "app.api",
+    "app.infrastructure.queue",
+    "app.infrastructure.worker",
+    "app.infrastructure.dispatcher",
+    "app.infrastructure.db",
+    "app.infrastructure.repositories",
+    "app.infrastructure.nodes",
+)
+
+
+@pytest.mark.parametrize("package", _PROVIDER_FREE_PACKAGES)
+def test_no_layer_but_the_adapter_imports_a_provider(package: str) -> None:
+    """Every layer the AI must not reach, named individually.
+
+    Listed rather than inferred so that a *new* package is not silently exempt:
+    adding one to `src/app` and forgetting it here is a visible omission in this
+    list, whereas a clever "everything except the adapter" rule would cover it
+    automatically and hide the decision.
+
+    `app.infrastructure.nodes` is in the list and matters most: `ai.agent@1`
+    lives there, and it is the single most convenient place to reach for the SDK
+    directly — which would make provider choice a property of a *published
+    version* rather than of the deployment.
+    """
+
+    for path in _modules(package):
+        assert not _ai_imports(path), f"{path.relative_to(SRC)} imports a provider"
+
+
+def test_the_adapter_package_is_where_the_provider_lives() -> None:
+    """The positive half. A guard that only forbids would still pass if the
+    integration were deleted, so this asserts the import is where it should be."""
+
+    adapter = SRC / "infrastructure/llm/gemini_agent_runner.py"
+    imported = _imported_names(adapter)
+
+    assert any(name.startswith("langchain_google_genai") for name in imported)
+    assert "app.domain.ports.agent_runner" in imported
+
+
+def test_the_settings_credential_is_a_secret_type() -> None:
+    """`SecretStr` is what stops a settings dump, a traceback frame, or a logged
+    model object from printing the key. A plain `str` would leak on any of
+    them."""
+
+    annotation = Settings.model_fields["gemini_api_key"].annotation
+
+    assert SecretStr in getattr(annotation, "__args__", (annotation,))
+
+
+def test_no_api_schema_exposes_the_credential() -> None:
+    """Nothing the HTTP surface returns may carry it — the credential is
+    server-side only and has no reason to appear in a response model."""
+
+    for path in _modules("app.schemas"):
+        code = _code_only(path).lower()
+        for word in ("gemini", "api_key", "apikey"):
+            assert word not in code, f"{path.name} mentions {word}"
+
+
+def test_no_workflow_configuration_can_carry_a_provider_credential() -> None:
+    """Restated for M2 in the terms that now matter: node config is JSON inside
+    an immutable published version, so a Gemini key there would be readable by
+    anyone who can read the workflow and unrotatable without republishing."""
+
+    for descriptor in build_registry().all():
+        schema = descriptor.config_model.model_json_schema()
+        rendered = str(schema).lower()
+        for word in ("gemini", "api_key", "apikey", "google_api_key"):
+            assert word not in rendered, f"{descriptor.qualified_name} config mentions {word}"
