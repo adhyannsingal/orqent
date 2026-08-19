@@ -18,7 +18,10 @@ from typing import Final
 from app.domain.nodes.descriptor import NodeDescriptor
 from app.domain.nodes.registry import NodeRegistry
 from app.domain.nodes.runner import NodeRunner
+from app.domain.ports.agent_runner import AgentRunner
+from app.infrastructure.llm.mock_agent_runner import MockAgentRunner
 from app.infrastructure.nodes.builtin import (
+    ai_agent,
     core_condition,
     core_constant,
     core_log,
@@ -46,14 +49,30 @@ _BUILT_INS: Final[tuple[tuple[NodeDescriptor, NodeRunner], ...]] = (
 )
 
 
-def build_registry() -> NodeRegistry:
+def build_registry(agents: AgentRunner | None = None) -> NodeRegistry:
     """Assemble the catalogue.
 
     Pure: no database, no settings, no I/O. That is what lets the container
     build it eagerly and every test build an identical one in a line.
+
+    ``agents`` is the one dependency any built-in has, and it belongs to
+    ``ai.agent@1`` alone — the port through which that node reaches a model
+    without importing one (ADR-013). It is optional because the seventy-odd
+    existing callers want a catalogue for *authoring*, validation, or the
+    node-type API, and never invoke a runner at all; requiring it would have
+    meant touching every one of them to say something they do not care about.
+
+    **The default is a deterministic mock, and the container passes one
+    explicitly anyway.** Defaulting keeps tests and tooling to a single line;
+    passing explicitly at the composition root means that when M2 adds a real
+    adapter, which one is in use is a visible decision in one file rather than a
+    fallback nobody notices is still in effect.
     """
 
     registry = InMemoryNodeRegistry()
     for descriptor, runner in _BUILT_INS:
         registry.register(descriptor, runner)
+    # Registered here rather than in `_BUILT_INS` because it is the only node
+    # whose runner is constructed rather than a module-level singleton.
+    registry.register(ai_agent.DESCRIPTOR, ai_agent.runner(agents or MockAgentRunner()))
     return registry

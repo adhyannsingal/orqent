@@ -34,6 +34,7 @@ EXPECTED_ORDER = [
     "core.wait@1",
     "core.condition@1",
     "core.merge@1",
+    "ai.agent@1",
 ]
 
 ITEM_KEYS = {

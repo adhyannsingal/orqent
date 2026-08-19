@@ -475,3 +475,128 @@ def test_the_cron_expression_has_one_home() -> None:
 
     assert "cron" not in columns
     assert "timezone" not in columns
+
+
+# --- Phase 10: the AI layer must not leak (ADR-013) --------------------------
+#
+# The redesign's sharpest claim is that AI is a *supporting* subdomain: an agent
+# step is dispatched, retried, and recorded by exactly the machinery that handles
+# a no-op. That claim is only true while the provider vocabulary stays behind one
+# port and one adapter package, and it is the kind of thing that erodes one
+# convenient import at a time. These make the erosion fail loudly.
+
+# LangChain and every vendor SDK. `chromadb` is here too: retrieval arrives in a
+# later Phase 10 milestone and belongs to the same adapter package, not to a node
+# or the engine (ADR-003, rescoped).
+_AI_PACKAGES = (
+    "langchain",
+    "langgraph",
+    "openai",
+    "anthropic",
+    "chromadb",
+    "chroma",
+    "tiktoken",
+    "litellm",
+    "transformers",
+)
+
+# The one package permitted to import them, when they arrive (M2 onward). Its own
+# docstring has said so since Phase 1.
+_ADAPTER_PACKAGE = "app/infrastructure/llm"
+
+
+def _ai_imports(path: Path) -> list[str]:
+    return sorted(name for name in _imported_names(path) if name.split(".")[0] in _AI_PACKAGES)
+
+
+@pytest.mark.parametrize("path", list(_modules("app")), ids=lambda p: p.name)
+def test_only_the_llm_adapter_may_import_a_provider(path: Path) -> None:
+    """ADR-013, mechanically.
+
+    Not "the engine does not import LangChain" but "**nothing** does, except one
+    package". The weaker rule is the one that rots: the tempting import is never
+    in the scheduler, it is in a node that needs "just a token count" or a
+    service that wants "just an embedding".
+    """
+
+    leaked = _ai_imports(path)
+    if leaked and _ADAPTER_PACKAGE in path.as_posix():
+        return
+    assert not leaked, f"{path.relative_to(SRC)} imports {leaked}"
+
+
+def test_the_domain_never_imports_a_provider() -> None:
+    """Stated separately from the rule above because it is the one that matters
+    most and must survive the adapter exception being edited."""
+
+    for path in _modules("app.domain"):
+        assert not _ai_imports(path), f"{path.relative_to(SRC)} reaches a provider"
+
+
+@pytest.mark.parametrize("module", _ENGINE_MODULES)
+def test_the_engine_does_not_know_the_agent_port_exists(module: str) -> None:
+    """ADR-014's strengthening, and the reason `AgentRunner` is *not* an engine
+    dependency: it is an implementation detail of one node's runner. The engine
+    depends on `NodeRunner` and resolves runners through a registry it does not
+    own."""
+
+    assert not _violations(SRC / module, ("app.domain.ports.agent_runner",))
+
+
+def test_the_agent_node_reaches_a_model_only_through_the_port() -> None:
+    """The node is where a direct SDK import would be most convenient and most
+    damaging — it would make provider choice a property of a *published version*
+    rather than of the deployment."""
+
+    node = SRC / "infrastructure/nodes/builtin/ai_agent.py"
+    imported = _imported_names(node)
+
+    assert not _ai_imports(node)
+    assert "app.domain.ports.agent_runner" in imported
+
+
+def test_no_node_configuration_can_carry_a_credential() -> None:
+    """Node config is stored in `workflow_nodes.config`: plain JSON inside an
+    immutable published version, readable by anyone who can read the workflow,
+    copied into every republish, and impossible to rotate without republishing.
+
+    Asked of the whole catalogue rather than of `ai.agent` alone, because the
+    node most likely to want an API key next is the HTTP node, and this should
+    already be failing when someone tries.
+    """
+
+    forbidden = ("api_key", "apikey", "secret", "token", "password", "credential")
+
+    for descriptor in build_registry().all():
+        for field in descriptor.config_model.model_fields:
+            lowered = field.lower().replace("_", "")
+            for word in forbidden:
+                assert word.replace("_", "") not in lowered, (
+                    f"{descriptor.qualified_name} config field {field!r} looks like a credential"
+                )
+
+
+def test_the_provider_detector_actually_detects(tmp_path: Path) -> None:
+    """A self-check, because the guards above are otherwise unfalsifiable here.
+
+    None of the forbidden packages is installed, so mutating a real module to
+    import one fails at *collection* rather than at the assertion — which proves
+    the package is absent, not that the rule works. Handing the detector a file
+    that does import one closes that gap.
+    """
+
+    offender = tmp_path / "offender.py"
+    offender.write_text(
+        "import langchain\n"
+        "from openai import OpenAI\n"
+        "import chromadb.config\n"
+        "from app.domain.nodes.runner import NodeRunner\n",
+        encoding="utf-8",
+    )
+
+    assert _ai_imports(offender) == ["chromadb.config", "langchain", "openai"]
+
+    innocent = tmp_path / "innocent.py"
+    innocent.write_text("from app.domain.ports.agent_runner import AgentRunner\n", encoding="utf-8")
+
+    assert _ai_imports(innocent) == []

@@ -15,6 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from app.core.config import Settings, get_settings
 from app.domain.nodes.registry import NodeRegistry
+from app.domain.ports.agent_runner import AgentRunner
 from app.domain.ports.password_hasher import PasswordHasher
 from app.domain.ports.task_queue import LeasePolicy, TaskQueue
 from app.domain.ports.token_service import TokenService
@@ -23,6 +24,7 @@ from app.infrastructure.db.engine import create_engine
 from app.infrastructure.db.session import create_session_factory
 from app.infrastructure.db.unit_of_work import SqlAlchemyUnitOfWork
 from app.infrastructure.dispatcher.loop import ScheduleDispatcher
+from app.infrastructure.llm.mock_agent_runner import MockAgentRunner
 from app.infrastructure.nodes import build_registry
 from app.infrastructure.queue.mysql_task_queue import MySqlTaskQueue
 from app.infrastructure.security.password_hasher import Argon2PasswordHasher
@@ -46,6 +48,7 @@ class Container:
         self._token_service: TokenService | None = None
         self._auth_service: AuthService | None = None
         self._node_registry: NodeRegistry | None = None
+        self._agent_runner: AgentRunner | None = None
         self._workflow_service: WorkflowService | None = None
         self._run_service: RunService | None = None
         self._task_queue: TaskQueue | None = None
@@ -128,6 +131,24 @@ class Container:
         return SqlAlchemyUnitOfWork(self.session_factory)
 
     @property
+    def agent_runner(self) -> AgentRunner:
+        """How ``ai.agent@1`` reaches a model (ADR-013).
+
+        **A deterministic mock until M2 replaces it.** Named here rather than
+        left to ``build_registry``'s default so that the deployment's choice of
+        provider is one visible line in the composition root — when the LangChain
+        adapter arrives, this is the only place that changes, and forgetting to
+        change it is a diff, not a silence.
+
+        Shared and stateless like the other ports; it holds no connection, so
+        there is nothing to isolate per request.
+        """
+
+        if self._agent_runner is None:
+            self._agent_runner = MockAgentRunner()
+        return self._agent_runner
+
+    @property
     def node_registry(self) -> NodeRegistry:
         """The catalogue of available node types.
 
@@ -138,7 +159,7 @@ class Container:
         """
 
         if self._node_registry is None:
-            self._node_registry = build_registry()
+            self._node_registry = build_registry(self.agent_runner)
         return self._node_registry
 
     @property

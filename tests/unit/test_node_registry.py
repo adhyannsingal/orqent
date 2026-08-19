@@ -39,6 +39,9 @@ BUILT_IN_NAMES = (
     "core.wait@1",
     "core.condition@1",
     "core.merge@1",
+    # Phase 10 M1. Last in the palette, and the only built-in whose runner takes
+    # a dependency — it reaches a model through the `AgentRunner` port.
+    "ai.agent@1",
 )
 
 # `namespace.name`, lower snake case. Keeps the catalogue readable and the
