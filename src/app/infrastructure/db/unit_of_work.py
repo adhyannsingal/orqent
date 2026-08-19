@@ -28,6 +28,10 @@ from app.infrastructure.repositories.refresh_token_repository import RefreshToke
 from app.infrastructure.repositories.role_repository import RoleRepository
 from app.infrastructure.repositories.run_event_repository import RunEventRepository
 from app.infrastructure.repositories.run_repository import RunRepository
+from app.infrastructure.repositories.schedule_repository import ScheduleRepository
+from app.infrastructure.repositories.trigger_registration_repository import (
+    TriggerRegistrationRepository,
+)
 from app.infrastructure.repositories.user_repository import UserRepository
 from app.infrastructure.repositories.workflow_repository import WorkflowRepository
 from app.infrastructure.repositories.workflow_version_repository import (
@@ -51,6 +55,8 @@ class SqlAlchemyUnitOfWork(UnitOfWork):
         self._node_executions: NodeExecutionRepository | None = None
         self._run_events: RunEventRepository | None = None
         self._queue_tasks: QueueTaskRepository | None = None
+        self._trigger_registrations: TriggerRegistrationRepository | None = None
+        self._schedules: ScheduleRepository | None = None
 
     @property
     def session(self) -> AsyncSession:
@@ -136,6 +142,34 @@ class SqlAlchemyUnitOfWork(UnitOfWork):
             self._queue_tasks = QueueTaskRepository(self.session)
         return self._queue_tasks
 
+    @property
+    def trigger_registrations(self) -> TriggerRegistrationRepository:
+        """Webhook registrations, in this transaction.
+
+        Here for the same reason the queue's enqueue is: a registration is
+        created or repointed *as part of publishing*, and a published version
+        without its webhook address — or an address pointing at a version that
+        was rolled back — is a state the system must not be able to reach.
+        """
+
+        if self._trigger_registrations is None:
+            self._trigger_registrations = TriggerRegistrationRepository(self.session)
+        return self._trigger_registrations
+
+    @property
+    def schedules(self) -> ScheduleRepository:
+        """Schedules, in this transaction.
+
+        Here for the same reason webhook registrations are: a schedule is
+        created or repointed *as part of publishing*, so a published version
+        whose schedule never appeared — or a schedule left pointing at a version
+        that was rolled back — is a state the system must not be able to reach.
+        """
+
+        if self._schedules is None:
+            self._schedules = ScheduleRepository(self.session)
+        return self._schedules
+
     # --- Lifecycle ----------------------------------------------------------
 
     async def __aenter__(self) -> Self:
@@ -167,6 +201,8 @@ class SqlAlchemyUnitOfWork(UnitOfWork):
             self._node_executions = None
             self._run_events = None
             self._queue_tasks = None
+            self._trigger_registrations = None
+            self._schedules = None
 
     async def commit(self) -> None:
         await self.session.commit()

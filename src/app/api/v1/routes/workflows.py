@@ -45,6 +45,7 @@ from app.schemas.workflows import (
     GraphRequest,
     GraphResponse,
     PublishRequest,
+    PublishResponse,
     UiPosition,
     UpdateWorkflowRequest,
     ValidationIssueEdge,
@@ -374,7 +375,7 @@ async def validate_draft(
 
 @router.post(
     "/{workflow_id}/publish",
-    response_model=VersionResponse,
+    response_model=PublishResponse,
     status_code=status.HTTP_201_CREATED,
     summary="Publish the draft as a new version",
     responses={**_ROLE_GUARDED_RESOURCE, **_CONFLICTING},
@@ -384,11 +385,17 @@ async def publish_workflow(
     payload: PublishRequest,
     current_user: CurrentUserDep,
     service: WorkflowServiceDep,
-) -> VersionResponse:
+) -> PublishResponse:
     # Authentication only. The publish rule is resource-dependent and lives in
     # the service (§1.6i, ADR-032); a role guard here would refuse the creator.
-    version = await service.publish(current_user, workflow_id, notes=payload.notes)
-    return _to_version(version)
+    result = await service.publish(current_user, workflow_id, notes=payload.notes)
+    # The one place a webhook token is readable. It is absent from every other
+    # response because, after this one, it does not exist anywhere but the
+    # caller's hands.
+    return PublishResponse(
+        **_to_version(result.version).model_dump(),
+        webhook_token=result.webhook_token,
+    )
 
 
 @router.get(

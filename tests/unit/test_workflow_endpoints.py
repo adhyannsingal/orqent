@@ -32,7 +32,12 @@ from app.infrastructure.db.models.workflow import Workflow
 from app.infrastructure.db.models.workflow_node import WorkflowNode
 from app.infrastructure.db.models.workflow_version import WorkflowVersion
 from app.main import create_app
-from app.services.workflow_service import GraphView, WorkflowSummaryView, WorkflowView
+from app.services.workflow_service import (
+    GraphView,
+    PublishResult,
+    WorkflowSummaryView,
+    WorkflowView,
+)
 
 SECRET = "workflow-endpoint-secret-long-enough"
 WORKFLOW_ID = "01WORKFLOWWORKFLOWWORKFLOW"
@@ -168,9 +173,11 @@ class FakeWorkflowService:
 
     async def publish(
         self, user: AuthenticatedUser, public_id: str, *, notes: str | None = None
-    ) -> WorkflowVersion:
+    ) -> PublishResult:
         self._record("publish", public_id=public_id, notes=notes)
-        return _version("PUBLISHED", version_no=3)
+        # `webhook_token` stays None: this workflow has no webhook trigger, which
+        # is the ordinary case. The one-time reveal has its own test.
+        return PublishResult(version=_version("PUBLISHED", version_no=3))
 
     async def list_versions(
         self, user: AuthenticatedUser, public_id: str, *, limit: int, offset: int

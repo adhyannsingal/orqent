@@ -14,6 +14,8 @@ from app.infrastructure.db.models.refresh_token import RefreshToken
 from app.infrastructure.db.models.role import Role
 from app.infrastructure.db.models.run import Run
 from app.infrastructure.db.models.run_event import RunEvent
+from app.infrastructure.db.models.schedule import Schedule
+from app.infrastructure.db.models.trigger_registration import TriggerRegistration
 from app.infrastructure.db.models.user import User
 from app.infrastructure.db.models.user_role import UserRole
 from app.infrastructure.db.models.workflow import Workflow
@@ -29,6 +31,8 @@ __all__ = [
     "Role",
     "Run",
     "RunEvent",
+    "Schedule",
+    "TriggerRegistration",
     "User",
     "UserRole",
     "Workflow",

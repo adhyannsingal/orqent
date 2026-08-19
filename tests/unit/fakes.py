@@ -34,6 +34,7 @@ from app.infrastructure.db.models.refresh_token import RefreshToken
 from app.infrastructure.db.models.role import Role
 from app.infrastructure.db.models.run import Run
 from app.infrastructure.db.models.run_event import RunEvent
+from app.infrastructure.db.models.trigger_registration import TriggerRegistration
 from app.infrastructure.db.models.user import User
 from app.infrastructure.db.models.user_role import UserRole
 from app.infrastructure.db.models.workflow import Workflow
@@ -72,6 +73,7 @@ class FakeDatabase:
     node_executions: list[NodeExecution] = field(default_factory=list)
     run_events: list[RunEvent] = field(default_factory=list)
     queue_tasks: list[QueueTask] = field(default_factory=list)
+    trigger_registrations: list[TriggerRegistration] = field(default_factory=list)
 
     pending_organizations: list[Organization] = field(default_factory=list)
     pending_users: list[User] = field(default_factory=list)
@@ -83,6 +85,7 @@ class FakeDatabase:
     pending_node_executions: list[NodeExecution] = field(default_factory=list)
     pending_run_events: list[RunEvent] = field(default_factory=list)
     pending_queue_tasks: list[QueueTask] = field(default_factory=list)
+    pending_trigger_registrations: list[TriggerRegistration] = field(default_factory=list)
 
     _next_id: int = 1
 
@@ -133,6 +136,10 @@ class FakeDatabase:
     def visible_queue_tasks(self) -> list[QueueTask]:
         return [*self.queue_tasks, *self.pending_queue_tasks]
 
+    @property
+    def visible_trigger_registrations(self) -> list[TriggerRegistration]:
+        return [*self.trigger_registrations, *self.pending_trigger_registrations]
+
     def commit(self) -> None:
         self.organizations.extend(self.pending_organizations)
         self.users.extend(self.pending_users)
@@ -144,6 +151,7 @@ class FakeDatabase:
         self.node_executions.extend(self.pending_node_executions)
         self.run_events.extend(self.pending_run_events)
         self.queue_tasks.extend(self.pending_queue_tasks)
+        self.trigger_registrations.extend(self.pending_trigger_registrations)
         self.clear_pending()
 
     def rollback(self) -> None:
@@ -160,6 +168,7 @@ class FakeDatabase:
         self.pending_node_executions.clear()
         self.pending_run_events.clear()
         self.pending_queue_tasks.clear()
+        self.pending_trigger_registrations.clear()
 
 
 # --- Repositories -----------------------------------------------------------
@@ -625,6 +634,45 @@ class FakeQueueTaskRepository:
         return len(found)
 
 
+class FakeTriggerRegistrationRepository:
+    """Webhook registrations, without a database.
+
+    ``get_for_workflow`` walks node → version → workflow exactly as the real
+    query joins, so the double cannot quietly answer a question the SQL would
+    not. What it deliberately does not model is the *live* predicate of
+    ``get_by_token_digest`` — that one turns on ``workflows.active_version_id``
+    and is proven against MySQL instead.
+    """
+
+    def __init__(self, db: FakeDatabase) -> None:
+        self._db = db
+
+    async def add(self, registration: TriggerRegistration) -> TriggerRegistration:
+        registration.id = self._db.next_id()
+        registration.public_id = registration.public_id or new_public_id()
+        self._db.pending_trigger_registrations.append(registration)
+        return registration
+
+    def _workflow_id_of(self, node_id: int) -> int | None:
+        for version_id, (nodes, _) in self._db.graphs.items():
+            if any(node.id == node_id for node in nodes):
+                version = next(
+                    (v for v in self._db.visible_workflow_versions if v.id == version_id), None
+                )
+                return version.workflow_id if version is not None else None
+        return None
+
+    async def get_for_workflow(
+        self, workflow_id: int, organization_id: int
+    ) -> TriggerRegistration | None:
+        for registration in self._db.visible_trigger_registrations:
+            if registration.organization_id != organization_id:
+                continue
+            if self._workflow_id_of(registration.workflow_node_id) == workflow_id:
+                return registration
+        return None
+
+
 class FakeUnitOfWork:
     """Mirrors ``SqlAlchemyUnitOfWork``: exit rolls back what was not committed."""
 
@@ -648,6 +696,7 @@ class FakeUnitOfWork:
         self.node_executions = node_execution_repository or FakeNodeExecutionRepository(db)
         self.run_events = run_event_repository or FakeRunEventRepository(db)
         self.queue_tasks = FakeQueueTaskRepository(db)
+        self.trigger_registrations = FakeTriggerRegistrationRepository(db)
         self.commit_calls = 0
         self.rollback_calls = 0
         self.entered = 0

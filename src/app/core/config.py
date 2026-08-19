@@ -74,6 +74,15 @@ class Settings(BaseSettings):
     # How long an idle worker waits before asking for work again.
     worker_poll_interval_seconds: float = Field(default=1.0, gt=0)
 
+    # --- Schedule dispatcher (Phase 9, M6) ---
+    # How long an idle dispatcher waits before looking for due schedules again.
+    # Longer than the worker's, because it bounds *lateness* rather than
+    # throughput: a schedule fires at most this long after it comes due, and
+    # cron's finest granularity is a minute. There is deliberately no lease TTL
+    # to match it — a dispatch is a short transaction holding a row lock, not
+    # owned work that has to survive a crash.
+    dispatcher_poll_interval_seconds: float = Field(default=5.0, gt=0)
+
     # --- Reserved for later phases (declared, intentionally unused now) ---
     database_url: str | None = None
     chroma_host: str | None = None

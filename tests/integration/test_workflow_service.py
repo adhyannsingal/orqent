@@ -116,7 +116,7 @@ async def test_create_edit_validate_publish_edit_again(
     report = await service.validate_draft(caller, workflow.public_id)
     assert report.is_valid
 
-    first = await service.publish(caller, workflow.public_id)
+    first = (await service.publish(caller, workflow.public_id)).version
     assert first.version_no == 1
     assert first.status == "PUBLISHED"
     assert (await service.get(caller, workflow.public_id)).workflow.active_version_id == first.id
@@ -134,7 +134,7 @@ async def test_create_edit_validate_publish_edit_again(
         nodes=[*_valid_graph()[0], _node("extra", "core.constant", x=300)],
         edges=_valid_graph()[1],
     )
-    second = await service.publish(caller, workflow.public_id)
+    second = (await service.publish(caller, workflow.public_id)).version
 
     assert second.version_no == 2
     assert (await service.get(caller, workflow.public_id)).workflow.active_version_id == second.id
@@ -148,7 +148,7 @@ async def test_a_published_graph_is_unchanged_by_later_draft_edits(
     service = service_factory
     workflow = (await service.create(caller, name="W")).workflow
     await _fill_draft(service, caller, workflow.public_id)
-    published = await service.publish(caller, workflow.public_id)
+    published = (await service.publish(caller, workflow.public_id)).version
 
     draft = (await service.get_draft(caller, workflow.public_id)).version
     await service.replace_draft(
@@ -380,6 +380,6 @@ async def test_the_creator_may_publish_as_a_plain_member(
         organization_id=caller.organization_id,
         roles=frozenset({"member"}),
     )
-    version = await service.publish(as_member, workflow.public_id)
+    version = (await service.publish(as_member, workflow.public_id)).version
 
     assert version.status == "PUBLISHED"

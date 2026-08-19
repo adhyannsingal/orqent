@@ -11,7 +11,7 @@ from __future__ import annotations
 import re
 
 import pytest
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, ValidationError
 
 from app.domain.nodes import handles
 from app.domain.nodes.descriptor import NodeCategory, NodeDescriptor, NodeDisplay
@@ -19,11 +19,20 @@ from app.domain.nodes.registry import NodeRegistry, UnknownNodeTypeError
 from app.domain.nodes.result import Completed, NodeResult
 from app.domain.nodes.runner import NodeRunContext, NodeRunner
 from app.infrastructure.nodes import build_registry
-from app.infrastructure.nodes.builtin import core_constant, core_log, core_noop, trigger_manual
+from app.infrastructure.nodes.builtin import (
+    core_constant,
+    core_log,
+    core_noop,
+    trigger_manual,
+    trigger_schedule,
+    trigger_webhook,
+)
 from app.infrastructure.nodes.registry import DuplicateNodeTypeError, InMemoryNodeRegistry
 
 BUILT_IN_NAMES = (
     "trigger.manual@1",
+    "trigger.webhook@1",
+    "trigger.schedule@1",
     "core.constant@1",
     "core.noop@1",
     "core.log@1",
@@ -169,6 +178,39 @@ def test_manual_trigger_shape() -> None:
     assert descriptor.output("main").type == handles.JSON  # type: ignore[union-attr]
 
 
+def test_webhook_trigger_shape() -> None:
+    descriptor = trigger_webhook.DESCRIPTOR
+
+    assert descriptor.is_trigger
+    assert descriptor.inputs == ()  # a trigger starts the graph
+    assert descriptor.output("main") is not None
+    # The same type the manual trigger emits, so everything already connected
+    # downstream of a trigger accepts a webhook one unchanged.
+    assert descriptor.output("main").type == handles.JSON  # type: ignore[union-attr]
+
+
+def test_a_webhook_trigger_has_nothing_to_configure() -> None:
+    """The address is the platform's to mint, not the author's to choose.
+
+    A user-selected token is a guessable token, and an unauthenticated receiver
+    has nothing else protecting it — so there is deliberately no field here to
+    put one in. ``extra="forbid"`` is what makes that a refusal rather than a
+    silently ignored key.
+    """
+
+    assert trigger_webhook.WebhookTriggerConfig().model_dump() == {}
+    with pytest.raises(ValidationError):
+        trigger_webhook.WebhookTriggerConfig(token="guess-me")  # type: ignore[call-arg]
+
+
+def test_the_two_triggers_are_distinct_node_types() -> None:
+    """Same behaviour today, different identities — which is the whole point:
+    the type is what M2's registration and M4's receiver key off."""
+
+    assert trigger_webhook.DESCRIPTOR.node_type != trigger_manual.DESCRIPTOR.node_type
+    assert trigger_webhook.DESCRIPTOR.category is trigger_manual.DESCRIPTOR.category
+
+
 def test_constant_emits_text() -> None:
     # Text rather than Json is what makes constant -> log a legal connection.
     assert core_constant.DESCRIPTOR.output("main").type == handles.TEXT  # type: ignore[union-attr]
@@ -195,11 +237,13 @@ def test_the_catalogue_spans_the_incompatibility_case() -> None:
     assert core_log.DESCRIPTOR.input("main").type == handles.TEXT  # type: ignore[union-attr]
 
 
-def test_exactly_one_built_in_is_a_trigger(registry: NodeRegistry) -> None:
-    # Workflows require exactly one trigger node, so a second trigger type would
-    # not break anything — but today there is one, and the count is worth
-    # pinning so a new one is a deliberate addition.
-    assert sum(1 for d in registry.all() if d.is_trigger) == 1
+def test_the_built_in_triggers_are_the_ones_we_meant(registry: NodeRegistry) -> None:
+    # Pinned so a new trigger type is a *deliberate* addition, exactly as the
+    # single-trigger version of this test intended. `trigger.webhook@1` arrived
+    # in Phase 9 M1 and `trigger.schedule@1` in M5; a workflow still declares
+    # exactly one of them.
+    triggers = [d.qualified_name for d in registry.all() if d.is_trigger]
+    assert triggers == ["trigger.manual@1", "trigger.webhook@1", "trigger.schedule@1"]
 
 
 # --- Runners ----------------------------------------------------------------
@@ -217,6 +261,87 @@ async def test_manual_trigger_completes_on_its_output_handle() -> None:
 
     assert isinstance(result, Completed)
     assert "main" in result.outputs
+
+
+async def test_webhook_trigger_hands_over_the_payload_unchanged() -> None:
+    """A trigger carries data into the graph; it does not interpret it."""
+
+    payload = {"order": 7, "nested": {"deep": True}}
+    result = await trigger_webhook.RUNNER.run(
+        NodeRunContext(
+            config=trigger_webhook.WebhookTriggerConfig(),
+            inputs={},
+            idempotency_key="1:1:1",
+            trigger_payload=payload,
+        )
+    )
+
+    assert isinstance(result, Completed)
+    assert result.outputs["main"] == payload
+
+
+async def test_schedule_trigger_hands_over_the_payload_unchanged() -> None:
+    """Like every trigger, it carries data in rather than deciding anything.
+
+    In particular it consults no clock. By the time this runs, the schedule has
+    already fired and a run already exists — the runner is the ordinary first
+    node of an ordinary run, which is why it is deterministic and testable with
+    no database, no queue, and no time at all.
+    """
+
+    payload = {"fired_at": "2026-08-19T00:00:00Z"}
+    result = await trigger_schedule.RUNNER.run(
+        NodeRunContext(
+            config=trigger_schedule.ScheduleTriggerConfig(),
+            inputs={},
+            idempotency_key="1:1:1",
+            trigger_payload=payload,
+        )
+    )
+
+    assert isinstance(result, Completed)
+    assert result.outputs["main"] == payload
+
+
+async def test_the_schedule_runner_is_deterministic() -> None:
+    """Two invocations of the same context give the same answer.
+
+    Worth pinning rather than assuming: a scheduling node is exactly where a
+    ``datetime.now()`` would be tempting, and at-least-once delivery means this
+    runner *will* sometimes be invoked twice for one firing (ADR-024). If it read
+    a clock, the two attempts would disagree about what the run was started with.
+    """
+
+    context = NodeRunContext(
+        config=trigger_schedule.ScheduleTriggerConfig(),
+        inputs={},
+        idempotency_key="1:1:1",
+        trigger_payload={"n": 1},
+    )
+
+    first = await trigger_schedule.RUNNER.run(context)
+    second = await trigger_schedule.RUNNER.run(context)
+
+    assert isinstance(first, Completed)
+    assert isinstance(second, Completed)
+    assert first.outputs == second.outputs
+
+
+async def test_a_webhook_trigger_started_with_no_payload_emits_none() -> None:
+    """`None` is distinct from `{}`: "started with nothing" and "started with an
+    empty object" are different facts, and the run row stores them differently."""
+
+    result = await trigger_webhook.RUNNER.run(
+        NodeRunContext(
+            config=trigger_webhook.WebhookTriggerConfig(),
+            inputs={},
+            idempotency_key="1:1:1",
+            trigger_payload=None,
+        )
+    )
+
+    assert isinstance(result, Completed)
+    assert result.outputs["main"] is None
 
 
 async def test_constant_returns_its_configured_value() -> None:
