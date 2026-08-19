@@ -22,6 +22,7 @@ from app.domain.value_objects.lease import WorkerId
 from app.infrastructure.db.engine import create_engine
 from app.infrastructure.db.session import create_session_factory
 from app.infrastructure.db.unit_of_work import SqlAlchemyUnitOfWork
+from app.infrastructure.dispatcher.loop import ScheduleDispatcher
 from app.infrastructure.nodes import build_registry
 from app.infrastructure.queue.mysql_task_queue import MySqlTaskQueue
 from app.infrastructure.security.password_hasher import Argon2PasswordHasher
@@ -29,6 +30,7 @@ from app.infrastructure.security.token_service import JwtTokenService
 from app.infrastructure.worker import FixedLeasePolicy, Worker, new_worker_id
 from app.services.auth_service import AuthService
 from app.services.run_service import RunService
+from app.services.schedule_dispatch_service import ScheduleDispatchService
 from app.services.webhook_service import WebhookService
 from app.services.workflow_service import WorkflowService
 
@@ -49,6 +51,7 @@ class Container:
         self._task_queue: TaskQueue | None = None
         self._lease_policy: LeasePolicy | None = None
         self._webhook_service: WebhookService | None = None
+        self._schedule_dispatch_service: ScheduleDispatchService | None = None
 
     @property
     def settings(self) -> Settings:
@@ -233,6 +236,36 @@ class Container:
             worker_id or new_worker_id(),
             poll_interval_seconds=self._settings.worker_poll_interval_seconds,
             heartbeat_interval_seconds=self._settings.worker_heartbeat_interval_seconds,
+        )
+
+    @property
+    def schedule_dispatch_service(self) -> ScheduleDispatchService:
+        """The use case that fires one due schedule.
+
+        Given ``run_service`` rather than the queue, for the same reason
+        ``webhook_service`` is: a schedule asks for a run through exactly the
+        boundary a person does, so there is one execution path and Phase 8 keeps
+        owning what happens next.
+        """
+
+        if self._schedule_dispatch_service is None:
+            self._schedule_dispatch_service = ScheduleDispatchService(
+                self.unit_of_work, self.run_service
+            )
+        return self._schedule_dispatch_service
+
+    def schedule_dispatcher(self) -> ScheduleDispatcher:
+        """Build a dispatcher loop.
+
+        A factory rather than a property, matching ``worker`` — a loop is a
+        running thing with a stop switch, and two callers sharing one would mean
+        either could stop the other. Unlike a worker it carries no identity,
+        because a dispatch owns nothing beyond its transaction.
+        """
+
+        return ScheduleDispatcher(
+            self.schedule_dispatch_service,
+            poll_interval_seconds=self._settings.dispatcher_poll_interval_seconds,
         )
 
     async def dispose(self) -> None:

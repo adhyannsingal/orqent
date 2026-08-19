@@ -1,7 +1,7 @@
 # Phase 9 — Triggers: implementation specification
 
-> **Status:** M1–M5 complete. **M6 and M7 are not implemented.** Phase 9 is
-> **not** complete.
+> **Status:** M1–M6 complete. **M7 is not implemented.** Phase 9 is **not**
+> complete.
 >
 > This document is created at M5. M1–M4 shipped without one; their contracts are
 > summarised in §1 for context, and the authoritative record of their design is
@@ -34,7 +34,7 @@ in the registry (ADR-020, ADR-022).
 | **M3** | Registration repository; lifecycle tied to publish | ✅ complete |
 | **M4** | `POST /hooks/{token}` receiver | ✅ complete |
 | **M5** | **`trigger.schedule@1` + `schedules` + migration `0008`** | ✅ **complete** |
-| **M6** | Schedule dispatcher — find due schedules, create and enqueue runs | ⬜ **not started** |
+| **M6** | **Schedule dispatcher — find due schedules, create and enqueue runs** | ✅ **complete** |
 | **M7** | Acceptance and documentation; close Phase 9 | ⬜ **not started** |
 
 ---
@@ -244,7 +244,11 @@ handful a table scan is genuinely cheaper and the question would be vacuous.
 
 ---
 
-## 7. How the schema prepares M6 — without implementing it
+## 7. How the schema prepared M6
+
+> Written at M5, before the dispatcher existed. It held up: M6 needed no schema
+> change, no new column, and no second locking mechanism. **One correction** — the
+> claim query must carry no ``ORDER BY``; see §11.
 
 M6 must, atomically: **(1)** identify a due schedule, **(2)** prevent a competing
 dispatcher from firing the same occurrence, **(3)** advance the due time, and
@@ -281,14 +285,10 @@ independent connections in contention and shows exactly one claims and
 `next_run_at` advances exactly once. That claim-and-advance lives in the test
 suite and **nowhere in `src`** — M6 owns the production version.
 
-### Open for M6: catch-up or skip-forward
+### Resolved in M6: skip-forward
 
-Advancing by exactly one occurrence does **not** guarantee a lagging schedule
-leaves the due window: a schedule an hour behind on a five-minute cron is still
-due after one advance, so it is claimed again immediately and replays the
-backlog. M5 takes no position — a strictly-monotonic single-occurrence advance is
-the honest primitive, and both policies are built from it. **M6 must choose**,
-and a test records the behaviour so the choice is deliberate.
+M5 left open whether a lagging schedule should replay its missed occurrences or
+skip to the next one. **M6 chose skip-forward** — see §12.
 
 ---
 
@@ -322,3 +322,203 @@ catch-up policy.
 
 `src/app/domain/`, `src/app/infrastructure/queue/`, and
 `src/app/infrastructure/worker/` are untouched. Nothing from Phase 10 exists.
+
+
+---
+
+# M6 — the schedule dispatcher
+
+## 10. What M6 added
+
+A third process. The API accepts and records, the Phase 8 worker advances runs,
+and the dispatcher *starts* them on a clock.
+
+```
+due schedule → claim → advance → RunService → queue task → worker → workflow runs
+```
+
+**No second execution path.** A scheduled run is an ordinary run: same `runs`
+row, same node executions, same `RunStarted`, same `queue_tasks` entry. A worker
+cannot tell it apart from one a person started, and nothing in the engine or the
+queue changed to accommodate it.
+
+Three responsibilities, kept apart:
+
+| Component | Decides |
+|---|---|
+| **Dispatcher** (M6) | *when* a run is created |
+| Engine scheduler (Phase 6) | *what node runs next* |
+| Phase 8 worker | *executes* queued runs |
+
+| File | Role |
+|---|---|
+| `repositories/schedule_repository.py` | `claim_due()` — the locking select |
+| `services/schedule_dispatch_service.py` | `dispatch_one()` — one claim, one run, one transaction |
+| `infrastructure/dispatcher/loop.py` | poll · act · idle · stop |
+| `infrastructure/dispatcher/__main__.py` | `python -m app.infrastructure.dispatcher` |
+
+## 11. The claim
+
+```sql
+SELECT schedules.*, workflows.public_id, workflow_nodes.config
+  FROM schedules
+  JOIN workflow_nodes    ON workflow_nodes.id = schedules.workflow_node_id
+  JOIN workflow_versions ON workflow_versions.id = workflow_nodes.workflow_version_id
+  JOIN workflows         ON workflows.id = workflow_versions.workflow_id
+ WHERE schedules.next_run_at <= :now
+   AND workflows.active_version_id = workflow_versions.id
+   AND workflows.deleted_at IS NULL
+ LIMIT 1
+   FOR UPDATE OF schedules SKIP LOCKED
+```
+
+Three details are load-bearing, and two of them are easy to get wrong.
+
+**`OF schedules`.** Without it MySQL locks the joined `workflows`,
+`workflow_versions`, and `workflow_nodes` rows too — so dispatching a schedule
+would block anyone *publishing* that workflow. A scheduler quietly taking locks
+on authoring is invisible until it deadlocks in production.
+
+**No `ORDER BY` — this was a fix, not a simplification.** A locking read locks
+every row it *examines*, and an `ORDER BY` forces MySQL to sort before applying
+`LIMIT`. The first dispatcher therefore locked the entire due set and returned
+one row, leaving every other dispatcher to skip all of them and find nothing.
+
+> **Measured:** six dispatchers against six due schedules claimed **one** row
+> between them with `ORDER BY next_run_at, id`; **six** without it. The sort
+> silently converted a parallel dispatcher into a serial one. A regression test
+> pins this, and reinstating the `ORDER BY` fails it.
+
+Ordering is not lost, only unpromised: the predicate is a range scan over
+`ix_schedules_next_run_at`, so InnoDB walks ascending and the most overdue is met
+first. Nothing depends on the guarantee, and no schedule can starve — a row is
+passed over only while another short transaction holds it.
+
+**Liveness re-checked inside the claim**, not before it, so a workflow
+republished without its schedule trigger cannot be dispatched by a transaction
+that read eligibility a moment earlier. M5's derived rule, unchanged: no `ACTIVE`
+or `ENABLED` column was added.
+
+## 12. Skip-forward
+
+`next_run_at` is computed from **the dispatcher's `now`**, never from the stale
+stored value.
+
+| | |
+|---|---|
+| cron | `*/5 * * * *` |
+| stored `next_run_at` | 10:00 |
+| dispatcher wakes | 10:27 |
+| runs created | **one** |
+| `scheduled_for` | `2026-08-19T10:00:00+00:00` |
+| new `next_run_at` | **10:30** |
+
+10:05 through 10:25 are **not** replayed. Advancing from the stale value instead
+would leave `next_run_at` in the past and the next poll would claim it again —
+catch-up by accident, turning an outage into a backlog storm rather than a
+resumed schedule.
+
+## 13. The trigger payload
+
+```json
+{ "scheduled_for": "2026-08-19T10:00:00+00:00" }
+```
+
+The occurrence that was claimed, read before the row is advanced. Nothing about
+the machinery: no schedule id, cron expression, workflow id, attempt count, or
+dispatcher identity. A trigger payload is a published contract that is hard to
+take back, and those are the platform's business, not the author's.
+
+**Timestamp format.** Explicitly offset-qualified, which is a deliberate
+divergence from the naive form the API renders elsewhere. This value is read by
+whoever draws the workflow, in a downstream node, possibly against a timestamp
+from another system; making them infer that the platform is UTC is how
+off-by-hours bugs get authored.
+
+## 14. The transaction boundary
+
+**One transaction, four effects, all or none:** the claim's row lock, the
+advanced `next_run_at`, the run (with node executions and `RunStarted`), and the
+queue task.
+
+This required the one new application seam in M6:
+`RunService.create_scheduled_run(uow, …)` — the only method there that joins a
+transaction the caller already owns and does **not** commit. Opening a second
+unit of work would have put the claim and the run in different transactions,
+which is exactly the split the boundary exists to prevent. It was extracted by
+splitting the existing `_create` into `_materialize` (writes) plus a committing
+wrapper; every other caller is unchanged, and "one transaction per use case"
+still holds.
+
+The two failures this rules out:
+
+- **advance committed, run never created** — the occurrence is consumed and the
+  workflow silently does not run; and
+- **run committed, advance rolled back** — the same occurrence fires again.
+
+No synthetic user. The schedule row establishes the tenant, exactly as the
+webhook registration does (M4).
+
+## 15. Crash behaviour
+
+**Before commit** — MySQL rolls the transaction back and releases the lock.
+`next_run_at` is untouched, so another dispatcher claims the same occurrence and
+tries again. A transient fault costs a poll interval, not an occurrence.
+
+**After commit** — the run, the queue task, and the new due time are already
+durable, and Phase 8 owns what happens next.
+
+**No lease, deliberately.** A worker holds a run for as long as the work takes,
+so its claim must survive a crash and needs a heartbeat and an expiry. A
+dispatch is a handful of statements, so an ordinary row lock covers it and dying
+releases it by ending the transaction. There is no dispatcher lease TTL setting.
+
+This guarantees **one committed run creation per claimed occurrence**. It does
+**not** claim exactly-once execution of anything external — that stays
+at-least-once (ADR-024), because a worker may still retry the run.
+
+## 16. Process and settings
+
+```
+python -m app.infrastructure.dispatcher
+```
+
+A separate process from the worker, not a flag on it: both are loops over a
+database, but one holds a run for minutes and the other a row lock for
+milliseconds, and merging them would let a slow node delay every schedule.
+
+Stops on SIGINT/SIGTERM by setting an event, so a dispatch in flight commits
+rather than being torn out mid-transaction; the idle wait is on that event rather
+than a flat sleep, so shutdown is immediate. It creates no background tasks —
+there is no heartbeat to leak.
+
+**Drains before idling:** a successful dispatch loops straight round, because a
+poll that found one due schedule usually finds more.
+
+One setting: `APP_DISPATCHER_POLL_INTERVAL_SECONDS` (default `5.0`). It bounds
+*lateness*, not throughput — cron's finest granularity is a minute.
+
+A failed dispatch is logged and treated as idle. The occurrence was not consumed,
+so retrying instantly would spin at full speed on the same broken row; idling
+gives free backoff without inventing a retry policy.
+
+## 17. Test coverage
+
+| File | Proves |
+|---|---|
+| `unit/test_schedule_dispatcher.py` | Loop shape: drains, idles, survives a failure, stops cleanly, leaks no tasks; payload rendering |
+| `integration/test_schedule_dispatch.py` | All four effects together; skip-forward; on-time and future occurrences; derived liveness; atomicity on failure; tenancy |
+| `integration/test_schedule_dispatch_concurrency.py` | Six competing dispatchers on independent connections; distribution; the payload arriving through a **real Phase 8 worker** |
+
+The concurrency tests hold the row lock open inside the dispatch transaction. Without
+that, six dispatchers would simply take turns and "only one run was created" would be
+satisfied by an implementation with no locking at all.
+
+## 18. Not in M6
+
+M7 (Phase 9 acceptance and closure) · retry, backoff, quotas, fairness,
+priority · delivery or execution history · schedule management API ·
+pause/resume · timezone support · anything from Phase 10.
+
+`src/app/domain/`, `infrastructure/queue/`, and `infrastructure/worker/` are
+unchanged.
