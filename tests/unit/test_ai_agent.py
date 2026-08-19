@@ -310,12 +310,33 @@ async def test_a_failure_never_looks_like_an_empty_answer() -> None:
 
 def test_the_port_names_no_provider() -> None:
     """`AgentRequest` is plain data. If a provider's vocabulary appeared here it
-    would cross the boundary the moment a node read it."""
+    would cross the boundary the moment a node read it.
+
+    The field sets are pinned so that widening this contract is a deliberate,
+    reviewed edit rather than a drift — M6 added three fields and had to come
+    here to say so.
+    """
 
     fields = set(AgentRequest.__dataclass_fields__)
 
-    assert fields == {"instructions", "prompt", "model", "temperature", "idempotency_key"}
-    assert set(AgentOutcome.__dataclass_fields__) == {"text"}
+    assert fields == {
+        "instructions",
+        "prompt",
+        "model",
+        "temperature",
+        "idempotency_key",
+        # M6. Provider-neutral: a definition Orqent owns, and the exchange so
+        # far — neither borrows a shape from an SDK.
+        "tools",
+        "completed_tools",
+    }
+    assert set(AgentOutcome.__dataclass_fields__) == {"text", "tool_calls"}
+
+    # The pin above says *which* fields; this says what none of them may be
+    # named after, which is the rule the pin exists to protect.
+    forbidden = ("gemini", "google", "langchain", "openai", "anthropic", "function_call")
+    for name in fields | set(AgentOutcome.__dataclass_fields__):
+        assert not any(vendor in name.lower() for vendor in forbidden), name
 
 
 def test_the_request_and_outcome_are_frozen() -> None:
@@ -431,4 +452,5 @@ def test_the_config_is_an_ordinary_pydantic_model() -> None:
         "model",
         "temperature",
         "retrieval",
+        "tools",
     }

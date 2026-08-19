@@ -79,7 +79,7 @@ they had already agreed. Nothing was invented.
 | **M3** | **Real agent execution through the Phase 8 worker, end to end** | ✅ **complete** |
 | **M4** | **Embeddings + document ingestion + Chroma retrieval** | ✅ **complete** |
 | **M5** | **Agent + retrieval (RAG): tenant-scoped grounding inside `ai.agent@1`** | ✅ **complete** |
-| **M6** | The minimum tool execution the POC needs | ⬜ not started |
+| **M6** | **Provider-neutral tools and tool calling inside `ai.agent@1`** | ✅ **complete** |
 | **M7** | Backend acceptance, documentation, and **backend closure** | ⬜ not started |
 
 One refinement against the working structure: **M2 must also settle where the
@@ -936,3 +936,277 @@ Tools, tool calling, `bind_tools`, function calling, MCP, agent loops, and
 LangGraph — all M6. Structured output, citations, reranking, hybrid search,
 `memory_collections`, per-document scoping, a public ingestion API, and retrieval
 caching remain deferred.
+
+---
+
+# M6 — tools and tool calling
+
+M5 let an agent *know* things. M6 lets it *do* one:
+
+```
+ai.agent@1 ─┬─ KnowledgeRetriever → Chroma            (M5, optional)
+            └─ AgentRunner → Gemini
+                   ↓ asks for a tool
+               ToolRegistry → argument validation → the tool
+                   ↓ result
+               AgentRunner → Gemini → final Text
+```
+
+The whole exchange happens **inside one ordinary node execution**, at one
+attempt. The engine, scheduler, queue, worker, and dispatcher gained nothing and
+know no tool vocabulary.
+
+## 50. What the repository had already reserved
+
+`src/app/infrastructure/tools/` existed as an **empty, committed package** — a
+placeholder from the pre-redesign design, whose ADR-012 notes still mention a
+deferred `tool_id` foreign key from the era when tools were a database table.
+M6 fills that directory and does **not** revive the table: ADR-022 settled that
+the catalogue is code, and a tool is the same kind of thing as a node type.
+
+The 2026-07-29 redesign also floated "agent tools are sub-workflows" as a
+candidate ADR, explicitly not a decision. M6 does not take it up. It remains
+open, and nothing here forecloses it — a `workflow.call` tool would be one more
+entry in the same registry.
+
+## 51. The contract
+
+| Type | Role |
+|---|---|
+| `ToolDefinition` | name, description, Pydantic `parameters`, `side_effect` |
+| `ToolCall` | what the model asked for — `call_id`, `name`, `arguments`, all untrusted |
+| `CompletedToolCall` | a finished round: the call, and its rendered result |
+| `Tool` | `definition` + `async execute(arguments) -> object` |
+| `ToolRegistry` | stable name → trusted implementation |
+
+**`parameters` is a Pydantic class, not a JSON-Schema dict**, and that is the
+load-bearing choice: the same object generates the schema the provider is shown
+*and* validates what comes back, so the shown and enforced schemas cannot drift.
+
+`ToolRegistry` is concrete rather than a port. `NodeRegistry` is a port because
+the *engine* resolves runners through it; nothing here has a second
+implementation or an inward consumer to insulate. A test builds a real registry
+holding fake tools, which exercises the same lookup and refusal paths a fake
+registry would have stubbed out.
+
+## 52. `AgentRunner` grew, and this is the second time the prediction was tested
+
+M1 predicted that later capabilities could widen `AgentRequest` without the
+engine noticing. M5 did not widen it at all — retrieval needs the tenant and the
+node's config, so it composes *above* the port. **M6 does widen it**, because a
+tool call is part of the model's own turn-taking: the provider decides to make
+one, so the layer above cannot simulate the conversation without inventing it.
+
+```python
+AgentRequest(..., tools=(), completed_tools=())
+AgentOutcome(text, tool_calls=())
+```
+
+**Option A — widen `AgentOutcome`** — was chosen over a closed union
+(`FinalAnswer | ToolRequest`, the shape `NodeResult` uses). The deciding argument
+is that **providers genuinely return both**: Gemini commonly emits a sentence of
+filler alongside its function calls. A union would force the adapter to discard
+that text and would model a tidiness the wire does not have. The precedence rule
+is stated once — *non-empty `tool_calls` means this is a tool round and `text` is
+not an answer* — and `is_tool_request` reads it. Defaults keep every M1–M5 call
+site and both non-tool adapters unchanged.
+
+**The loop is not in the port.** `AgentRunner.run` describes *one turn*.
+Orchestration, argument validation, and the round limit live in provider-neutral
+code, so a provider adapter cannot decide which tools are allowed and a second
+provider inherits every rule for free.
+
+## 53. `tools` — an explicit allow-list
+
+```python
+class AgentConfig(BaseModel):
+    ...
+    tools: tuple[str, ...] = ()   # ← M6
+```
+
+**Names only — never a schema, an endpoint, or a credential.** Choosing from a
+catalogue is a very different trust proposition from *describing* a capability,
+and only the first is on offer (ADR-022, one level down).
+
+**Empty by default**, so a pre-M6 config parses unchanged, is offered no tools,
+and never reaches the tool machinery. An explicit list rather than "everything
+installed": an agent that silently gained a capability because a release added
+one would be an agent whose published behaviour changed without a republish.
+
+Unknown names are refused at **publish**, anchored at
+`nodes.<key>.config.tools`. Duplicates collapse **keeping first occurrence** —
+the order is the order the model is shown the tools in, and that is the author's
+decision; sorting would quietly override it.
+
+Validation runs against `CATALOGUE`, a **module-level constant** built at
+import. This differs from the node registry, which is per-container, and the
+difference is principled: a node's runner needs injected dependencies, so which
+nodes exist is a property of the *deployment*; a tool needs nothing injected, so
+which tools exist is a property of the *release*. That is what makes
+authoring-time validation honest — a version that publishes in one environment
+cannot fail to resolve a tool in another.
+
+No tools API was added. `/node-types` already carries the config JSON Schema,
+which is what a builder needs.
+
+## 54. The first tool: `calculator`
+
+`calculate(a, b, operation ∈ {add, subtract, multiply, divide})`, and nothing
+else. Chosen to prove the mechanism, not to be useful: deterministic (so an
+assertion is about plumbing, not about a model's mood), obviously verifiable,
+and `PURE` — no network, no filesystem, no database, no tenant, no credential,
+nothing to clean up.
+
+`operation` is a closed set rather than a free expression string. "Evaluate this
+expression" would need a parser and with it an entire injection surface.
+
+## 55. Side effects and at-least-once
+
+**The registry refuses to register a non-`PURE` tool.** M6 enforces the
+restriction rather than documenting it.
+
+Execution is at-least-once (ADR-024): a recovered agent execution calls the model
+again, which may request the same tool again. For a pure tool that is free. For
+anything that sends, charges, or writes it is a duplicate, and the machinery that
+would make it safe — idempotency threaded to the external system, connections,
+approvals — is deliberately not in this milestone. **No exactly-once claim is
+made about tool execution.**
+
+## 56. Nothing the provider says is trusted
+
+Arguments are validated against Orqent's own copy of the schema before anything
+runs. A provider asserting that its arguments match the schema it was given is
+not evidence — it is the same provider's output.
+
+The failure kinds are deliberately *not* alike:
+
+| Condition | Outcome | Why |
+|---|---|---|
+| Tool not in this agent's allow-list | **Node fails** | The model was only shown its permitted tools; asking for another means the binding is wrong |
+| Tool unknown to the registry | **Node fails** | Same |
+| Arguments fail validation | **Error result to the model** | Ordinary model fallibility, self-correctable |
+| Tool raises `ToolError` | **Error result to the model** | `1 / 0` deserves "undefined", not a failed run |
+| Provider fails | **Node fails**, adapter's `retryable` preserved | Unchanged from M2 |
+| Round limit exceeded | **Node fails** | See below |
+
+Neither path fabricates a result. The model is told what went wrong, or the node
+fails; it is never handed a plausible answer to a call that did not happen.
+
+## 57. The loop is bounded
+
+`MAX_TOOL_ROUNDS = 5` — a count of *rounds*, so the model is called at most six
+times. Without a ceiling, a model that keeps requesting tools (confused, stuck on
+an error it cannot act on, or steered by injected text) would spend the
+deployment's quota until something else broke.
+
+Exhausting the rounds **fails the node** rather than answering from the
+commentary attached to the last request: that text is not an answer, it is a
+remark about a call that never ran.
+
+The bound is pinned to a literal in its own test. An earlier mutation raising it
+to 500 passed the entire suite, because every assertion was written in terms of
+the constant — the tests moved with it.
+
+## 58. LangChain and Gemini — verified, not remembered
+
+Verified against the installed `langchain-core 1.5.6` and
+`langchain-google-genai 4.3.4`: `bind_tools` accepts a sequence including plain
+dicts; `AIMessage.tool_calls` is the normalised return path;
+`ToolMessage(tool_call_id=...)` carries a result back.
+
+The adapter passes **plain OpenAI-style function declarations**, not LangChain
+`BaseTool` objects or `@tool`-decorated callables. Those bind a *Python function*
+for LangChain to invoke, which is exactly the arrangement M6 must not have:
+execution, argument validation, and the allow-list belong to Orqent. LangChain is
+told what the tools look like; it is never told how to run one.
+
+The exchange is rebuilt from `completed_tools` on every turn rather than kept in
+a chat session, because an agent execution can be re-attempted on another worker
+and state inside a client would not survive that. `bind_tools` returns a *new*
+runnable rather than mutating the client, which is what makes one adapter
+instance safe for two concurrent agents with different allow-lists.
+
+**Tool results are `ToolMessage`, never `SystemMessage`.** A tool result is data
+the model asked for; the system turn is what the author wrote.
+
+## 59. RAG and tools compose
+
+All four combinations work: neither, RAG only, tools only, both. Retrieval
+happens **once, before the loop**, so the augmented prompt is carried unchanged
+through every subsequent turn — a tool round that dropped it would silently
+un-ground the agent halfway through the conversation.
+
+Retrieved documents stay contextual data; tool results stay tool-result data;
+the author's `instructions` remain the system instruction throughout.
+
+## 60. Tenancy
+
+M5's rule is unchanged: `NodeRunContext.organization_public_id` is authoritative.
+The calculator needs no tenant, but the execution contract is shaped so a future
+tenant-aware tool receives trusted runtime context rather than accepting identity
+from model arguments. A guard asserts no shipped tool's schema declares an
+organization field, so a model cannot redirect a tool by asking.
+
+## 61. Observability — what M6 deliberately did not add
+
+**No `ToolStarted` / `ToolCompleted` / `ToolFailed` events, and no tool-call
+table.** Tool turns are internal to one node invocation, and the engine's event
+vocabulary is unchanged.
+
+**The limitation, stated plainly:** an operator can see that a tool-using agent
+succeeded or failed and what it finally answered, but *not* which tools it
+called, with what arguments, or how many rounds it took. For a POC where a tool
+conversation is short and the only tool is a calculator, that is an acceptable
+trade against adding an engine event type and a table to the durable schema.
+It is the first thing to revisit when a tool does something a user can be billed
+for or surprised by.
+
+## 62. Guards added
+
+- The engine, queue, worker, and dispatcher contain **no tool vocabulary**
+  (`tool`, `function_call`, `bind_tools`) in their source text.
+- The engine and `RunService` do not import `app.domain.tools` or
+  `app.infrastructure.tools`.
+- No tool implementation imports a provider; the tool contract names none.
+- `bind_tools`, `AIMessage`, `ToolMessage`, and `function_declarations` appear
+  **only** in `app/infrastructure/llm`.
+- No node configuration — including nested models — may declare a `schema`,
+  `parameters`, `endpoint`, `url`, `code`, `script`, or `command` field.
+- No shipped tool's arguments may name an organization.
+- Every shipped tool is `PURE`.
+
+## 63. What proved it
+
+Ten mutations, each reverted, each caught:
+
+| Mutation | Caught by |
+|---|---|
+| Allow-list ignored | 4 offline, 1 runtime |
+| Argument validation bypassed | 9 offline |
+| Tool result omitted from the next turn | 12 offline, 8 runtime |
+| Round limit raised to 500 | 1 offline *(after the pin below)* |
+| Round-limit branch disabled | 3 offline |
+| Non-tool agent given every tool | 2 offline, 2 runtime |
+| RAG context dropped once tools appear | 1 offline, 1 runtime |
+| Tool failure rendered as a success | 9 offline |
+| Tenant field added to a tool schema | 3 offline, 1 architecture |
+| LangChain type used in the node | 4 architecture |
+
+**Two of these found real weaknesses in the tests rather than in the code**,
+which is the reason for doing them:
+
+- *Round limit raised to 500* passed everything. Every assertion about the bound
+  was written in terms of `MAX_TOOL_ROUNDS`, so the tests moved with the
+  constant. Fixed by pinning it to a literal in `test_the_round_limit_is_a_pinned_decision`.
+- *Provider type leaked* passed on the first attempt because the mutation put
+  `bind_tools` in a **string literal**, and `_code_only` strips strings by
+  design. That was an unrealistic mutation, not a hole: re-run as an actual
+  `from langchain_core.messages import AIMessage` plus a use, it fails four
+  guards.
+
+## 64. Not in M6
+
+Arbitrary HTTP, database, shell, Python, or filesystem tools · Gmail · Slack ·
+GitHub · MCP · connections and secrets · OAuth · any external side-effecting
+action · human approval · a durable tool-call ledger · billing and quotas ·
+retry/backoff · LangGraph · long-running agent loops · tools as sub-workflows.

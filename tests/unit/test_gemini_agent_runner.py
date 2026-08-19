@@ -28,6 +28,7 @@ from app.core.config import Environment, Settings
 from app.domain.nodes.result import Completed, Failed
 from app.domain.nodes.runner import NodeRunContext
 from app.domain.ports.agent_runner import AgentError, AgentRequest
+from app.domain.tools.contract import CompletedToolCall, ToolCall, ToolDefinition
 from app.infrastructure.llm.gemini_agent_runner import (
     REDACTED,
     GeminiAgentRunner,
@@ -37,6 +38,8 @@ from app.infrastructure.llm.gemini_agent_runner import (
 from app.infrastructure.llm.mock_agent_runner import MockAgentRunner
 from app.infrastructure.llm.unconfigured_agent_runner import UnconfiguredAgentRunner
 from app.infrastructure.nodes import build_registry
+from app.infrastructure.tools import build_tool_registry
+from app.infrastructure.tools.builtin.calculator import NAME as CALCULATOR
 
 # Obviously fake, and never a real credential. Tests must never carry one.
 FAKE_KEY = SecretStr("test-key-not-a-real-credential")
@@ -76,6 +79,21 @@ class _Client:
         self._provider = provider
         self.kwargs = kwargs
         self.seen: list[Any] | None = None
+        self.bound: list[Any] | None = None
+
+    def bind_tools(self, tools: list[Any]) -> _Client:
+        """Record the declarations and return a *new* client.
+
+        New rather than ``self``, mirroring what LangChain actually does — which
+        is the property that makes one adapter instance safe for two concurrent
+        agents with different allow-lists. A fake that mutated in place would
+        hide a real concurrency bug.
+        """
+
+        bound = _Client(self._provider, self.kwargs)
+        bound.bound = tools
+        self._provider.clients.append(bound)
+        return bound
 
     async def ainvoke(self, messages: list[Any]) -> Any:
         self.seen = messages
@@ -708,3 +726,170 @@ def test_an_unconfigured_application_still_starts() -> None:
     assert "ai.agent@1" in catalogue
     assert "trigger.manual@1" in catalogue
     assert container.settings.gemini_api_key is None
+
+
+# =============================================================================
+# Tool calling (Phase 10, M6)
+# =============================================================================
+#
+# Offline discrimination for the adapter's half of M6. The gated live test proves
+# Gemini accepts what is generated here; these prove *what* is generated, which
+# is the part that must not drift and the part a shared, exhaustible provider
+# quota cannot be relied on to check.
+
+
+def _calculator() -> ToolDefinition:
+    return build_tool_registry().get(CALCULATOR).definition
+
+
+async def test_no_tools_are_bound_when_none_are_offered(provider: _Provider) -> None:
+    """An agent with no tools must send exactly the M2 request. Binding an empty
+    list would still change the wire format."""
+
+    await _runner().run(_request())
+
+    assert len(provider.clients) == 1
+    assert provider.clients[0].bound is None
+
+
+async def test_offered_tools_are_bound(provider: _Provider) -> None:
+    await _runner().run(_request(tools=(_calculator(),)))
+
+    bound = [client for client in provider.clients if client.bound is not None]
+    assert len(bound) == 1
+    assert [tool["function"]["name"] for tool in bound[0].bound] == [CALCULATOR]
+
+
+async def test_the_declaration_carries_the_schema_orqent_validates_against(
+    provider: _Provider,
+) -> None:
+    """The same Pydantic model generates this and checks what comes back, so the
+    shown and enforced schemas cannot drift."""
+
+    await _runner().run(_request(tools=(_calculator(),)))
+
+    bound = next(client for client in provider.clients if client.bound is not None)
+    declaration = bound.bound[0]["function"]
+
+    assert declaration["name"] == CALCULATOR
+    assert declaration["description"]
+    assert set(declaration["parameters"]["properties"]) == {"a", "b", "operation"}
+
+
+async def test_a_langchain_tool_object_is_never_constructed(provider: _Provider) -> None:
+    """Plain declarations, not `BaseTool`. Binding a callable would move
+    execution and the allow-list inside the adapter."""
+
+    await _runner().run(_request(tools=(_calculator(),)))
+
+    bound = next(client for client in provider.clients if client.bound is not None)
+    for tool in bound.bound:
+        assert isinstance(tool, dict)
+        assert tool["type"] == "function"
+
+
+async def test_binding_returns_a_new_client_rather_than_mutating(provider: _Provider) -> None:
+    """What makes one adapter instance safe for two concurrent agents with
+    different allow-lists (Phase 8 M6)."""
+
+    await _runner().run(_request(tools=(_calculator(),)))
+
+    assert provider.clients[0].bound is None
+    assert provider.clients[1].bound is not None
+
+
+async def test_a_completed_tool_call_is_replayed_as_the_provider_expects(
+    provider: _Provider,
+) -> None:
+    """Assistant request, then result, paired by the provider's own id."""
+
+    finished = CompletedToolCall(
+        ToolCall(call_id="c1", name=CALCULATOR, arguments={"a": 1, "b": 2, "operation": "add"}),
+        "3.0",
+    )
+
+    await _runner().run(_request(tools=(_calculator(),), completed_tools=(finished,)))
+
+    bound = next(client for client in provider.clients if client.bound is not None)
+    assert [type(message).__name__ for message in bound.seen] == [
+        "HumanMessage",
+        "AIMessage",
+        "ToolMessage",
+    ]
+
+
+async def test_a_tool_result_is_never_a_system_message(provider: _Provider) -> None:
+    """A tool result is data the model asked for; the system turn is what the
+    author wrote. Collapsing them would let a tool's output rewrite the agent's
+    standing behaviour."""
+
+    finished = CompletedToolCall(
+        ToolCall(call_id="c1", name=CALCULATOR, arguments={}), "sensitive tool output"
+    )
+
+    await _runner().run(
+        _request(instructions="Be terse.", tools=(_calculator(),), completed_tools=(finished,))
+    )
+
+    bound = next(client for client in provider.clients if client.bound is not None)
+    system = [message for message in bound.seen if isinstance(message, SystemMessage)]
+    assert [message.content for message in system] == ["Be terse."]
+    assert not any(
+        isinstance(message, SystemMessage) and "sensitive tool output" in str(message.content)
+        for message in bound.seen
+    )
+
+
+async def test_the_result_is_matched_to_its_call_id(provider: _Provider) -> None:
+    finished = CompletedToolCall(ToolCall(call_id="call-42", name=CALCULATOR, arguments={}), "3.0")
+
+    await _runner().run(_request(tools=(_calculator(),), completed_tools=(finished,)))
+
+    bound = next(client for client in provider.clients if client.bound is not None)
+    tool_message = next(m for m in bound.seen if type(m).__name__ == "ToolMessage")
+    assert tool_message.tool_call_id == "call-42"
+
+
+async def test_a_providers_tool_request_becomes_orqents_own_type(provider: _Provider) -> None:
+    """`AIMessage.tool_calls` stops at the adapter."""
+
+    provider.reply = AIMessage(
+        content="let me calculate",
+        tool_calls=[
+            {
+                "name": CALCULATOR,
+                "args": {"a": 137, "b": 29, "operation": "multiply"},
+                "id": "c1",
+                "type": "tool_call",
+            }
+        ],
+    )
+
+    outcome = await _runner().run(_request(tools=(_calculator(),)))
+
+    assert outcome.is_tool_request
+    assert [type(call).__name__ for call in outcome.tool_calls] == ["ToolCall"]
+    assert outcome.tool_calls[0].name == CALCULATOR
+    assert outcome.tool_calls[0].arguments == {"a": 137, "b": 29, "operation": "multiply"}
+
+
+async def test_text_alongside_a_tool_call_is_carried_not_discarded(provider: _Provider) -> None:
+    """Gemini commonly says something as well. Dropping it here would decide
+    upstream policy in the adapter."""
+
+    provider.reply = AIMessage(
+        content="let me calculate",
+        tool_calls=[{"name": CALCULATOR, "args": {}, "id": "c1", "type": "tool_call"}],
+    )
+
+    outcome = await _runner().run(_request(tools=(_calculator(),)))
+
+    assert outcome.text == "let me calculate"
+    assert outcome.is_tool_request
+
+
+async def test_a_plain_answer_is_not_a_tool_request(provider: _Provider) -> None:
+    outcome = await _runner().run(_request(tools=(_calculator(),)))
+
+    assert not outcome.is_tool_request
+    assert outcome.tool_calls == ()

@@ -40,7 +40,7 @@ from __future__ import annotations
 import json
 from collections.abc import Callable, Mapping
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from app.domain.memory.augmentation import augment
 from app.domain.nodes import handles
@@ -50,6 +50,10 @@ from app.domain.nodes.result import Completed, Failed, NodeResult
 from app.domain.nodes.runner import NodeRunContext, NodeRunner
 from app.domain.ports.agent_runner import AgentError, AgentRequest, AgentRunner
 from app.domain.ports.knowledge import KnowledgeRetrievalError, KnowledgeRetriever
+from app.domain.tools.contract import CompletedToolCall, ToolCall, ToolError
+from app.domain.tools.registry import ToolRegistry
+from app.domain.tools.serialisation import render
+from app.infrastructure.tools import CATALOGUE
 
 MAX_INSTRUCTIONS_LENGTH = 10_000
 MAX_MODEL_LENGTH = 64
@@ -65,6 +69,19 @@ DEFAULT_MODEL = "default"
 # can edit the workflow. Twenty is far past useful and well short of harmful.
 MAX_TOP_K = 20
 DEFAULT_TOP_K = 5
+
+# How many times the model may ask for tools before it has to answer.
+#
+# Bounded because the loop is driven by the model: without a ceiling, a model
+# that keeps requesting tools — because it is confused, because a tool keeps
+# returning an error it cannot act on, or because it is being steered by
+# injected text — would spend the deployment's quota until something else broke.
+#
+# Five is chosen to be comfortably above real usage (a tool call, a look at the
+# result, occasionally a correction) and far below a runaway. It is a *count of
+# rounds*, so the model is called at most six times: one first ask, five
+# tool-and-reply cycles.
+MAX_TOOL_ROUNDS = 5
 
 
 class RetrievalConfig(BaseModel):
@@ -115,6 +132,52 @@ class AgentConfig(BaseModel):
     author debugging one should not have to wonder whether the difference they
     are looking at is their change or the sampler's.
     """
+
+    tools: tuple[str, ...] = ()
+    """Which tools this agent may call, **by name** (M6).
+
+    **Empty by default, and empty is exactly what M1-M5 did.** An agent
+    configured before this field existed parses as no tools, sends a request
+    indistinguishable from M3's, and never reaches the tool machinery.
+
+    **Names only — never a schema, an endpoint, or a credential.** A tool's
+    arguments and behaviour come from the trusted implementation the deployment
+    ships (ADR-022, by analogy). An author choosing from a catalogue is a very
+    different trust proposition from an author *describing* a capability, and
+    only the first one is on offer.
+
+    An explicit allow-list rather than "every tool installed": an agent that
+    silently gained a capability because a release added one would be an agent
+    whose published behaviour changed without a republish.
+    """
+
+    @field_validator("tools")
+    @classmethod
+    def _known_and_deduplicated(cls, names: tuple[str, ...]) -> tuple[str, ...]:
+        """Reject unknown tools, and make the list deterministic.
+
+        **Refused at authoring**, which for this field means at publish, because
+        the catalogue is a property of the release rather than of a deployment
+        (see ``app.infrastructure.tools.CATALOGUE``). A name that validates here
+        validates everywhere, so a version cannot publish in one environment and
+        fail to resolve a tool in another.
+
+        Duplicates are collapsed **keeping first occurrence**, not sorted: the
+        order is the order the model is shown the tools in, and that is the
+        author's decision to make. Sorting would quietly override it; leaving
+        duplicates would show the model the same tool twice.
+        """
+
+        unknown = [name for name in names if not CATALOGUE.has(name)]
+        if unknown:
+            raise ValueError(
+                f"Unknown tools: {sorted(unknown)}. Available: {sorted(CATALOGUE.names())}."
+            )
+
+        seen: dict[str, None] = {}
+        for name in names:
+            seen.setdefault(name)
+        return tuple(seen)
 
     retrieval: RetrievalConfig | None = None
     """Retrieval settings, or ``None`` to ask the model without any documents.
@@ -172,6 +235,7 @@ class AgentNodeRunner(NodeRunner):
         self,
         agents: AgentRunner,
         knowledge: Callable[[], KnowledgeRetriever] | None = None,
+        tools: ToolRegistry | None = None,
     ) -> None:
         """Takes the ports, never a provider.
 
@@ -196,6 +260,12 @@ class AgentNodeRunner(NodeRunner):
 
         self._agents = agents
         self._knowledge = knowledge
+        # The shipped catalogue by default — unlike `knowledge`, building it
+        # costs nothing and needs no credential, so there is no reason to defer
+        # it and every reason for the production path to be the default path.
+        # Injectable so a test can supply its own tools without mutating a
+        # module-level catalogue that every other test also reads.
+        self._tools = tools if tools is not None else CATALOGUE
 
     async def run(self, context: NodeRunContext) -> NodeResult:
         config = context.config
@@ -217,22 +287,104 @@ class AgentNodeRunner(NodeRunner):
                 return Failed(error=str(error), retryable=error.retryable)
 
         try:
-            outcome = await self._agents.run(
-                AgentRequest(
-                    instructions=config.instructions,
-                    prompt=prompt,
-                    model=config.model,
-                    temperature=config.temperature,
-                    idempotency_key=context.idempotency_key,
-                )
-            )
-        except AgentError as error:
-            # Returned, not raised. A provider that refused is an outcome of this
-            # node that the engine must record against it and decide about; an
-            # exception escaping here would be treated as a bug in the node.
-            return Failed(error=str(error), retryable=error.retryable)
+            definitions = self._tools.definitions(config.tools)
+        except ToolError as error:
+            # A published workflow naming a tool this release does not ship.
+            # Authoring refuses it, so reaching here means the catalogue changed
+            # under a published version — a deployment problem, not a model one.
+            return Failed(error=str(error), retryable=False)
 
-        return Completed(outputs={"main": outcome.text})
+        completed: list[CompletedToolCall] = []
+        allowed = frozenset(config.tools)
+
+        for round_number in range(MAX_TOOL_ROUNDS + 1):
+            try:
+                outcome = await self._agents.run(
+                    AgentRequest(
+                        instructions=config.instructions,
+                        prompt=prompt,
+                        model=config.model,
+                        temperature=config.temperature,
+                        idempotency_key=context.idempotency_key,
+                        tools=tuple(definitions),
+                        completed_tools=tuple(completed),
+                    )
+                )
+            except AgentError as error:
+                # Returned, not raised. A provider that refused is an outcome of
+                # this node that the engine must record against it and decide
+                # about; an exception escaping here would be treated as a bug in
+                # the node.
+                return Failed(error=str(error), retryable=error.retryable)
+
+            if not outcome.is_tool_request:
+                return Completed(outputs={"main": outcome.text})
+
+            if round_number == MAX_TOOL_ROUNDS:
+                # The model still wants tools after its last permitted round.
+                # Failing rather than answering from whatever it said alongside
+                # the request: that text is not an answer, it is commentary on a
+                # call that never ran, and returning it would put an unfinished
+                # thought into a downstream node as if it were a result.
+                return Failed(
+                    error=(
+                        f"The agent asked for tools more than {MAX_TOOL_ROUNDS} times "
+                        "without producing an answer."
+                    ),
+                    retryable=False,
+                )
+
+            try:
+                for call in outcome.tool_calls:
+                    completed.append(CompletedToolCall(call, await self._call(call, allowed)))
+            except ToolError as error:
+                return Failed(error=str(error), retryable=error.retryable)
+
+        raise AssertionError("unreachable: the loop returns on its final round")  # pragma: no cover
+
+    async def _call(self, call: ToolCall, allowed: frozenset[str]) -> str:
+        """Run one tool the model asked for, and render what it returned.
+
+        **Nothing the provider said is taken on trust.** The name is checked
+        against this agent's allow-list before the registry is consulted, and
+        the arguments are validated against Orqent's own copy of the schema
+        before anything executes. A provider asserting that its arguments match
+        the schema it was given is not evidence — it is the same provider's
+        output (§9).
+
+        The two failure kinds are deliberately *not* treated alike:
+
+        - **A tool that is not allowed** fails the node. The model was only ever
+          shown its permitted tools, so asking for another one means the binding
+          is wrong or the response is not what it claims — neither is something
+          to negotiate with, and continuing would train the loop to tolerate it.
+        - **Bad arguments, or a tool that refused**, come back to the model as an
+          explicit error result. That is ordinary model fallibility and is
+          self-correctable — asking for ``1 / 0`` deserves "undefined", not a
+          failed run — and the round limit stops it becoming a loop.
+
+        Neither path fabricates a result. The model is told what went wrong, or
+        the node fails; it is never handed a plausible answer to a call that did
+        not happen.
+        """
+
+        if call.name not in allowed:
+            raise ToolError(
+                f"This agent is not permitted to use the tool {call.name!r}.", retryable=False
+            )
+
+        tool = self._tools.get(call.name)
+        try:
+            arguments = tool.definition.parameters.model_validate(dict(call.arguments))
+        except ValidationError as error:
+            return render({"error": "invalid_arguments", "detail": _problems(error)})
+
+        try:
+            return render(await tool.execute(arguments))
+        except ToolError as error:
+            # The tool's own message, which it wrote for exactly this purpose.
+            # Implementation internals and tracebacks never reach here.
+            return render({"error": "tool_failed", "detail": str(error)})
 
     async def _grounded(
         self, prompt: str, retrieval: RetrievalConfig, context: NodeRunContext
@@ -313,9 +465,27 @@ def _prompt(inputs: Mapping[str, object]) -> str:
         return str(value)
 
 
+def _problems(error: ValidationError) -> list[str]:
+    """Summarise a validation failure for the model, and only for the model.
+
+    Field paths and Pydantic's own wording, without the offending input echoed
+    back. The model produced that input and re-sending it wastes tokens telling
+    it what it just said; more importantly this string ends up in a prompt, and
+    the less of the model's own output that loops back into the conversation
+    verbatim, the smaller the surface for it to talk itself in circles.
+    """
+
+    return [
+        f"{'.'.join(str(part) for part in problem['loc']) or 'arguments'}: {problem['msg']}"
+        for problem in error.errors()
+    ]
+
+
 def runner(
-    agents: AgentRunner, knowledge: Callable[[], KnowledgeRetriever] | None = None
+    agents: AgentRunner,
+    knowledge: Callable[[], KnowledgeRetriever] | None = None,
+    tools: ToolRegistry | None = None,
 ) -> AgentNodeRunner:
     """Build this node's runner. The registry's one composition point."""
 
-    return AgentNodeRunner(agents, knowledge)
+    return AgentNodeRunner(agents, knowledge, tools)

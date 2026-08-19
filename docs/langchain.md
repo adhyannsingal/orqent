@@ -1,9 +1,9 @@
 # LangChain isolation and the `AgentRunner` boundary
 
 > **Status:** implemented at **Phase 10 M2**. Gemini is the first and only
-> provider. **Tools** are a later milestone (M6) and are described here only as
-> the path they will take. **Retrieval** was expected to arrive on this seam too;
-> M5 built it and found that it does not belong here — see §13.
+> provider. **Tools** arrived on this seam at M6 and are described in §14.
+> **Retrieval** was expected here too; M5 built it and found that it does not
+> belong — see §13.
 
 Referenced by `architecture.md` and `ADR-013`, which promised this document long
 before there was an implementation to describe.
@@ -341,9 +341,76 @@ ai.agent@1 ─┬─ KnowledgeRetriever → MemoryService → Embedder · Chroma
   workflows ungrounded with nothing to show for it. M5 composes retrieval in the
   *node's* runner instead, where the tenant and the config already are. See
   `phase-10-implementation-spec.md` §37.
-- **M6** adds the tools the POC needs, and those *do* belong on this seam: a tool
-  call is part of the model's own loop, which is exactly what this port describes.
+- **M6 is done**, and it *did* belong on this seam — a tool call is part of the
+  model's own turn-taking, so the provider decides to make one and the layer
+  above cannot simulate that. It is the one thing that widened `AgentRequest`.
+  See §14.
 
-No placeholder field exists for any of it. The extension point is the port, not a
-reserved slot — and M5 is the demonstration that the right extension point is not
-always the one sketched in advance.
+No placeholder field ever existed for any of it. The extension point is the port,
+not a reserved slot — and M5 and M6 together are the demonstration that whether a
+capability belongs *behind* this port or *above* it is decided by whether it
+describes a model call, not by whether it feels AI-shaped.
+
+---
+
+## 14. Tool calling, as actually implemented (M6)
+
+**Verified against the installed versions**, not from memory:
+`langchain-core 1.5.6`, `langchain-google-genai 4.3.4`.
+
+```
+AgentRequest(tools=…, completed_tools=…)
+        ↓
+  bind_tools([{type: function, function: {name, description, parameters}}])
+        ↓
+  ainvoke([SystemMessage, HumanMessage, AIMessage(tool_calls=…), ToolMessage, …])
+        ↓
+AgentOutcome(text=…, tool_calls=…)   ← from AIMessage.tool_calls
+```
+
+### Plain dicts, not `BaseTool`
+
+`bind_tools` accepts `Sequence[dict | type | Callable | BaseTool | GoogleTool]`.
+The adapter passes **dicts** — OpenAI-style function declarations built from
+`ToolDefinition.json_schema()`.
+
+This is the single most important line in M6's adapter. A `BaseTool` or a
+`@tool`-decorated callable binds a *Python function for LangChain to invoke*,
+which would move execution, argument validation, and the allow-list inside the
+adapter — out of provider-neutral code, out of reach of a second provider, and
+into the one place that must not be trusted to police the model. LangChain is
+told what the tools look like. It is never told how to run one.
+
+The schema comes from the same Pydantic model that validates the arguments
+coming back, so the shown and enforced schemas cannot drift.
+
+### The exchange is rebuilt every turn
+
+`_messages` replays `completed_tools` as `AIMessage(tool_calls=[…])` followed by
+`ToolMessage(content=result, tool_call_id=…)`, paired by the provider's own id.
+
+Rebuilt rather than held in a chat session, because an agent execution can be
+re-attempted on another worker (ADR-024) and state inside a client would not
+survive that. It also keeps every call to `run` self-contained, which is what
+lets two concurrent agents share one adapter instance — `bind_tools` returns a
+new runnable rather than mutating the client.
+
+**Results are `ToolMessage`, never `SystemMessage`, and never appended to the
+instructions.** A tool result is data the model asked for; the system turn is
+what the author wrote.
+
+### `AIMessage.tool_calls` stops here
+
+LangChain's normalised view across providers is the one piece of normalisation
+worth accepting from the framework — the alternative is parsing Google's
+`function_call` parts here and again for the next provider. It is converted to
+Orqent's `ToolCall` in `_tool_calls_of` and goes no further: nothing above the
+adapter sees an `AIMessage`, a `tool_call` dict, or an id it did not receive from
+here. An architecture guard enforces it.
+
+### Text alongside tool calls
+
+Gemini commonly returns a sentence of filler *and* function calls in the same
+turn. The adapter carries both; `AgentOutcome` documents that `tool_calls` takes
+precedence. Discarding the text in the adapter would make that decision in the
+wrong place.

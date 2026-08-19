@@ -31,9 +31,11 @@ from pydantic import BaseModel, SecretStr
 import app
 from app.core.config import Settings
 from app.domain.engine.events import RunEventType
+from app.domain.nodes.descriptor import SideEffect
 from app.infrastructure.db import models  # noqa: F401  (registers tables)
 from app.infrastructure.db.base import Base
 from app.infrastructure.nodes import build_registry
+from app.infrastructure.tools import CATALOGUE
 
 SRC = Path(app.__file__).parent
 
@@ -921,3 +923,144 @@ def test_no_node_configuration_can_name_a_tenant() -> None:
         for model in config_models:
             leaked = forbidden & set(model.model_fields)
             assert not leaked, f"{descriptor.qualified_name} config exposes {leaked}"
+
+
+# =============================================================================
+# Tools and tool calling (Phase 10, M6)
+# =============================================================================
+#
+# M6 lets a model *act*. The risk is the same shape as M5's and worse in
+# consequence: not that tools work badly, but that tool calling becomes
+# something the engine schedules, the queue carries, or a provider adapter gets
+# to decide the rules of. A whole tool conversation is meant to happen inside one
+# ordinary node invocation, and these say it does.
+
+_TOOL_VOCABULARY = ("tool", "function_call", "bind_tools")
+
+
+@pytest.mark.parametrize("module", _ENGINE_MODULES)
+def test_the_engine_has_no_vocabulary_for_tools(module: str) -> None:
+    """A tool-using node execution is a node execution.
+
+    Checked against source text rather than imports, because this boundary
+    erodes through a special case — "give a tool-using agent a longer lease" —
+    that no import would reveal.
+    """
+
+    source = _code_only(SRC / module).lower()
+    found = [word for word in _TOOL_VOCABULARY if word in source]
+
+    assert not found, f"{module} mentions {found}"
+
+
+@pytest.mark.parametrize("module", _ENGINE_MODULES)
+def test_the_engine_does_not_know_the_tool_contract_exists(module: str) -> None:
+    assert not _violations(SRC / module, ("app.domain.tools", "app.infrastructure.tools"))
+
+
+@pytest.mark.parametrize(
+    "package",
+    ["app.infrastructure.queue", "app.infrastructure.worker", "app.infrastructure.dispatcher"],
+)
+def test_the_transport_knows_nothing_about_tools(package: str) -> None:
+    for path in _modules(package):
+        source = _code_only(path).lower()
+        assert not [word for word in _TOOL_VOCABULARY if word in source], _relative(path)
+
+
+def test_the_run_service_never_reaches_a_tool() -> None:
+    """``RunService`` invokes a node and records what it returned. That a node
+    held a six-turn conversation with a model is not its business."""
+
+    assert not _violations(
+        SRC / "services/run_service.py", ("app.domain.tools", "app.infrastructure.tools")
+    )
+
+
+def test_no_tool_implementation_imports_a_provider() -> None:
+    """A tool is Orqent's code, not the framework's.
+
+    The temptation M6 declined: registering a LangChain ``BaseTool`` and letting
+    the framework invoke it. That would move execution, argument validation, and
+    the allow-list inside the adapter — out of provider-neutral code and out of
+    reach of a second provider.
+    """
+
+    for package in ("app.domain.tools", "app.infrastructure.tools"):
+        for path in _modules(package):
+            assert not _ai_imports(path), f"{_relative(path)} reaches a provider"
+
+
+def test_the_tool_contract_names_no_provider() -> None:
+    """The vocabulary crossing this boundary is Orqent's own."""
+
+    for path in _modules("app.domain.tools"):
+        source = _code_only(path).lower()
+        for vendor in ("gemini", "google", "langchain", "openai", "anthropic", "basetool"):
+            assert vendor not in source, f"{_relative(path)} says {vendor}"
+
+
+def test_provider_tool_translation_lives_only_in_the_llm_adapter() -> None:
+    """``bind_tools``, ``AIMessage``, and ``ToolMessage`` are LangChain's
+    vocabulary and stop at the adapter."""
+
+    for path in _modules("app"):
+        if "app/infrastructure/llm" in path.as_posix():
+            continue
+        source = _code_only(path)
+        for leaked in ("bind_tools", "AIMessage", "ToolMessage", "function_declarations"):
+            assert leaked not in source, f"{_relative(path)} uses {leaked}"
+
+
+def test_no_node_configuration_can_describe_a_tool() -> None:
+    """**Names only, catalogue-wide.**
+
+    A config that could carry a schema, an endpoint, or a snippet of code would
+    be a config that describes a capability rather than selecting one — which is
+    ADR-022's refusal to execute what the catalogue did not ship, restated for
+    the thing a *model* can invoke.
+    """
+
+    forbidden = {
+        "tool_schemas",
+        "tool_schema",
+        "schema",
+        "parameters",
+        "endpoint",
+        "url",
+        "code",
+        "script",
+        "command",
+    }
+
+    for descriptor in build_registry().all():
+        config_models = [descriptor.config_model]
+        for field in descriptor.config_model.model_fields.values():
+            for candidate in getattr(field.annotation, "__args__", ()) or (field.annotation,):
+                if isinstance(candidate, type) and issubclass(candidate, BaseModel):
+                    config_models.append(candidate)
+
+        for model in config_models:
+            leaked = forbidden & set(model.model_fields)
+            assert not leaked, f"{descriptor.qualified_name} config exposes {leaked}"
+
+
+def test_no_tool_accepts_a_tenant_from_the_model() -> None:
+    """Tool arguments are written by the model. If one could name an
+    organization, a model could redirect a tenant-scoped tool by asking (M5's
+    rule, extended to the surface M6 opens)."""
+
+    forbidden = {"organization", "organization_id", "organization_public_id", "tenant", "org_id"}
+
+    for name in CATALOGUE.names():
+        fields = set(CATALOGUE.get(name).definition.parameters.model_fields)
+        assert not (forbidden & fields), name
+
+
+def test_every_shipped_tool_is_repeatable() -> None:
+    """Execution is at-least-once (ADR-024), so a recovered agent may request the
+    same tool again. M6 ships only tools for which that is free, and the registry
+    refuses to register anything else."""
+
+    for name in CATALOGUE.names():
+        assert CATALOGUE.get(name).definition.side_effect is SideEffect.PURE, name

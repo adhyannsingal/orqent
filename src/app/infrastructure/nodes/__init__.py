@@ -21,6 +21,7 @@ from app.domain.nodes.registry import NodeRegistry
 from app.domain.nodes.runner import NodeRunner
 from app.domain.ports.agent_runner import AgentRunner
 from app.domain.ports.knowledge import KnowledgeRetriever
+from app.domain.tools.registry import ToolRegistry
 from app.infrastructure.llm.mock_agent_runner import MockAgentRunner
 from app.infrastructure.nodes.builtin import (
     ai_agent,
@@ -54,6 +55,7 @@ _BUILT_INS: Final[tuple[tuple[NodeDescriptor, NodeRunner], ...]] = (
 def build_registry(
     agents: AgentRunner | None = None,
     knowledge: Callable[[], KnowledgeRetriever] | None = None,
+    tools: ToolRegistry | None = None,
 ) -> NodeRegistry:
     """Assemble the catalogue.
 
@@ -75,6 +77,13 @@ def build_registry(
     and validation and fails loudly rather than silently if an agent configured
     for retrieval is ever executed through it.
 
+    ``tools`` is the third, and belongs to the same node again (M6). Unlike
+    ``knowledge`` it is a plain registry rather than a factory, because building
+    one costs nothing and needs no credential — so ``None`` here means *the
+    shipped catalogue*, not "no tools". A deployment cannot accidentally run
+    without the tools its published workflows validated against; only a test
+    substitutes them.
+
     **The default is a deterministic mock, and the container passes one
     explicitly anyway.** Defaulting keeps tests and tooling to a single line;
     passing explicitly at the composition root means that when M2 adds a real
@@ -87,5 +96,7 @@ def build_registry(
         registry.register(descriptor, runner)
     # Registered here rather than in `_BUILT_INS` because it is the only node
     # whose runner is constructed rather than a module-level singleton.
-    registry.register(ai_agent.DESCRIPTOR, ai_agent.runner(agents or MockAgentRunner(), knowledge))
+    registry.register(
+        ai_agent.DESCRIPTOR, ai_agent.runner(agents or MockAgentRunner(), knowledge, tools)
+    )
     return registry
