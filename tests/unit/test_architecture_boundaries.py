@@ -508,7 +508,12 @@ _AI_PACKAGES = (
 
 # The one package permitted to import them, when they arrive (M2 onward). Its own
 # docstring has said so since Phase 1.
-_ADAPTER_PACKAGE = "app/infrastructure/llm"
+# **A set, not a single package, since M4.** The rule is unchanged — only an
+# approved adapter may import a vendor SDK — but there are now two such adapters:
+# LangChain/Gemini for generation and embedding, and ChromaDB for vectors
+# (ADR-003). Widening the *list* is a visible, reviewable edit; widening the rule
+# to "infrastructure may import anything" would not be.
+_ADAPTER_PACKAGES = ("app/infrastructure/llm", "app/infrastructure/vector")
 
 
 def _ai_imports(path: Path) -> list[str]:
@@ -526,7 +531,7 @@ def test_only_the_llm_adapter_may_import_a_provider(path: Path) -> None:
     """
 
     leaked = _ai_imports(path)
-    if leaked and _ADAPTER_PACKAGE in path.as_posix():
+    if leaked and any(package in path.as_posix() for package in _ADAPTER_PACKAGES):
         return
     assert not leaked, f"{path.relative_to(SRC)} imports {leaked}"
 
@@ -717,3 +722,71 @@ def test_the_event_vocabulary_stays_free_of_provider_concepts() -> None:
         "NodeSuspended",
         "NodeSkipped",
     }
+
+
+# --- Phase 10 M4: retrieval stays behind its ports ---------------------------
+
+
+def test_the_chroma_adapter_is_where_the_vector_store_lives() -> None:
+    """The positive half. A rule that only forbids would still pass if the
+    integration were deleted."""
+
+    adapter = SRC / "infrastructure/vector/chroma_store.py"
+    imported = _imported_names(adapter)
+
+    assert any(name.startswith("chromadb") for name in imported)
+    assert "app.domain.ports.vector_store" in imported
+
+
+def test_the_memory_service_speaks_only_in_ports() -> None:
+    """Ingestion and retrieval orchestrate; they must not know which vector
+    database or which embedding provider is underneath (ADR-003)."""
+
+    service = SRC / "services/memory_service.py"
+
+    assert not _ai_imports(service)
+    imported = _imported_names(service)
+    assert "app.domain.ports.embedder" in imported
+    assert "app.domain.ports.vector_store" in imported
+
+
+def test_the_agent_node_still_knows_nothing_about_retrieval() -> None:
+    """**The M5 boundary, enforced rather than promised.**
+
+    Joining retrieval to generation is the next milestone, and the temptation is
+    to do it here "while the code is open". Until M5 decides how, an agent must
+    not import a retriever, a vector store, or the memory service.
+    """
+
+    node = SRC / "infrastructure/nodes/builtin/ai_agent.py"
+
+    assert not _violations(
+        node,
+        (
+            "app.domain.ports.vector_store",
+            "app.domain.ports.embedder",
+            "app.services.memory_service",
+            "app.infrastructure.vector",
+        ),
+    )
+
+
+def test_the_gemini_agent_runner_still_knows_nothing_about_chroma() -> None:
+    """Same boundary, one layer down: generation and retrieval are two systems
+    until M5 joins them."""
+
+    runner = SRC / "infrastructure/llm/gemini_agent_runner.py"
+    imported = _imported_names(runner)
+
+    assert not any(name.startswith("chromadb") for name in imported)
+    assert "app.domain.ports.vector_store" not in imported
+
+
+def test_no_layer_outside_the_adapters_imports_chromadb() -> None:
+    """Stated separately from the general provider rule because `chromadb` is now
+    installed, so a misplaced import would resolve rather than fail loudly."""
+
+    for package in _PROVIDER_FREE_PACKAGES:
+        for path in _modules(package):
+            imported = _imported_names(path)
+            assert not any(name.startswith("chromadb") for name in imported), path.name

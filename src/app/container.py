@@ -16,22 +16,27 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 from app.core.config import Settings, get_settings
 from app.domain.nodes.registry import NodeRegistry
 from app.domain.ports.agent_runner import AgentRunner
+from app.domain.ports.embedder import Embedder
 from app.domain.ports.password_hasher import PasswordHasher
 from app.domain.ports.task_queue import LeasePolicy, TaskQueue
 from app.domain.ports.token_service import TokenService
+from app.domain.ports.vector_store import VectorStore
 from app.domain.value_objects.lease import WorkerId
 from app.infrastructure.db.engine import create_engine
 from app.infrastructure.db.session import create_session_factory
 from app.infrastructure.db.unit_of_work import SqlAlchemyUnitOfWork
 from app.infrastructure.dispatcher.loop import ScheduleDispatcher
 from app.infrastructure.llm.gemini_agent_runner import GeminiAgentRunner
+from app.infrastructure.llm.gemini_embedder import GeminiEmbedder
 from app.infrastructure.llm.unconfigured_agent_runner import UnconfiguredAgentRunner
 from app.infrastructure.nodes import build_registry
 from app.infrastructure.queue.mysql_task_queue import MySqlTaskQueue
 from app.infrastructure.security.password_hasher import Argon2PasswordHasher
 from app.infrastructure.security.token_service import JwtTokenService
+from app.infrastructure.vector.chroma_store import ChromaVectorStore
 from app.infrastructure.worker import FixedLeasePolicy, Worker, new_worker_id
 from app.services.auth_service import AuthService
+from app.services.memory_service import MemoryService
 from app.services.run_service import RunService
 from app.services.schedule_dispatch_service import ScheduleDispatchService
 from app.services.webhook_service import WebhookService
@@ -50,6 +55,9 @@ class Container:
         self._auth_service: AuthService | None = None
         self._node_registry: NodeRegistry | None = None
         self._agent_runner: AgentRunner | None = None
+        self._embedder: Embedder | None = None
+        self._vector_store: VectorStore | None = None
+        self._memory_service: MemoryService | None = None
         self._workflow_service: WorkflowService | None = None
         self._run_service: RunService | None = None
         self._task_queue: TaskQueue | None = None
@@ -304,6 +312,61 @@ class Container:
             self.schedule_dispatch_service,
             poll_interval_seconds=self._settings.dispatcher_poll_interval_seconds,
         )
+
+    @property
+    def embedder(self) -> Embedder:
+        """How text becomes vectors (ADR-003).
+
+        Reuses the Gemini credential: a deployment that can generate can also
+        embed, and a second key for one provider is a second thing to rotate.
+
+        **Requires the credential**, unlike ``agent_runner``, which degrades to
+        an explicit refusal. The difference is that an agent node can fail one
+        run, whereas there is no such thing as a partial ingestion — so this
+        raises at construction, and only a caller that actually embeds ever
+        reaches it.
+        """
+
+        if self._embedder is None:
+            key = self._settings.gemini_api_key
+            if key is None:
+                raise RuntimeError(
+                    "No embedding provider is configured. Set GEMINI_API_KEY to "
+                    "enable document ingestion and retrieval."
+                )
+            self._embedder = GeminiEmbedder(key, self._settings.gemini_embedding_model)
+        return self._embedder
+
+    @property
+    def vector_store(self) -> VectorStore:
+        """Where vectors live (ADR-003).
+
+        **Nothing connects here.** The Chroma client is built on first use inside
+        the adapter, so constructing this — and starting an API, a worker, or any
+        non-AI workflow — costs no network and cannot fail because a container is
+        down.
+        """
+
+        if self._vector_store is None:
+            self._vector_store = ChromaVectorStore(
+                host=self._settings.chroma_host or "localhost",
+                port=self._settings.chroma_port or 8000,
+            )
+        return self._vector_store
+
+    @property
+    def memory_service(self) -> MemoryService:
+        """Ingestion and retrieval (architecture.md §12).
+
+        Built lazily, so touching this property is what first requires an
+        embedding credential — the application starts without one.
+        """
+
+        if self._memory_service is None:
+            self._memory_service = MemoryService(
+                self.unit_of_work, self.embedder, self.vector_store
+            )
+        return self._memory_service
 
     async def dispose(self) -> None:
         """Release the connection pool. Safe to call if never initialised."""

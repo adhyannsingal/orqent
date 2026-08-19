@@ -34,6 +34,12 @@ def test_exactly_the_expected_tables_exist() -> None:
         # tests/unit/test_schedule_metadata.py.
         "trigger_registrations",
         "schedules",
+        # Phase 10 M4 knowledge corpus. MySQL is authoritative for *which*
+        # documents and chunks exist; the vectors and the chunk text live in
+        # Chroma as a derived index (ADR-002, ADR-003). Their own metadata lives
+        # in tests/unit/test_document_metadata.py.
+        "documents",
+        "document_chunks",
     }
 
 

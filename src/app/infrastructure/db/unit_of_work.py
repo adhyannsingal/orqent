@@ -21,6 +21,7 @@ from typing import Self
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.domain.ports.unit_of_work import UnitOfWork
+from app.infrastructure.repositories.document_repository import DocumentRepository
 from app.infrastructure.repositories.node_execution_repository import NodeExecutionRepository
 from app.infrastructure.repositories.organization_repository import OrganizationRepository
 from app.infrastructure.repositories.queue_task_repository import QueueTaskRepository
@@ -57,6 +58,7 @@ class SqlAlchemyUnitOfWork(UnitOfWork):
         self._queue_tasks: QueueTaskRepository | None = None
         self._trigger_registrations: TriggerRegistrationRepository | None = None
         self._schedules: ScheduleRepository | None = None
+        self._documents: DocumentRepository | None = None
 
     @property
     def session(self) -> AsyncSession:
@@ -157,6 +159,19 @@ class SqlAlchemyUnitOfWork(UnitOfWork):
         return self._trigger_registrations
 
     @property
+    def documents(self) -> DocumentRepository:
+        """The knowledge corpus, in this transaction.
+
+        Here for the same reason the others are: ingesting a document replaces
+        its chunk rows, and a half-replaced chunk set must never be visible —
+        so the delete and the inserts commit together (ADR-009).
+        """
+
+        if self._documents is None:
+            self._documents = DocumentRepository(self.session)
+        return self._documents
+
+    @property
     def schedules(self) -> ScheduleRepository:
         """Schedules, in this transaction.
 
@@ -203,6 +218,7 @@ class SqlAlchemyUnitOfWork(UnitOfWork):
             self._queue_tasks = None
             self._trigger_registrations = None
             self._schedules = None
+            self._documents = None
 
     async def commit(self) -> None:
         await self.session.commit()

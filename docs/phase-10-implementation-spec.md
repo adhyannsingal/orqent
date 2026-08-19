@@ -1,7 +1,7 @@
 # Phase 10 — AI execution layer: implementation specification
 
-> **Status:** **M1, M2 and M3 complete.** M4–M7 are **not started**. Phase 10 is
-> **not** complete.
+> **Status:** **M1–M4 complete.** M5–M7 are **not started**. Phase 10 is **not**
+> complete.
 >
 > **Phase 10 is the final backend phase.** The frontend follows it. The backend
 > roadmap does not extend to Phase 11 or beyond.
@@ -77,7 +77,7 @@ they had already agreed. Nothing was invented.
 | **M1** | **AI execution contracts: `AgentRunner` port + `ai.agent@1` + mock adapter** | ✅ **complete** |
 | **M2** | **LangChain + Gemini adapter behind the port; credential from settings** | ✅ **complete** |
 | **M3** | **Real agent execution through the Phase 8 worker, end to end** | ✅ **complete** |
-| **M4** | Embeddings + document ingestion + Chroma retrieval | ⬜ not started |
+| **M4** | **Embeddings + document ingestion + Chroma retrieval** | ✅ **complete** |
 | **M5** | Agent + retrieval (RAG) through the same port | ⬜ not started |
 | **M6** | The minimum tool execution the POC needs | ⬜ not started |
 | **M7** | Backend acceptance, documentation, and **backend closure** | ⬜ not started |
@@ -465,3 +465,166 @@ calling, LangGraph, memory, multi-agent orchestration, structured output, token
 accounting, streaming, and any Orqent-level retry policy. `domain/engine`,
 `infrastructure/queue`, `infrastructure/worker`, and `infrastructure/dispatcher`
 are unchanged.
+
+
+---
+
+# M4 — knowledge and retrieval
+
+    text → chunk → embed → MySQL record + Chroma vectors
+    query → embed → nearest chunks
+
+**This is not RAG.** Nothing retrieves on a workflow's behalf and no node knows
+the vector store exists. Generation and retrieval are two systems until M5 joins
+them, and architecture tests enforce that they stay apart.
+
+## 24. Ports, and why there are two
+
+`Embedder` and `VectorStore` — the names `ports/__init__.py`, ADR-003 and
+`architecture.md` §12 have used since Phase 1.
+
+`Embedder` is **not** folded into `AgentRunner`: generation and embedding are
+different models with different costs and failure modes, and a deployment may
+reasonably use different providers for each. Folding them would make that a fork
+rather than a configuration change.
+
+`embed_documents` and `embed_query` are separate because several providers embed
+the two **asymmetrically** — the model encodes "this is a passage" differently
+from "this is a question". Collapsing them silently costs retrieval quality,
+which is the kind of regression that never fails a test.
+
+## 25. MySQL vs Chroma — settled by ADR, not by preference
+
+The brief invited the smaller design without a migration. **ADR-002 and ADR-003
+settle it the other way**: "all source-of-truth data is relational; the vector
+store is derived and never authoritative", and MySQL holds `documents` /
+`document_chunks` metadata while Chroma holds vectors and chunk text.
+
+Without those tables the only record of a corpus would live in the store the
+architecture explicitly designates as rebuildable, and "which documents do we
+have?" would be answerable only by the index. So **migration `0009`** adds both.
+
+| Store | Owns |
+|---|---|
+| MySQL | which documents and chunks exist, whose they are, ordering, fingerprints |
+| Chroma | vectors and the chunk **text**, so a match needs no second round trip |
+
+**Honest limitation:** ADR-003 puts raw source bytes in object storage, which
+this POC does not have. Rebuilding the index therefore requires the caller to
+re-supply the source; `content_hash` is what makes doing so cheap and safe.
+
+## 26. Identity
+
+| | |
+|---|---|
+| Document | `(organization, external_id)` — the caller's stable name, unique per org |
+| Chunk | `{document public id}:{ordinal}` |
+
+The caller supplies `external_id` because only the caller knows whether an upload
+is a new document or a new version of one. A generated id would make every
+re-ingest a new document and the corpus would grow without bound.
+
+This distinguishes all four cases the brief asks about: the same document twice
+(same hash → no-op), changed content (same document, new chunks), two documents
+with identical text (different `external_id` → two documents), and the same name
+in two organizations (uniqueness is per-org).
+
+## 27. Chunking
+
+Character windows of **1000** with **200** overlap, boundaries nudged back to
+whitespace within 100 characters. Deterministic, order-preserving, no empty
+chunks, Unicode-safe by operating on `str` rather than bytes.
+
+Characters rather than tokens on purpose: a token splitter ties chunking to one
+provider's tokenizer, so changing embedding model would silently re-chunk the
+entire corpus. Overlap exists because a sentence answering a query may straddle a
+boundary and would otherwise be retrievable from neither side.
+
+File formats (PDF, DOCX, HTML) are **out of scope** — ingestion takes text
+something else has already extracted.
+
+## 28. Tenancy — structural, not filtered
+
+**One Chroma collection per organization**, named `orqent-<organization public
+id>` (ADR-004 — internal BIGINTs leak row counts).
+
+A metadata filter is one forgotten `where` clause away from returning everyone's
+data; a wrong collection name returns nothing. And because the namespace derives
+from the *caller's* organization rather than from anything a document contains,
+no ingested text can reach across it.
+
+Tested with deliberately identical text in two organizations, so a leak cannot
+hide behind a low similarity score.
+
+## 29. Re-ingestion
+
+| Case | Behaviour |
+|---|---|
+| Identical content | **No-op.** Content hash matches; nothing is re-embedded |
+| Changed content | Every old chunk deleted, new set written |
+| Shorter revision | Tail removed — the failure upsert alone would miss |
+
+**Delete-before-upsert is what prevents duplicates and stale chunks**, not the
+ids being deterministic. That distinction was established by a mutation:
+replacing chunk ids with random ones passed every test until one was added that
+pins them. Stable ids are a genuine second line of defence — if the delete ever
+failed, an upsert would still overwrite — but they are not the mechanism, and the
+code now says so.
+
+**No transaction spans MySQL and Chroma, and none is claimed.** Writes are
+ordered vectors-then-commit: if the commit fails after the vectors land, the
+index holds the new chunks while the record describes the old ones, and the next
+ingestion corrects it. The reverse order would be worse — a committed record
+whose vectors never arrived reads as a healthy document that silently retrieves
+nothing.
+
+## 30. Batching
+
+One provider call per **64** chunks, in order, sequentially. Not one call per
+chunk (which would multiply cost and latency by document length) and not one
+unbounded call (which fails wholesale where several succeed). A short response is
+**refused**, because pairing is positional and silently accepting it would attach
+every later vector to the wrong text.
+
+## 31. Retrieval results
+
+`RetrievalResult(document_id, ordinal, text, distance, metadata)`.
+
+**`distance`, and smaller is closer.** Not renamed to "score", which would invert
+the reader's intuition, and not normalised into a 0-1 relevance, which would mean
+choosing a curve nobody asked for. An honest distance can be turned into whatever
+a caller wants; a fabricated score cannot be turned back.
+
+Identity is read from metadata rather than parsed out of the chunk id, so a
+caller never depends on the id's shape.
+
+## 32. Async, and startup
+
+`chromadb.AsyncHttpClient` and `aembed_*` are both **natively async** — no
+threads, no offloading, nothing blocking the loop. That matters because Phase 8
+M6 invokes independently-ready nodes concurrently.
+
+**Nothing connects at startup.** The Chroma client and every collection are
+created on first use, so the API, the worker, the dispatcher, and every Phase 1–9
+workflow start and run normally when Chroma is unreachable. The embedder requires
+`GEMINI_API_KEY` and raises when asked for without one — scoped to the capability
+rather than the process.
+
+## 33. Failure and security
+
+Embedding failures and store failures become `EmbeddingError` /
+`VectorStoreError`, never a raw provider exception. Provider messages are not
+forwarded, and the credential is scrubbed from anything that is.
+
+Store failures are **retryable**; embedding failures conservatively are not.
+
+Caller metadata using a reserved key (`document_id`, `ordinal`,
+`organization_id`) is **rejected, not silently dropped** — a document that could
+set its own `document_id` could claim to belong to another, and one that could
+set a tenant key could try to reach across an organization.
+
+## 34. Deferred
+
+RAG (M5) · tools (M6) · file parsing · object storage · `memory_collections` ·
+a public ingestion/document-management API · rebuild-from-source · reranking ·
+hybrid search.

@@ -129,8 +129,20 @@ class Settings(BaseSettings):
     # provider neutrality applies to model identity too).
     gemini_model: str = Field(default="gemini-3.5-flash", min_length=1)
 
+    # Which model embeds text for retrieval (Phase 10, M4). Chosen by **asking
+    # the API** which models advertise `embedContent`, the same way M2's chat
+    # model was chosen after an obsolete identifier returned 404:
+    # `gemini-embedding-001` is the stable, generally-available one, and it
+    # produces 3072-dimension vectors. A different embedding model produces
+    # vectors that are not comparable with existing ones, so changing this
+    # setting means re-embedding the corpus — which is why it is deployment
+    # configuration and never document data.
+    gemini_embedding_model: str = Field(default="models/gemini-embedding-001", min_length=1)
+
     # --- Reserved for later phases (declared, intentionally unused now) ---
     database_url: str | None = None
+    # Declared in Phase 1 and unused until M4, which is the first milestone with
+    # anything to put in a vector store.
     chroma_host: str | None = None
     chroma_port: int | None = None
 
