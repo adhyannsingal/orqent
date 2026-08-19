@@ -322,8 +322,11 @@ ai.agent@1 → AgentRunner → LangChain adapter ─┬─ LLM        (M2, done)
                                                  Chroma     (M4)
 ```
 
-- **M3** proves the full `queue → worker → scheduler → ai.agent → Gemini` path.
-  M2 stops at the node boundary.
+- **M3 is done**: the full `queue → worker → scheduler → ai.agent → Gemini` path
+  is proved, including one real end-to-end call. It needed no change to this
+  adapter — the only production correction was in the *node*, which now renders a
+  structured input as JSON rather than Python's `repr` before it becomes
+  `AgentRequest.prompt`. See `phase-10-implementation-spec.md` §15.
 - **M4/M5** add embeddings, ingestion, and Chroma retrieval. They attach to the
   *adapter*, never to the engine or the workflow model — `ADR-003` as rescoped in
   the redesign. `AgentRequest` gains a field; nothing above the port changes.

@@ -1,6 +1,6 @@
 # Phase 10 — AI execution layer: implementation specification
 
-> **Status:** **M1 and M2 complete.** M3–M7 are **not started**. Phase 10 is
+> **Status:** **M1, M2 and M3 complete.** M4–M7 are **not started**. Phase 10 is
 > **not** complete.
 >
 > **Phase 10 is the final backend phase.** The frontend follows it. The backend
@@ -76,7 +76,7 @@ they had already agreed. Nothing was invented.
 |---|---|---|
 | **M1** | **AI execution contracts: `AgentRunner` port + `ai.agent@1` + mock adapter** | ✅ **complete** |
 | **M2** | **LangChain + Gemini adapter behind the port; credential from settings** | ✅ **complete** |
-| **M3** | Real agent execution through the Phase 8 worker, end to end | ⬜ not started |
+| **M3** | **Real agent execution through the Phase 8 worker, end to end** | ✅ **complete** |
 | **M4** | Embeddings + document ingestion + Chroma retrieval | ⬜ not started |
 | **M5** | Agent + retrieval (RAG) through the same port | ⬜ not started |
 | **M6** | The minimum tool execution the POC needs | ⬜ not started |
@@ -333,3 +333,135 @@ connections (ADR-027), and Orqent-level retry policy.
 
 M3 proves `queue → worker → scheduler → ai.agent → Gemini`; M2 stops at the node
 boundary.
+
+
+---
+
+# M3 — AI through the real runtime
+
+## 14. The path, and what M3 had to build
+
+```
+publish → POST /runs → queue_tasks → worker → RunService → registry
+        → ai.agent@1 → AgentRunner → GeminiAgentRunner → LangChain → Gemini
+        → AgentOutcome → node_executions.output → downstream node
+```
+
+**One production change was required, and it is not plumbing.** Everything about
+dispatch, persistence, events, concurrency, and failure worked unchanged — M1 and
+M2 were designed to plug into this runtime, and they did. What M3 corrected was
+the *prompt normalisation*, described below. No engine, scheduler, queue, worker,
+or service change was needed, and none was made.
+
+## 15. Input normalisation — the one correction
+
+`ai.agent@1` rendered a non-string input with `str(value)`. A webhook or manual
+trigger emits `Json`, so a payload reached the model as:
+
+```
+{'order': 7, 'ok': True, 'missing': None}      ← Python repr
+```
+
+Single quotes, `True`/`None` where a model expects `true`/`null`. That was never
+a decision; it was what `str` happened to do. Two things make it worth correcting
+rather than documenting:
+
+- the upstream handle's declared type is literally **`Json`**, so JSON is the
+  honest rendering of what arrived; and
+- `repr` is a Python implementation detail that would have hardened into a public
+  prompt contract the moment an author depended on its shape.
+
+Now:
+
+| Input | Prompt |
+|---|---|
+| `"hello"` | `hello` — strings pass through unquoted |
+| `{"order": 7, "ok": true}` | `{"order": 7, "ok": true}` |
+| `[1, "a"]` | `[1, "a"]` |
+| unconnected | `""` — not the word `None` |
+
+Tested **through the real runtime**, because the value crosses JSON persistence
+on the way: it is written to `runs.trigger_payload`, read back by the worker, and
+handed to the trigger before it reaches the agent. The assertion compares parsed
+JSON rather than a string, because MySQL's JSON type does not preserve object key
+order.
+
+## 16. What the runtime proved
+
+| Claim | Evidence |
+|---|---|
+| An AI run completes through the real worker | Published, queued, claimed, `COMPLETED` — no direct `AgentRunner` call, no `advance` |
+| Output is ordinary node output | `node_executions.output == {"main": text}`, read back from MySQL |
+| Downstream consumes it | `core.noop` forwards it (its *output* is the evidence — executions record outputs, never inputs), then `core.log` consumes `Text` |
+| Visible to users | The Runs API detail shows the agent's output |
+| Config reaches the request | `instructions` and `temperature` authored → frozen in a version → delivered to the port |
+| The profile survives | The workflow stores `model = "default"`; no vendor name is anywhere in the published config |
+| Idempotency | The request's key equals `idempotency_key(run_id, workflow_node_id, attempt)` recomputed from the row — the engine's scheme, not a second one |
+
+## 17. Events
+
+`NodeStarted` / `NodeSucceeded` / `RunCompleted` — the ordinary vocabulary, and
+`NodeFailed` on failure. **No AI-specific event type was added**, and an
+architecture test now pins the vocabulary as an exact set: `AgentStarted`,
+`LLMCalled`, `TokenUsage`, and `PromptSent` are all plausible and all wrong here,
+because they would put provider concepts into the engine's basic language.
+
+## 18. Failure behaviour
+
+Both `AgentError` classifications reach the same terminal state today, and that
+is the **existing** semantics rather than an M3 decision: `Failed(retryable=…)`
+is recorded in the event timeline and nothing acts on it, because the engine has
+no retry policy by design. A rate limit and a malformed request both fail the
+run; the difference is visible to a reader, not to the scheduler.
+
+Verified through the real worker: the node is `FAILED`, the run is `FAILED`, the
+downstream node stays `PENDING`, **the worker survives and keeps looping**, the
+queue task settles to `DONE`, and the persisted error carries no credential or
+provider internals.
+
+## 19. Missing credential
+
+`UnconfiguredAgentRunner` through the full runtime: the run fails cleanly and
+promptly, `output` is `None`, the error names `GEMINI_API_KEY`, and — the point —
+**no `[mock]` text appears**. A deployment that forgot the credential fails
+loudly rather than writing plausible-looking answers into runs.
+
+## 20. Concurrency
+
+Two independently-ready agents execute **concurrently** through Phase 8 M6,
+proved with a barrier: neither can finish unless the other is inside it at the
+same time, so a sequential engine fails deterministically on the timeout rather
+than merely being slower. Discrimination checked — demanding three parties when
+only two agents exist fails, so the passing case really is evidence of overlap.
+
+Each invocation carries its own idempotency key, both outputs persist, and the
+join downstream waits for both.
+
+## 21. Worker configuration
+
+**The worker, not the API, is the process that invokes an AI node** — and it
+takes its configuration from `get_settings()`, which reads the environment and
+the repo-root `.env`.
+
+`docker-compose.yml` defines `api`, `mysql`, and `chroma` — **there is no worker
+service**. That predates Phase 10 (the worker has always been run locally with
+`python -m app.infrastructure.worker`), so locally the worker picks up
+`GEMINI_API_KEY` from the developer's shell or `.env` exactly as the API
+container does from Compose. Recorded here because it is precisely the trap it
+looks like: putting the credential only in the `api` service would configure the
+process that *does not* call Gemini. Adding a worker service is deployment work,
+not M3.
+
+## 22. Startup
+
+M2's deferred provider import is intact and verified: importing `app.container`
+loads **neither** `langchain` nor `google.genai`, container import is ~0.3s, and
+the worker's SIGTERM graceful-shutdown test passes 3/3.
+
+## 23. Not in M3
+
+Embeddings, ingestion, Chroma, vector search, retrieval, RAG, tools, tool
+calling, LangGraph, memory, multi-agent orchestration, structured output, token
+accounting, streaming, and any Orqent-level retry policy. `domain/engine`,
+`infrastructure/queue`, `infrastructure/worker`, and `infrastructure/dispatcher`
+are unchanged.

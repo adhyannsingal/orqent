@@ -29,6 +29,7 @@ all.
 
 from __future__ import annotations
 
+import json
 from collections.abc import Mapping
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -156,11 +157,24 @@ class AgentNodeRunner(NodeRunner):
 def _prompt(inputs: Mapping[str, object]) -> str:
     """Render the incoming value as the text the agent is asked about.
 
-    Deliberately blunt: whatever arrived, as a string. There is no template
-    language, no field mapping, and no interpolation — ADR-022 declines to
-    execute anything the catalogue did not ship, and a prompt template is a small
-    language with all the usual injection questions attached. Shaping the input
-    is a Transform node's job.
+    Deliberately blunt: whatever arrived, as text. There is no template language,
+    no field mapping, and no interpolation — ADR-022 declines to execute anything
+    the catalogue did not ship, and a prompt template is a small language with
+    all the usual injection questions attached. Shaping the input is a Transform
+    node's job.
+
+    **Structured values are rendered as JSON, not as Python.** This began as a
+    plain ``str(value)``, which turned a webhook trigger's payload into
+    ``{'order': 7}`` — Python's ``repr``, with single quotes and ``True``/``None``
+    where a model expects ``true``/``null``. That was never a decision; it was
+    what ``str`` happened to do. Two things make it worth correcting rather than
+    documenting: the upstream handle's declared type is literally ``Json``, so
+    JSON is the honest rendering of what arrived; and ``repr`` is a Python
+    implementation detail that would silently become a public prompt contract the
+    moment an author started depending on its shape.
+
+    Strings pass through untouched — quoting them would be a change to what the
+    author wrote, and a prompt is usually a string.
 
     An unconnected input yields an empty prompt rather than the word ``None``,
     which is what an agent working from its instructions alone should see.
@@ -169,7 +183,15 @@ def _prompt(inputs: Mapping[str, object]) -> str:
     value = inputs.get("main")
     if value is None:
         return ""
-    return value if isinstance(value, str) else str(value)
+    if isinstance(value, str):
+        return value
+    try:
+        # `default=str` rather than letting it raise: a node upstream may one day
+        # emit something JSON does not cover, and refusing to build a prompt over
+        # a rendering detail would fail a run for no reason a user could act on.
+        return json.dumps(value, ensure_ascii=False, default=str)
+    except (TypeError, ValueError):  # pragma: no cover - `default=str` covers it
+        return str(value)
 
 
 def runner(agents: AgentRunner) -> AgentNodeRunner:

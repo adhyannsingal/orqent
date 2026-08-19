@@ -30,6 +30,7 @@ from pydantic import SecretStr
 
 import app
 from app.core.config import Settings
+from app.domain.engine.events import RunEventType
 from app.infrastructure.db import models  # noqa: F401  (registers tables)
 from app.infrastructure.db.base import Base
 from app.infrastructure.nodes import build_registry
@@ -687,3 +688,32 @@ def test_no_workflow_configuration_can_carry_a_provider_credential() -> None:
         rendered = str(schema).lower()
         for word in ("gemini", "api_key", "apikey", "google_api_key"):
             assert word not in rendered, f"{descriptor.qualified_name} config mentions {word}"
+
+
+def test_the_event_vocabulary_stays_free_of_provider_concepts() -> None:
+    """An AI step is a *node* step, so the timeline says exactly what it says for
+    a no-op (Phase 10, M3).
+
+    ``AgentStarted``, ``LLMCalled``, ``TokenUsage``, ``PromptSent`` are all
+    plausible and all wrong here: they would put provider vocabulary into the
+    engine's basic language, which is the coupling ADR-013 exists to prevent, and
+    every future provider would then argue about which of its concepts deserve an
+    event. Observability of that kind is later work built *beside* the engine,
+    not inside its event model.
+
+    Pinned as an exact set rather than a denylist, so a new event type is a
+    deliberate decision with a reason rather than something that slipped in.
+    """
+
+    assert {event.value for event in RunEventType} == {
+        "RunStarted",
+        "RunSuspended",
+        "RunResumed",
+        "RunCompleted",
+        "RunFailed",
+        "NodeStarted",
+        "NodeSucceeded",
+        "NodeFailed",
+        "NodeSuspended",
+        "NodeSkipped",
+    }
