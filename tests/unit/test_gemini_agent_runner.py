@@ -574,6 +574,7 @@ async def test_the_agent_node_reaches_gemini_through_the_real_adapter(
             config=descriptor.config_model(instructions="Be terse.", model="default"),
             inputs={"main": "greet me"},
             idempotency_key="run:node:1",
+            organization_public_id="01ORGORGORGORGORGORGORGORG",
             trigger_payload={},
         )
     )
@@ -606,6 +607,7 @@ async def test_a_provider_failure_becomes_a_failed_node_rather_than_a_crash(
             config=descriptor.config_model(),
             inputs={"main": "hi"},
             idempotency_key="k",
+            organization_public_id="01ORGORGORGORGORGORGORGORG",
             trigger_payload={},
         )
     )
@@ -628,6 +630,7 @@ async def test_an_unconfigured_deployment_fails_the_node_without_faking(
             config=descriptor.config_model(),
             inputs={"main": "hi"},
             idempotency_key="k",
+            organization_public_id="01ORGORGORGORGORGORGORGORG",
             trigger_payload={},
         )
     )

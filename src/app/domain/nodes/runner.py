@@ -64,6 +64,29 @@ class NodeRunContext:
     learning that triggers exist (ADR-014, ADR-020). Empty when the run was
     started with nothing."""
 
+    organization_public_id: str
+    """Which tenant this run belongs to (ADR-016), as a **public** id (ADR-004).
+
+    Engine-supplied and **not authorable**: it is derived in ``RunService`` from
+    the run's own organization, never from node configuration, workflow input, or
+    anything a document contains. A node cannot widen it and cannot reach another
+    tenant with it.
+
+    Required rather than defaulted, deliberately. A default would mean a runner
+    that forgot to receive it silently operated against ``""`` — which for a
+    tenant-scoped lookup is not "no tenant" but "some other namespace", and the
+    failure would be a silent cross-tenant read rather than a loud error.
+
+    The *public* id rather than the internal ``BIGINT``: internal keys leak row
+    counts and have no business outside persistence, and every tenant-scoped
+    resource a node can reach is already namespaced by the public one.
+
+    Most runners ignore it, exactly as most ignore ``idempotency_key``. It is
+    here because *some* node work is tenant-scoped, and the alternative is each
+    such node discovering its own tenant — which is how one of them eventually
+    discovers the wrong one.
+    """
+
     resume_token: str | None = None
     """The token that resumed this invocation, or ``None`` on a fresh one.
 

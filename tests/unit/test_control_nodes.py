@@ -29,6 +29,7 @@ async def _decide(config: ConditionConfig, incoming: object = None) -> NodeResul
             config=config,
             inputs={"main": incoming} if incoming is not None else {},
             idempotency_key="1:1:1",
+            organization_public_id="01ORGORGORGORGORGORGORGORG",
             trigger_payload={},
         )
     )
@@ -49,6 +50,7 @@ async def _merge(inputs: dict[str, Any]) -> NodeResult:
             config=core_merge.MergeConfig(),
             inputs=inputs,
             idempotency_key="1:1:1",
+            organization_public_id="01ORGORGORGORGORGORGORGORG",
             trigger_payload={},
         )
     )

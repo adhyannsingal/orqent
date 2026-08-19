@@ -1,8 +1,9 @@
 # LangChain isolation and the `AgentRunner` boundary
 
 > **Status:** implemented at **Phase 10 M2**. Gemini is the first and only
-> provider. Tools, retrieval, and RAG are later milestones and are described
-> here only as the path they will take — nothing in those sections exists yet.
+> provider. **Tools** are a later milestone (M6) and are described here only as
+> the path they will take. **Retrieval** was expected to arrive on this seam too;
+> M5 built it and found that it does not belong here — see §13.
 
 Referenced by `architecture.md` and `ADR-013`, which promised this document long
 before there was an implementation to describe.
@@ -315,11 +316,10 @@ tier being exhausted is not an implementation problem.
 Described as a path, not as something that exists.
 
 ```
-ai.agent@1 → AgentRunner → LangChain adapter ─┬─ LLM        (M2, done)
-                                              ├─ retriever  (M4/M5)
-                                              └─ tools      (M6)
-                                                    ↓
-                                                 Chroma     (M4)
+ai.agent@1 ─┬─ KnowledgeRetriever → MemoryService → Embedder · Chroma   (M4/M5, done)
+            │       (retrieve, then augment the prompt)
+            └─ AgentRunner → LangChain adapter ─┬─ LLM     (M2, done)
+                                                └─ tools   (M6)
 ```
 
 - **M3 is done**: the full `queue → worker → scheduler → ai.agent → Gemini` path
@@ -327,11 +327,23 @@ ai.agent@1 → AgentRunner → LangChain adapter ─┬─ LLM        (M2, done)
   adapter — the only production correction was in the *node*, which now renders a
   structured input as JSON rather than Python's `repr` before it becomes
   `AgentRequest.prompt`. See `phase-10-implementation-spec.md` §15.
-- **M4/M5** add embeddings, ingestion, and Chroma retrieval. They attach to the
-  *adapter*, never to the engine or the workflow model — `ADR-003` as rescoped in
-  the redesign. `AgentRequest` gains a field; nothing above the port changes.
-- **M6** adds the tools the POC needs, on the same seam.
+- **M4 is done**: embeddings and Chroma retrieval, reached through `Embedder` and
+  `VectorStore`. The embedding adapter lives beside this one and shares its
+  credential; nothing else changed here.
+- **M5 is done, and it corrected the sketch this section used to draw.** Retrieval
+  was expected to attach to *this adapter*, behind `AgentRunner`, with
+  `AgentRequest` gaining a field. **It does not, and `AgentRequest` is unchanged.**
+  Retrieval needs the tenant and the node's configuration; generation needs
+  neither, so putting it behind this port would have meant widening the
+  provider-neutral description of one model call with an organization id and a
+  `top_k` that every generation adapter must remember to ignore — silently. A
+  deployment wired to the plain runner would then answer retrieval-enabled
+  workflows ungrounded with nothing to show for it. M5 composes retrieval in the
+  *node's* runner instead, where the tenant and the config already are. See
+  `phase-10-implementation-spec.md` §37.
+- **M6** adds the tools the POC needs, and those *do* belong on this seam: a tool
+  call is part of the model's own loop, which is exactly what this port describes.
 
-No placeholder field exists for any of them. The extension point is the port, not
-a reserved slot: `AgentRequest` is not an engine type, so widening it later
-touches the adapter and one node and nothing else.
+No placeholder field exists for any of it. The extension point is the port, not a
+reserved slot — and M5 is the demonstration that the right extension point is not
+always the one sketched in advance.

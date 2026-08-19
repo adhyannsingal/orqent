@@ -26,6 +26,17 @@ class OrganizationRepository:
         await self._session.flush()
         return organization
 
+    async def get_by_id(self, organization_id: int) -> Organization | None:
+        """One organization by its internal id.
+
+        Exists so ``RunService`` can translate the tenant it already holds into
+        the **public** id a node is given (ADR-004): the internal key is the one
+        in scope during execution, and the public one is the only shape that may
+        cross into a runner.
+        """
+
+        return await self._session.get(Organization, organization_id)
+
     async def slug_exists(self, slug: str) -> bool:
         """Return whether ``slug`` is already taken.
 

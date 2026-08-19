@@ -184,7 +184,15 @@ def test_the_context_carries_the_validated_config_model() -> None:
         (GraphNode(key="c", node_type="core.constant", version=1, config={"value": "hi"}),), (), {}
     )
 
-    context = build_context(snapshot, _registry(), "c", run_id=1, workflow_node_id=2, attempt=1)
+    context = build_context(
+        snapshot,
+        _registry(),
+        "c",
+        run_id=1,
+        organization_public_id="01ORGORGORGORGORGORGORGORG",
+        workflow_node_id=2,
+        attempt=1,
+    )
 
     assert isinstance(context.config, BaseModel)
     assert context.config.value == "hi"  # type: ignore[attr-defined]
@@ -193,7 +201,15 @@ def test_the_context_carries_the_validated_config_model() -> None:
 def test_the_context_carries_the_idempotency_key() -> None:
     snapshot = _snapshot((GraphNode(key="t", node_type="trigger.manual", version=1),), (), {})
 
-    context = build_context(snapshot, _registry(), "t", run_id=9, workflow_node_id=8, attempt=2)
+    context = build_context(
+        snapshot,
+        _registry(),
+        "t",
+        run_id=9,
+        organization_public_id="01ORGORGORGORGORGORGORGORG",
+        workflow_node_id=8,
+        attempt=2,
+    )
 
     assert context.idempotency_key == "9:8:2"
 
@@ -206,7 +222,15 @@ def test_the_context_carries_the_trigger_payload() -> None:
         trigger_payload={"order": 7},
     )
 
-    context = build_context(snapshot, _registry(), "t", run_id=1, workflow_node_id=1, attempt=1)
+    context = build_context(
+        snapshot,
+        _registry(),
+        "t",
+        run_id=1,
+        organization_public_id="01ORGORGORGORGORGORGORGORG",
+        workflow_node_id=1,
+        attempt=1,
+    )
 
     assert context.trigger_payload == {"order": 7}
 
@@ -216,7 +240,15 @@ def test_an_absent_trigger_payload_becomes_an_empty_mapping() -> None:
 
     snapshot = _snapshot((GraphNode(key="t", node_type="trigger.manual", version=1),), (), {})
 
-    context = build_context(snapshot, _registry(), "t", run_id=1, workflow_node_id=1, attempt=1)
+    context = build_context(
+        snapshot,
+        _registry(),
+        "t",
+        run_id=1,
+        organization_public_id="01ORGORGORGORGORGORGORGORG",
+        workflow_node_id=1,
+        attempt=1,
+    )
 
     assert context.trigger_payload == {}
 
@@ -231,7 +263,15 @@ def test_every_node_receives_the_payload_not_only_the_trigger() -> None:
         trigger_payload={"a": 1},
     )
 
-    context = build_context(snapshot, _registry(), "n", run_id=1, workflow_node_id=1, attempt=1)
+    context = build_context(
+        snapshot,
+        _registry(),
+        "n",
+        run_id=1,
+        organization_public_id="01ORGORGORGORGORGORGORGORG",
+        workflow_node_id=1,
+        attempt=1,
+    )
 
     assert context.trigger_payload == {"a": 1}
 
@@ -240,7 +280,15 @@ def test_an_unknown_node_key_is_refused() -> None:
     snapshot = _snapshot((_node("a"),), (), {})
 
     with pytest.raises(DomainRuleError, match="no node 'ghost'"):
-        build_context(snapshot, _registry(), "ghost", run_id=1, workflow_node_id=1, attempt=1)
+        build_context(
+            snapshot,
+            _registry(),
+            "ghost",
+            run_id=1,
+            organization_public_id="01ORGORGORGORGORGORGORGORG",
+            workflow_node_id=1,
+            attempt=1,
+        )
 
 
 def test_config_the_node_type_no_longer_accepts_is_reported_against_the_node() -> None:
@@ -252,7 +300,15 @@ def test_config_the_node_type_no_longer_accepts_is_reported_against_the_node() -
     )
 
     with pytest.raises(DomainRuleError, match="no longer accepts"):
-        build_context(snapshot, _registry(), "c", run_id=1, workflow_node_id=1, attempt=1)
+        build_context(
+            snapshot,
+            _registry(),
+            "c",
+            run_id=1,
+            organization_public_id="01ORGORGORGORGORGORGORGORG",
+            workflow_node_id=1,
+            attempt=1,
+        )
 
 
 # --- Invocation -------------------------------------------------------------
@@ -281,7 +337,13 @@ def _custom(runner: NodeRunner, node_type: str = "test.node") -> NodeRegistry:
 
 
 def _context() -> NodeRunContext:
-    return NodeRunContext(config=_Config(), inputs={}, idempotency_key="1:1:1", trigger_payload={})
+    return NodeRunContext(
+        config=_Config(),
+        inputs={},
+        idempotency_key="1:1:1",
+        organization_public_id="01ORGORGORGORGORGORGORGORG",
+        trigger_payload={},
+    )
 
 
 async def test_a_completed_result_is_returned_unchanged() -> None:
@@ -355,7 +417,15 @@ async def test_the_real_manual_trigger_emits_the_run_payload() -> None:
         trigger_payload={"order": 7},
     )
     registry = _registry()
-    context = build_context(snapshot, registry, "t", run_id=1, workflow_node_id=1, attempt=1)
+    context = build_context(
+        snapshot,
+        registry,
+        "t",
+        run_id=1,
+        organization_public_id="01ORGORGORGORGORGORGORGORG",
+        workflow_node_id=1,
+        attempt=1,
+    )
 
     result = await invoke(snapshot, registry, "t", context)
 
@@ -365,7 +435,15 @@ async def test_the_real_manual_trigger_emits_the_run_payload() -> None:
 async def test_the_manual_trigger_emits_an_empty_object_when_started_with_nothing() -> None:
     snapshot = _snapshot((GraphNode(key="t", node_type="trigger.manual", version=1),), (), {})
     registry = _registry()
-    context = build_context(snapshot, registry, "t", run_id=1, workflow_node_id=1, attempt=1)
+    context = build_context(
+        snapshot,
+        registry,
+        "t",
+        run_id=1,
+        organization_public_id="01ORGORGORGORGORGORGORGORG",
+        workflow_node_id=1,
+        attempt=1,
+    )
 
     result = await invoke(snapshot, registry, "t", context)
 
@@ -393,7 +471,15 @@ async def test_a_suspended_result_is_returned_untouched() -> None:
 def test_a_fresh_invocation_carries_no_resume_token() -> None:
     snapshot = _snapshot((GraphNode(key="w", node_type="core.wait", version=1),), (), {})
 
-    context = build_context(snapshot, _registry(), "w", run_id=1, workflow_node_id=1, attempt=1)
+    context = build_context(
+        snapshot,
+        _registry(),
+        "w",
+        run_id=1,
+        organization_public_id="01ORGORGORGORGORGORGORGORG",
+        workflow_node_id=1,
+        attempt=1,
+    )
 
     assert context.resume_token is None
 
@@ -406,6 +492,7 @@ def test_a_resumed_invocation_carries_the_token_that_resumed_it() -> None:
         _registry(),
         "w",
         run_id=1,
+        organization_public_id="01ORGORGORGORGORGORGORGORG",
         workflow_node_id=1,
         attempt=1,
         resume_token="01ABCDEFGHJKMNPQRSTVWXYZ00",
@@ -420,9 +507,24 @@ def test_the_idempotency_key_is_unchanged_by_a_resume() -> None:
 
     snapshot = _snapshot((GraphNode(key="w", node_type="core.wait", version=1),), (), {})
 
-    first = build_context(snapshot, _registry(), "w", run_id=5, workflow_node_id=6, attempt=2)
+    first = build_context(
+        snapshot,
+        _registry(),
+        "w",
+        run_id=5,
+        organization_public_id="01ORGORGORGORGORGORGORGORG",
+        workflow_node_id=6,
+        attempt=2,
+    )
     resumed = build_context(
-        snapshot, _registry(), "w", run_id=5, workflow_node_id=6, attempt=2, resume_token="t"
+        snapshot,
+        _registry(),
+        "w",
+        run_id=5,
+        organization_public_id="01ORGORGORGORGORGORGORGORG",
+        workflow_node_id=6,
+        attempt=2,
+        resume_token="t",
     )
 
     assert first.idempotency_key == resumed.idempotency_key == "5:6:2"
@@ -438,6 +540,7 @@ async def _wait(inputs: dict[str, object], resume_token: str | None) -> NodeResu
         config=core_wait.WaitConfig(),
         inputs=inputs,
         idempotency_key="1:1:1",
+        organization_public_id="01ORGORGORGORGORGORGORGORG",
         trigger_payload={},
         resume_token=resume_token,
     )

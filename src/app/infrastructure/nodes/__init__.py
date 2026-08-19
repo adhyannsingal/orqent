@@ -13,12 +13,14 @@ of the catalogue a decision rather than an accident of the filesystem.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Final
 
 from app.domain.nodes.descriptor import NodeDescriptor
 from app.domain.nodes.registry import NodeRegistry
 from app.domain.nodes.runner import NodeRunner
 from app.domain.ports.agent_runner import AgentRunner
+from app.domain.ports.knowledge import KnowledgeRetriever
 from app.infrastructure.llm.mock_agent_runner import MockAgentRunner
 from app.infrastructure.nodes.builtin import (
     ai_agent,
@@ -49,7 +51,10 @@ _BUILT_INS: Final[tuple[tuple[NodeDescriptor, NodeRunner], ...]] = (
 )
 
 
-def build_registry(agents: AgentRunner | None = None) -> NodeRegistry:
+def build_registry(
+    agents: AgentRunner | None = None,
+    knowledge: Callable[[], KnowledgeRetriever] | None = None,
+) -> NodeRegistry:
     """Assemble the catalogue.
 
     Pure: no database, no settings, no I/O. That is what lets the container
@@ -61,6 +66,14 @@ def build_registry(agents: AgentRunner | None = None) -> NodeRegistry:
     existing callers want a catalogue for *authoring*, validation, or the
     node-type API, and never invoke a runner at all; requiring it would have
     meant touching every one of them to say something they do not care about.
+
+    ``knowledge`` is the second, and belongs to the same node: how it reaches the
+    organization's documents (M5). A **factory**, because constructing a
+    retriever needs an embedding credential this deployment may not have, and a
+    catalogue must be buildable without one — see ``AgentNodeRunner``. Omitting
+    it yields a catalogue that cannot retrieve, which is correct for authoring
+    and validation and fails loudly rather than silently if an agent configured
+    for retrieval is ever executed through it.
 
     **The default is a deterministic mock, and the container passes one
     explicitly anyway.** Defaulting keeps tests and tooling to a single line;
@@ -74,5 +87,5 @@ def build_registry(agents: AgentRunner | None = None) -> NodeRegistry:
         registry.register(descriptor, runner)
     # Registered here rather than in `_BUILT_INS` because it is the only node
     # whose runner is constructed rather than a module-level singleton.
-    registry.register(ai_agent.DESCRIPTOR, ai_agent.runner(agents or MockAgentRunner()))
+    registry.register(ai_agent.DESCRIPTOR, ai_agent.runner(agents or MockAgentRunner(), knowledge))
     return registry

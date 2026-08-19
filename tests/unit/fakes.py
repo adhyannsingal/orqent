@@ -186,6 +186,12 @@ class FakeOrganizationRepository:
         self._db.pending_organizations.append(organization)
         return organization
 
+    async def get_by_id(self, organization_id: int) -> Organization | None:
+        """Mirrors the real repository: the run service resolves the tenant's
+        public id through this once per advance (Phase 10, M5)."""
+
+        return next((o for o in self._db.visible_organizations if o.id == organization_id), None)
+
     async def slug_exists(self, slug: str) -> bool:
         return any(o.slug == slug for o in self._db.visible_organizations)
 

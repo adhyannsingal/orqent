@@ -296,6 +296,7 @@ def test_run_context_carries_config_and_inputs() -> None:
         config=_Config(value="v"),
         inputs={"main": 1},
         idempotency_key="1:1:1",
+        organization_public_id="01ORGORGORGORGORGORGORGORG",
         trigger_payload={},
     )
 
@@ -306,7 +307,11 @@ def test_run_context_carries_config_and_inputs() -> None:
 def test_unconnected_input_is_absent_rather_than_none() -> None:
     # "not connected" and "connected to null" must stay distinguishable.
     context = NodeRunContext(
-        config=_Config(), inputs={}, idempotency_key="1:1:1", trigger_payload={}
+        config=_Config(),
+        inputs={},
+        idempotency_key="1:1:1",
+        organization_public_id="01ORGORGORGORGORGORGORGORG",
+        trigger_payload={},
     )
 
     assert "main" not in context.inputs

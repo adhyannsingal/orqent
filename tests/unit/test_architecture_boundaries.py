@@ -26,7 +26,7 @@ from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
-from pydantic import SecretStr
+from pydantic import BaseModel, SecretStr
 
 import app
 from app.core.config import Settings
@@ -790,3 +790,134 @@ def test_no_layer_outside_the_adapters_imports_chromadb() -> None:
         for path in _modules(package):
             imported = _imported_names(path)
             assert not any(name.startswith("chromadb") for name in imported), path.name
+
+
+# =============================================================================
+# Retrieval-augmented generation (Phase 10, M5)
+# =============================================================================
+#
+# M5 joins retrieval to generation. The risk it introduces is not that RAG works
+# badly — it is that RAG becomes *load-bearing*: that the engine learns to
+# schedule around it, that the queue learns to carry it, or that the tenant it
+# retrieves from becomes something a workflow can name. These guards say none of
+# that happened.
+
+_RAG_VOCABULARY = (
+    "retriev",
+    "knowledge",
+    "chroma",
+    "embed",
+    "rag",
+    "augment",
+    "vector",
+    "chunk",
+)
+
+
+@pytest.mark.parametrize("module", _ENGINE_MODULES)
+def test_the_engine_has_no_vocabulary_for_retrieval(module: str) -> None:
+    """The engine schedules nodes; it does not know some of them read documents.
+
+    Checked against the *source text* rather than imports, because the way this
+    boundary actually erodes is a special case — "if the node retrieves, give it
+    longer" — not an import anyone would notice in review.
+    """
+
+    source = _code_only(SRC / module).lower()
+    found = [word for word in _RAG_VOCABULARY if word in source]
+
+    assert not found, f"{module} mentions {found}"
+
+
+@pytest.mark.parametrize("module", _ENGINE_MODULES)
+def test_the_engine_does_not_know_the_knowledge_port_exists(module: str) -> None:
+    """The same statement as for ``AgentRunner``, for the same reason: retrieval
+    is an implementation detail of one node's runner (ADR-014, ADR-020)."""
+
+    assert not _violations(
+        SRC / module,
+        (
+            "app.domain.ports.knowledge",
+            "app.domain.ports.vector_store",
+            "app.services.memory_service",
+        ),
+    )
+
+
+@pytest.mark.parametrize("package", ["app.infrastructure.queue", "app.infrastructure.worker"])
+def test_the_queue_and_worker_know_nothing_about_retrieval(package: str) -> None:
+    """A queued AI node is a queued node. Nothing about the transport changes
+    because the work it names happens to read documents first."""
+
+    for path in _modules(package):
+        source = _code_only(path).lower()
+        found = [word for word in _RAG_VOCABULARY if word in source]
+        assert not found, f"{_relative(path)} mentions {found}"
+
+
+def test_the_dispatcher_knows_nothing_about_retrieval() -> None:
+    for path in _modules("app.infrastructure.dispatcher"):
+        source = _code_only(path).lower()
+        assert not [word for word in _RAG_VOCABULARY if word in source], _relative(path)
+
+
+def test_the_run_service_never_reaches_a_vector_store() -> None:
+    """``RunService`` resolves the tenant and hands it to a node. That is the
+    whole of its involvement in M5, and it must not grow: a run service that
+    could retrieve would be a run service that could retrieve for the wrong
+    tenant."""
+
+    assert not _violations(
+        SRC / "services/run_service.py",
+        (
+            "app.domain.ports.vector_store",
+            "app.domain.ports.knowledge",
+            "app.domain.ports.embedder",
+            "app.services.memory_service",
+            "app.infrastructure.vector",
+        ),
+    )
+
+
+def test_the_agent_node_reaches_documents_only_through_the_port() -> None:
+    """The node composes retrieval and generation, so it is the module where a
+    shortcut to Chroma or to ``MemoryService`` would be most convenient."""
+
+    node = SRC / "infrastructure/nodes/builtin/ai_agent.py"
+
+    assert not _violations(
+        node,
+        (
+            "app.services",
+            "app.infrastructure.vector",
+            "app.infrastructure.llm",
+            "app.domain.ports.embedder",
+            "app.domain.ports.vector_store",
+        ),
+    )
+
+
+def test_no_node_configuration_can_name_a_tenant() -> None:
+    """**The tenant is engine-supplied, and this is the mechanical statement of
+    it.** A config field naming an organization would be a field an author could
+    set, stored in a published version, and read at execution — which is exactly
+    the cross-tenant path M5 exists to make impossible.
+
+    Checked across the whole catalogue rather than ``ai.agent@1`` alone: the next
+    tenant-scoped node type is the one that would get this wrong.
+    """
+
+    forbidden = {"organization", "organization_id", "organization_public_id", "tenant", "org_id"}
+
+    for descriptor in build_registry().all():
+        config_models = [descriptor.config_model]
+        # Nested models are where it would actually appear — `retrieval.org_id`
+        # rather than a top-level field somebody would notice.
+        for field in descriptor.config_model.model_fields.values():
+            for candidate in getattr(field.annotation, "__args__", ()) or (field.annotation,):
+                if isinstance(candidate, type) and issubclass(candidate, BaseModel):
+                    config_models.append(candidate)
+
+        for model in config_models:
+            leaked = forbidden & set(model.model_fields)
+            assert not leaked, f"{descriptor.qualified_name} config exposes {leaked}"

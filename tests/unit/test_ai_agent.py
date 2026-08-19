@@ -63,6 +63,7 @@ def _context(
         config=config or AgentConfig(),
         inputs=inputs or {},
         idempotency_key=idempotency_key,
+        organization_public_id="01ORGORGORGORGORGORGORGORG",
         trigger_payload={},
     )
 
@@ -429,4 +430,5 @@ def test_the_config_is_an_ordinary_pydantic_model() -> None:
         "instructions",
         "model",
         "temperature",
+        "retrieval",
     }
