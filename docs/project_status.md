@@ -13,8 +13,12 @@ Status:         Healthy — Phases 1–9 complete, migrations 0001–0008 applie
                 schedule fired by a dispatcher process. 2135 tests (1641
                 default + 494 integration), 0 failures, 0 skips;
                 ruff/mypy/alembic/architecture green.
-Next Milestone: Phase 10 — Human-in-the-loop (approval node, inbox API) — NOT
-                STARTED
+Next Stage:     FRONTEND. Phase 10 (AI execution layer) is complete, and with
+                it the ten-phase backend plan: agent execution behind a
+                provider-neutral port, LangChain/Gemini, embeddings, Chroma
+                retrieval, tenant-scoped RAG, and provider-neutral tool calling.
+                2793 tests (2187 default + 606 integration), 0 failures;
+                ruff/mypy/alembic/architecture green; migration head 0009.
 ```
 
 > **Phase renumbering (2026-08-10).** Phase 5 is the **Workflow Authoring API**;
@@ -731,7 +735,8 @@ guarantees the runtime stage contains exactly what the builder produced.
 ### Local development workflow
 
 ```bash
-docker compose up --build   # full stack: api :8000, mysql :3306, chroma :8001
+docker compose up --build   # full stack: api :8000, mysql :3306, chroma :8001,
+                            # plus the worker and dispatcher processes
 # or hybrid: run infra in Docker, app on the host:
 docker compose up mysql chroma
 uvicorn app.main:app --reload
@@ -815,20 +820,42 @@ execution engine (Phase 6) is tested against a **mock `AgentRunner`**.
   API and the worker: `python -m app.infrastructure.dispatcher`.
   Authoritative description:
   **[phase-9-implementation-spec.md](phase-9-implementation-spec.md)**.
-- [ ] **Phase 10 — Human-in-the-loop** 🟢 *next* · *Objective:* approval node,
-  inbox API, authorization, timeouts/escalation. *Depends on:* 6.
-  *Complexity:* **Medium**.
-- [ ] **Phase 11 — Connections + I/O nodes** · *Objective:* encrypted
-  connections (ADR-027); HTTP, Email, Database, File nodes behind the egress
-  policy (ADR-029). *Depends on:* 6. *Complexity:* **High (security)**.
-- [ ] **Phase 12 — AI Agent node** · *Objective:* `ai.agent@1` as an ordinary
-  data node; `AgentRunner` port + LangChain adapter (ADR-013); provider
-  configuration and credentials. *Depends on:* 6, 11. *Complexity:* **Medium**.
-- [ ] **Phase 13 — Memory / RAG** · *Objective:* Chroma-backed retrieval for
-  the agent node (ADR-003). *Depends on:* 12. *Complexity:* **Medium-High**.
-- [ ] **Phase 14 — Observability, quotas, retention** · *Objective:* metrics,
-  audit, purge jobs, SSE streaming. *Depends on:* all prior. *Complexity:*
-  **Medium**.
+- [x] **Phase 10 — AI execution layer** ✅ **COMPLETE** · the final backend
+  phase. Delivered as seven milestones: `AgentRunner` + `ai.agent@1` contracts
+  (M1), the LangChain/Gemini adapter (M2), real AI execution through the Phase 8
+  queue and worker (M3), embeddings + document ingestion + Chroma retrieval +
+  migration **0009** (M4), tenant-scoped RAG (M5), provider-neutral tools and
+  bounded tool calling (M6), and backend acceptance, audit, and closure (M7).
+  Authoritative description:
+  **[phase-10-implementation-spec.md](phase-10-implementation-spec.md)**.
+
+> **Numbering, settled (2026-08-19).** The list above previously ran to Phase 14
+> with human-in-the-loop at 10, the AI agent node at 12, and RAG at 13. **The
+> project follows a ten-phase backend plan**, so Phase 10 is the AI execution
+> layer and the last backend phase; the capabilities that older numbering placed
+> at 10–14 are not cancelled, they are **deferred past the POC backend**. The
+> pre-redesign plan in [roadmap.md](roadmap.md) §6 is retained as history and is
+> deliberately not rewritten. Full reasoning:
+> [phase-10-implementation-spec.md](phase-10-implementation-spec.md) §0.
+
+### Deferred past the backend, not delivered
+
+Recorded here so nothing below is mistaken for complete. Each was verified absent
+from the repository at Phase 10 M7.
+
+- **Human-in-the-loop** — approval node, inbox API, timeouts, escalation.
+- **Connections and secrets** (ADR-027) and the **I/O nodes** that need them —
+  HTTP, Email, Database, File — behind the egress policy (ADR-029).
+- **Observability, quotas, retention** — metrics, audit, purge jobs, SSE
+  streaming, per-org fairness and priority (ADR-030), payload externalisation
+  (ADR-025).
+- **Execution policy** — retry/backoff, node timeouts, run cancellation.
+- **Trigger management** — registration and schedule APIs, timezone-aware
+  schedules, pause/resume, catch-up policy, webhook body limits and dedup.
+- **AI follow-ons** — a public document-ingestion API (the one gap that blocks
+  *using* RAG from a frontend; see the spec §72), per-corpus targeting, citation
+  output, durable tool-call observability, side-effecting tools, structured
+  output, persistent agent memory.
 
 **On Phase 4's M12 and M13.** `phase-4-implementation-spec.md` (FROZEN) ends with
 **M12** (workflow HTTP API) and **M13** (documentation sign-off). Neither was

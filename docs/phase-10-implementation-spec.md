@@ -80,7 +80,7 @@ they had already agreed. Nothing was invented.
 | **M4** | **Embeddings + document ingestion + Chroma retrieval** | ✅ **complete** |
 | **M5** | **Agent + retrieval (RAG): tenant-scoped grounding inside `ai.agent@1`** | ✅ **complete** |
 | **M6** | **Provider-neutral tools and tool calling inside `ai.agent@1`** | ✅ **complete** |
-| **M7** | Backend acceptance, documentation, and **backend closure** | ⬜ not started |
+| **M7** | **Backend acceptance, audit, documentation, and backend closure** | ✅ **complete** |
 
 One refinement against the working structure: **M2 must also settle where the
 provider credential lives**, because a LangChain adapter cannot be written
@@ -1210,3 +1210,255 @@ Arbitrary HTTP, database, shell, Python, or filesystem tools · Gmail · Slack �
 GitHub · MCP · connections and secrets · OAuth · any external side-effecting
 action · human approval · a durable tool-call ledger · billing and quotas ·
 retry/backoff · LangGraph · long-running agent loops · tools as sub-workflows.
+
+---
+
+# M7 — acceptance, audit, and backend closure
+
+**Phase 10 is complete, and with it the ten-phase backend plan.**
+
+M1–M6 each proved a piece. M7 asks the question none of them could: do Phases
+1–10 compose into one backend? It is a closure milestone — 24 acceptance
+scenarios, two architecture guards, two production fixes, and documentation. No
+new subsystem.
+
+## 65. What the backend actually is
+
+Derived from the repository, not from a roadmap:
+
+| Capability | Where it lives | Phase |
+|---|---|---|
+| Organizations, tenancy-as-column | `organizations`, every owned row | 1–2 |
+| Auth: register/login/refresh/logout/me, roles | `AuthService`, ADR-010 | 3 |
+| Workflow authoring, drafts, validation | `WorkflowService`, closed type lattice | 4 |
+| Immutable published versions | `workflow_versions`, ADR-026 | 4 |
+| Node catalogue, contracts, JSON Schema | `build_registry`, `/node-types`, ADR-022 | 4 |
+| Durable resumable execution, suspension | `RunService`, `run_events`, ADR-019 | 5–6 |
+| Branching, skipping, merge, join policies | engine, ADR-028 | 7 |
+| Durable queue, worker, leases, recovery | `queue_tasks`, `SKIP LOCKED`, ADR-015 | 8 |
+| Concurrent independent nodes | `asyncio.gather` in the scheduler | 8 |
+| Webhook + schedule triggers, dispatcher | `/hooks/{token}`, `schedules` | 9 |
+| AI generation behind a provider-neutral port | `AgentRunner`, ADR-013 | 10 |
+| Embeddings, ingestion, Chroma retrieval | `Embedder`, `VectorStore`, ADR-003 | 10 |
+| Tenant-scoped RAG | `KnowledgeRetriever`, ADR-016 | 10 |
+| Provider-neutral tools, bounded loop | `ToolRegistry`, ADR-024 | 10 |
+
+## 66. Two production defects, both found by audit
+
+**1. The local stack could not execute a run.** `docker-compose.yml` defined
+`api`, `mysql`, and `chroma`, while `project_status.md` described
+`docker compose up` as the "full stack". It was not: with no `worker`, a run
+accepted over the API queues in `queue_tasks` and never advances; with no
+`dispatcher`, a schedule never fires. The stack looks healthy and does nothing,
+which is the worst way for this to be wrong. M3 recorded the gap and correctly
+called it deployment work; M7 *is* that work.
+
+Fixed minimally — same image, three roles, only the entrypoint differs:
+
+| Service | Command | Gemini | Chroma |
+|---|---|---|---|
+| `api` | uvicorn (image default) | ✅ | ✅ |
+| `worker` | `python -m app.infrastructure.worker` | ✅ | ✅ |
+| `dispatcher` | `python -m app.infrastructure.dispatcher` | ❌ | ❌ |
+
+The worker gets the credential and Chroma because **the worker is the process
+that invokes `ai.agent@1`** — configuring only the API would configure the one
+process that never calls a provider. The dispatcher gets neither: it claims a due
+schedule and enqueues a run, and a credential it cannot use is a credential in
+one more environment, one more log, and one more core dump. The value is
+interpolated (`${GEMINI_API_KEY:-}`), never written into the file.
+
+Guarded by `test_the_local_stack_can_actually_execute_a_run` and
+`test_only_the_processes_that_use_the_credential_are_given_it`.
+
+**2. `project_status.md` described a superseded plan.** It listed Phase 10 as
+human-in-the-loop, AI as Phase 12, RAG as Phase 13 — the pre-decision numbering
+that §0 of this document settled. Corrected surgically; the historical roadmap
+material in `roadmap.md` §6 is deliberately left untouched.
+
+## 67. The acceptance suite
+
+`tests/integration/test_phase_10_acceptance.py` — **26 scenarios, zero live
+provider calls.** Real FastAPI routes, real MySQL, the real queue, a real Phase 8
+worker, the real Phase 9 dispatcher, the real registry, the real tool registry
+and calculator. Only the model is scripted.
+
+That last point is a design decision, not a shortcut: the Gemini free tier is a
+shared exhaustible resource, and **a backend whose acceptance suite cannot run
+without it is a backend nobody can verify.** Live proof is gated separately.
+
+No test calls `RunService.advance` or invokes a node runner directly.
+
+| Scenario | Proves |
+|---|---|
+| AI end-to-end | publish → `POST /runs` → queue → worker → agent → output → downstream |
+| Ordinary event vocabulary | no AI/RAG/tool event types exist |
+| RAG end-to-end | synthetic fact reaches the answer only via retrieval |
+| Retrieval-only provenance | the fact is in neither the question nor the instructions |
+| Cross-tenant isolation | both orgs hold documents; only the *other* holds the answer |
+| Tenant cannot be redirected | hostile input searched in the caller's namespace; hostile config refused at publish |
+| Public id, not internal key | the tenant reaching retrieval is never the `BIGINT` |
+| Tool end-to-end | instrumented on the executor, not on the final text |
+| One node execution | two model turns + a tool call, at attempt 1 |
+| **RAG + tools composed** | one invocation: retrieve once, augment, call a tool, answer |
+| **Webhook → RAG agent** | no `POST /runs`; payload and tenant both correct |
+| **Schedule → AI** | dispatcher not bypassed; occurrence reaches the agent |
+| Branch pruning | a skipped agent is never invoked — the provider is never reached |
+| Selected branch | the other side runs normally |
+| Concurrency | a barrier that deadlocks if AI execution serialises |
+| Provider failure | run FAILED, downstream stopped, queue settled, worker survived |
+| Sanitised errors | no credential, traceback, or provider internals persisted |
+| Retrieval outage | node fails; **the provider is never asked** |
+| Empty corpus | nothing matched still answers |
+| Unapproved tool | rejected before the implementation |
+| Invalid arguments | never reach the implementation |
+| Unknown tool | refused at publish |
+| **No AI infrastructure** | an ordinary workflow completes with `GEMINI_API_KEY` absent |
+| Catalogue without a credential | `/node-types` serves; authoring needs no provider |
+| **Chroma unreachable, no RAG** | a non-retrieving run completes against a dead vector store |
+| **Chroma unreachable, RAG** | the node fails, the provider is never asked, the address never leaks |
+
+### Chroma's failure domain
+
+M4 proved *startup* survives an unreachable vector store. Only an acceptance test
+can show that a **run** does, and both directions matter: a workflow that never
+retrieves completes normally while Chroma is down, and one that does retrieve
+fails cleanly rather than hanging or answering ungrounded. Both use the real
+`ChromaVectorStore` pointed at a closed port — `127.0.0.1:1` rather than an
+unroutable address, because a refused connection fails in milliseconds where a
+blackholed one costs the 75-second timeout M4 discovered the slow way.
+
+## 68. Architecture audit
+
+Two boundaries were genuinely unguarded before M7:
+
+- **`test_a_node_runner_owns_no_persistence_queue_or_route`** — no runner in the
+  catalogue may import a session, engine, unit of work, repository, the queue,
+  the worker, the dispatcher, the API layer, SQLAlchemy, or FastAPI. Phase 10 is
+  where this stopped being obvious: the AI runner grew to compose retrieval and
+  tools, both of which genuinely need data, so the tempting shortcut was a
+  session right there rather than a port handed in at construction.
+- **The two Compose guards** above.
+
+Everything else was already covered by the 54 guards M1–M6 accumulated. Total:
+**385 architecture assertions**.
+
+## 69. Security audit
+
+`.env` ignored and untracked · no credential literal anywhere in tracked source ·
+`gemini_api_key` is `SecretStr | None` · Compose interpolates, never embeds ·
+**no logging at all** in the AI node, the tool contract, the tool catalogue, or
+the augmentation module · webhook raw tokens exist once and only a digest is
+stored · tenant authority runs Run → organization →
+`NodeRunContext.organization_public_id` → retrieval namespace, and nothing an
+author, a caller, a document, or a model can write participates in it.
+
+## 70. Live-provider strategy
+
+**Gated operational checks, not CI gates.** `tests/gemini/` (11 tests) runs only
+under `ORQENT_GEMINI_SMOKE=1 pytest -m gemini`. Generation (M2), full runtime
+(M3), embeddings (M4), RAG (M5), and tool calling (M6) have each passed against
+the real provider and that evidence stands.
+
+They are excluded from the default suite by `addopts` because the free tier is
+exhaustible: M5's verification emptied it once, and M6's live discrimination run
+was quota-blocked minutes after its live test passed. The tests skip — narrowly,
+on the adapter's own transient wordings — rather than fail, so a red gated suite
+still means something.
+
+**At M7 the suite was run once and is quota-blocked for generation.** Of eleven
+gated tests, the generation-dependent ones (`test_gemini_smoke`,
+`test_gemini_runtime`, `test_gemini_rag`, `test_gemini_tools`) skipped with *"The
+model provider is rate limiting this deployment"*; a repeat run degraded further
+(5 passing, then 3), confirming an exhausting quota rather than a defect, so no
+further calls were made. The credential itself is valid — the tests that do not
+generate still pass.
+
+**This is not an M7 failure.** Live generation (M2), full runtime (M3),
+embeddings (M4), RAG (M5), and tool calling (M6) each passed against the real
+provider when quota was available, and that evidence stands. Offline acceptance
+is green and requires no quota, which is exactly the property that makes the
+backend verifiable by anyone.
+
+## 71. Deferred, and honestly so
+
+Verified against the repository; none of these is implemented.
+
+**Execution:** retry/backoff · node timeouts · per-org fairness, quotas, priority
+(ADR-030) · payload externalisation to object storage (ADR-025) · run
+cancellation endpoint.
+**Triggers:** registration management API · webhook body-size limits · delivery
+dedup/idempotency · schedule management API · timezone-aware schedules · pause /
+resume · catch-up policy.
+**AI:** a public document-ingestion API (see §72) · per-corpus / knowledge-base
+targeting · RAG citation output · stronger prompt-injection defences · durable
+tool-call observability · side-effecting tools · persistent agent memory ·
+structured output · reranking · hybrid search · MySQL↔Chroma reconciliation.
+**Platform:** human-in-the-loop (approval node, inbox) · connections and secrets
+(ADR-027) · OAuth · HTTP/DB/file/email nodes and the egress policy (ADR-029) ·
+external integrations · MCP · LangGraph · tools as sub-workflows.
+
+## 72. The one frontend blocker
+
+**There is no HTTP surface for document ingestion.** `MemoryService.ingest_document`
+exists, is tested, and works — but nothing in `app/api` reaches it. A frontend can
+publish a retrieval-enabled agent and can never populate the corpus it retrieves
+from.
+
+By the standard that matters — *does a missing endpoint make a completed backend
+capability impossible to use from the frontend?* — this one does, for RAG
+specifically. Everything else is reachable: auth, workflow CRUD, drafts,
+validation, publish, versions, the node catalogue, run creation, run detail
+(which includes `node_executions`, so a run timeline is buildable), run events,
+resume, and webhook delivery.
+
+It is **not** built here. M7 is a closure milestone, and a new API surface with
+its own schemas, authorization, and tenancy is scope for a milestone of its own.
+Recorded as the recommended immediate next step.
+
+## 73. Backend Definition of Done
+
+Only checked where demonstrated by a passing test or a verified command.
+
+- [x] Backend starts locally — `docker compose config` valid, five services
+- [x] Migrations clean — linear `0001…0009`, round-tripped, `alembic check` clean
+- [x] Auth works — register / login / refresh / logout / me
+- [x] Tenancy enforced — every owned row scoped; cross-tenant reads refused
+- [x] Workflow authoring works — draft save, validate, node-anchored errors
+- [x] Publication works — immutable versions, `version_no`, active pointer
+- [x] Run creation works — `POST /api/v1/runs`
+- [x] Queue and worker work — `SKIP LOCKED`, leases, recovery
+- [x] Branching works — condition, pruning, merge, join policies
+- [x] Suspension and resume work — `core.wait@1`, resume tokens
+- [x] Concurrent ready nodes work — barrier-proved, including AI nodes
+- [x] Webhook triggers work — `POST /hooks/{token}` → run → completion
+- [x] Schedule triggers work — due schedule → dispatcher → queue → completion
+- [x] Dispatcher works — `SKIP LOCKED`, skip-forward, atomic run creation
+- [x] AI generation works — offline through the full runtime; live at M2/M3
+- [x] Non-AI backend works without a provider key — proved with the variable unset
+- [x] Embeddings work — live at M4 (`gemini-embedding-001`, 3072-d)
+- [x] Ingestion and retrieval work — MySQL source of truth, Chroma derived
+- [x] RAG works — offline acceptance; live at M5
+- [x] Cross-tenant RAG blocked — config, input, and metadata all refused
+- [x] Tools work — offline acceptance; live at M6
+- [x] Unapproved tools blocked — allow-list enforced at execution
+- [x] RAG + tools compose — one invocation, both capabilities
+- [x] Failures persist safely — sanitised, downstream stopped, queue settled
+- [x] Secrets absent from persisted and logged state
+- [ ] **API surface sufficient to begin frontend** — sufficient for everything
+      except RAG corpus management; see §72
+- [x] Chroma failure isolated — non-RAG runs unaffected by a dead vector store
+- [x] All offline gates green
+- [x] No residue or process leaks — every table empty, no Chroma collections
+
+## 74. Known limitations that are not blockers
+
+At-least-once execution means a recovered agent may call the model and its tools
+again; only `PURE` tools are permitted, so repeating is free, and no exactly-once
+claim is made. Tool calls are not durably recorded — an operator sees the final
+answer and any failure, but not which tools ran or with what arguments. RAG
+retrieves across the whole organization; there is no per-corpus targeting and no
+citation output. Prompt injection is contained and labelled, not prevented.
+Wall-clock time for the full integration suite varies widely (50s–190s observed)
+against a local Dockerised MySQL under sustained create/delete load; test outcomes
+did not vary, and every table is empty afterwards.

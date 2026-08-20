@@ -26,6 +26,7 @@ from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
+import yaml
 from pydantic import BaseModel, SecretStr
 
 import app
@@ -1064,3 +1065,106 @@ def test_every_shipped_tool_is_repeatable() -> None:
 
     for name in CATALOGUE.names():
         assert CATALOGUE.get(name).definition.side_effect is SideEffect.PURE, name
+
+
+# =============================================================================
+# Backend closure (Phase 10, M7)
+# =============================================================================
+
+
+_NODE_RUNNER_MODULES = tuple(
+    str(path.relative_to(SRC))
+    for path in _modules("app.infrastructure.nodes.builtin")
+    if path.name != "__init__.py"
+)
+
+# What a node runner must not reach for. Persistence, the queue, and the HTTP
+# layer are all *given* to a node by the engine or held on its behalf; a runner
+# that opened its own session would be a runner that could see another tenant's
+# rows, escape the transaction the engine settles its result in, or keep working
+# after the run was cancelled.
+_RUNNER_FORBIDDEN_LAYERS = (
+    "app.infrastructure.db.session",
+    "app.infrastructure.db.engine",
+    "app.infrastructure.db.unit_of_work",
+    "app.infrastructure.repositories",
+    "app.infrastructure.queue",
+    "app.infrastructure.worker",
+    "app.infrastructure.dispatcher",
+    "app.api",
+    "sqlalchemy",
+    "fastapi",
+)
+
+
+@pytest.mark.parametrize("module", _NODE_RUNNER_MODULES)
+def test_a_node_runner_owns_no_persistence_queue_or_route(module: str) -> None:
+    """**The uniform node contract, stated as what a runner cannot reach.**
+
+    ADR-020 says every node is invoked the same way; this says every node is
+    *limited* the same way. Phase 10 is where that stopped being obvious: the AI
+    runner grew to compose retrieval and tools, and both of those genuinely need
+    data — so the tempting shortcut was a session or a repository right here,
+    rather than a port handed in at construction.
+
+    Checked across the whole catalogue rather than the AI node alone, because the
+    next runner that needs data is the one that would get this wrong.
+    """
+
+    assert not _violations(SRC / module, _RUNNER_FORBIDDEN_LAYERS), module
+
+
+def test_there_are_node_runners_to_check() -> None:
+    """Guards the parametrisation above against silently covering nothing."""
+
+    assert len(_NODE_RUNNER_MODULES) >= 8
+
+
+def _command(service: dict[str, object]) -> str:
+    """A Compose ``command`` may be a string or an argv list; both mean the same."""
+
+    command = service["command"]
+    return command if isinstance(command, str) else " ".join(str(part) for part in command)
+
+
+def test_the_local_stack_can_actually_execute_a_run() -> None:
+    """**A deployment guard, and it earns its place by having caught a real
+    defect.**
+
+    Until M7, `docker-compose.yml` defined `api`, `mysql`, and `chroma` — while
+    `project_status.md` described `docker compose up` as the "full stack". It was
+    not: with no worker, a run accepted over the API queues in `queue_tasks` and
+    never advances, and with no dispatcher a schedule never fires. The stack
+    looks healthy and does nothing, which is the worst way for this to be wrong.
+
+    Asserted against the file rather than a running container so it costs
+    nothing in CI. It cannot prove the stack *works*; it proves the two processes
+    that execute work have not gone missing again.
+    """
+
+    compose = yaml.safe_load((SRC.parent.parent / "docker-compose.yml").read_text())
+    services = compose["services"]
+
+    assert {"api", "worker", "dispatcher", "mysql", "chroma"} <= set(services)
+    assert "app.infrastructure.worker" in _command(services["worker"])
+    assert "app.infrastructure.dispatcher" in _command(services["dispatcher"])
+
+
+def test_only_the_processes_that_use_the_credential_are_given_it() -> None:
+    """The worker invokes ``ai.agent@1``; the dispatcher only enqueues.
+
+    A credential in a process that cannot use it is a credential in one more
+    environment, one more log, and one more core dump — and configuring *only*
+    the API would configure the one process that never calls a provider, which
+    is exactly the trap M3 recorded.
+    """
+
+    compose = yaml.safe_load((SRC.parent.parent / "docker-compose.yml").read_text())
+    services = compose["services"]
+
+    assert "GEMINI_API_KEY" in services["worker"]["environment"]
+    assert "APP_CHROMA_HOST" in services["worker"]["environment"]
+    assert "GEMINI_API_KEY" not in services["dispatcher"]["environment"]
+
+    # Interpolated from the environment, never written into the file.
+    assert services["worker"]["environment"]["GEMINI_API_KEY"].startswith("${")
