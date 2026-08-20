@@ -439,6 +439,7 @@ class RunService:
             async with self._unit_of_work_factory() as uow:
                 run = await self._run(uow, organization_id, run_public_id)
                 snapshot, executions = await self._snapshot(uow, run, organization_id)
+                organization_public_id = await self._organization_public_id(uow, organization_id)
 
                 if limit is None:
                     limit = len(snapshot.graph) + 1
@@ -495,6 +496,7 @@ class RunService:
                         node_key,
                         run_id=run_id,
                         organization_id=organization_id,
+                        organization_public_id=organization_public_id,
                         workflow_node_id=node_ids[node_key],
                         attempt=attempts[node_key],
                     )
@@ -535,6 +537,7 @@ class RunService:
         *,
         run_id: int,
         organization_id: int,
+        organization_public_id: str,
         workflow_node_id: int,
         attempt: int,
         resume_token: str | None = None,
@@ -561,11 +564,27 @@ class RunService:
             node_key,
             run_id=run_id,
             organization_id=organization_id,
+            organization_public_id=organization_public_id,
             workflow_node_id=workflow_node_id,
             attempt=attempt,
             resume_token=resume_token,
         )
         await self._settle(run_public_id, organization_id, node_key, outcome)
+
+    @staticmethod
+    async def _organization_public_id(uow: SqlAlchemyUnitOfWork, organization_id: int) -> str:
+        """The run's tenant as a public id, for the node contract (ADR-004).
+
+        Resolved **once per advance**, inside the transaction that already loaded
+        the run, and handed down to every node invoked by it. The alternative —
+        each node finding its own — is how one of them eventually finds the
+        wrong one.
+        """
+
+        organization = await uow.organizations.get_by_id(organization_id)
+        if organization is None:  # pragma: no cover - a run cannot outlive its tenant
+            raise DomainRuleError("This run's organization no longer exists.")
+        return organization.public_id
 
     async def _invoke(
         self,
@@ -574,6 +593,7 @@ class RunService:
         *,
         run_id: int,
         organization_id: int,
+        organization_public_id: str,
         workflow_node_id: int,
         attempt: int,
         resume_token: str | None = None,
@@ -598,6 +618,7 @@ class RunService:
             self._node_registry,
             node_key,
             run_id=run_id,
+            organization_public_id=organization_public_id,
             workflow_node_id=workflow_node_id,
             attempt=attempt,
             resume_token=resume_token,
@@ -805,6 +826,8 @@ class RunService:
             # it has already been consumed just above.
             await uow.queue_tasks.enqueue(run.id, caller.organization_id)
 
+            organization_public_id = await self._organization_public_id(uow, caller.organization_id)
+
             await uow.commit()
 
             run_id, organization_id = run.id, caller.organization_id
@@ -817,6 +840,7 @@ class RunService:
             node_key,
             run_id=run_id,
             organization_id=organization_id,
+            organization_public_id=organization_public_id,
             workflow_node_id=workflow_node_id,
             attempt=attempt,
             resume_token=resume_token,

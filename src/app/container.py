@@ -15,20 +15,30 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from app.core.config import Settings, get_settings
 from app.domain.nodes.registry import NodeRegistry
+from app.domain.ports.agent_runner import AgentRunner
+from app.domain.ports.embedder import Embedder
+from app.domain.ports.knowledge import KnowledgeRetrievalError, KnowledgeRetriever
 from app.domain.ports.password_hasher import PasswordHasher
 from app.domain.ports.task_queue import LeasePolicy, TaskQueue
 from app.domain.ports.token_service import TokenService
+from app.domain.ports.vector_store import VectorStore
 from app.domain.value_objects.lease import WorkerId
 from app.infrastructure.db.engine import create_engine
 from app.infrastructure.db.session import create_session_factory
 from app.infrastructure.db.unit_of_work import SqlAlchemyUnitOfWork
 from app.infrastructure.dispatcher.loop import ScheduleDispatcher
+from app.infrastructure.llm.gemini_agent_runner import GeminiAgentRunner
+from app.infrastructure.llm.gemini_embedder import GeminiEmbedder
+from app.infrastructure.llm.unconfigured_agent_runner import UnconfiguredAgentRunner
 from app.infrastructure.nodes import build_registry
 from app.infrastructure.queue.mysql_task_queue import MySqlTaskQueue
 from app.infrastructure.security.password_hasher import Argon2PasswordHasher
 from app.infrastructure.security.token_service import JwtTokenService
+from app.infrastructure.vector.chroma_store import ChromaVectorStore
 from app.infrastructure.worker import FixedLeasePolicy, Worker, new_worker_id
 from app.services.auth_service import AuthService
+from app.services.knowledge_retriever import MemoryKnowledgeRetriever
+from app.services.memory_service import MemoryService
 from app.services.run_service import RunService
 from app.services.schedule_dispatch_service import ScheduleDispatchService
 from app.services.webhook_service import WebhookService
@@ -46,6 +56,11 @@ class Container:
         self._token_service: TokenService | None = None
         self._auth_service: AuthService | None = None
         self._node_registry: NodeRegistry | None = None
+        self._agent_runner: AgentRunner | None = None
+        self._embedder: Embedder | None = None
+        self._vector_store: VectorStore | None = None
+        self._memory_service: MemoryService | None = None
+        self._knowledge_retriever: KnowledgeRetriever | None = None
         self._workflow_service: WorkflowService | None = None
         self._run_service: RunService | None = None
         self._task_queue: TaskQueue | None = None
@@ -128,6 +143,39 @@ class Container:
         return SqlAlchemyUnitOfWork(self.session_factory)
 
     @property
+    def agent_runner(self) -> AgentRunner:
+        """How ``ai.agent@1`` reaches a model (ADR-013).
+
+        **Gemini when a credential is configured; an explicit refusal when not.**
+
+        The tempting third option — fall back to the deterministic mock — is
+        deliberately absent. A deployment that simply forgot to set
+        ``GEMINI_API_KEY`` would then run agent workflows to completion and write
+        plausible-looking text into runs, and the mistake would surface much
+        later, in data, as output nobody could trace. Failing the node is worse
+        for one run and much better for everything after it. The mock remains
+        available to tests, which pass it explicitly.
+
+        Note what is *not* conditional: the application still starts, the
+        catalogue still serves, workflows still validate, and every non-AI node
+        still runs. Only invoking an agent needs the credential, so only that
+        fails.
+
+        Shared and stateless — the credential and model name are values, and the
+        provider client is built per request inside the adapter, so there is no
+        mutable client here for two concurrent agent nodes to race over.
+        """
+
+        if self._agent_runner is None:
+            key = self._settings.gemini_api_key
+            self._agent_runner = (
+                GeminiAgentRunner(key, self._settings.gemini_model)
+                if key is not None
+                else UnconfiguredAgentRunner()
+            )
+        return self._agent_runner
+
+    @property
     def node_registry(self) -> NodeRegistry:
         """The catalogue of available node types.
 
@@ -138,7 +186,7 @@ class Container:
         """
 
         if self._node_registry is None:
-            self._node_registry = build_registry()
+            self._node_registry = build_registry(self.agent_runner, self.knowledge_retriever)
         return self._node_registry
 
     @property
@@ -267,6 +315,91 @@ class Container:
             self.schedule_dispatch_service,
             poll_interval_seconds=self._settings.dispatcher_poll_interval_seconds,
         )
+
+    @property
+    def embedder(self) -> Embedder:
+        """How text becomes vectors (ADR-003).
+
+        Reuses the Gemini credential: a deployment that can generate can also
+        embed, and a second key for one provider is a second thing to rotate.
+
+        **Requires the credential**, unlike ``agent_runner``, which degrades to
+        an explicit refusal. The difference is that an agent node can fail one
+        run, whereas there is no such thing as a partial ingestion — so this
+        raises at construction, and only a caller that actually embeds ever
+        reaches it.
+        """
+
+        if self._embedder is None:
+            key = self._settings.gemini_api_key
+            if key is None:
+                raise RuntimeError(
+                    "No embedding provider is configured. Set GEMINI_API_KEY to "
+                    "enable document ingestion and retrieval."
+                )
+            self._embedder = GeminiEmbedder(key, self._settings.gemini_embedding_model)
+        return self._embedder
+
+    @property
+    def vector_store(self) -> VectorStore:
+        """Where vectors live (ADR-003).
+
+        **Nothing connects here.** The Chroma client is built on first use inside
+        the adapter, so constructing this — and starting an API, a worker, or any
+        non-AI workflow — costs no network and cannot fail because a container is
+        down.
+        """
+
+        if self._vector_store is None:
+            self._vector_store = ChromaVectorStore(
+                host=self._settings.chroma_host or "localhost",
+                port=self._settings.chroma_port or 8000,
+            )
+        return self._vector_store
+
+    @property
+    def memory_service(self) -> MemoryService:
+        """Ingestion and retrieval (architecture.md §12).
+
+        Built lazily, so touching this property is what first requires an
+        embedding credential — the application starts without one.
+        """
+
+        if self._memory_service is None:
+            self._memory_service = MemoryService(
+                self.unit_of_work, self.embedder, self.vector_store
+            )
+        return self._memory_service
+
+    def knowledge_retriever(self) -> KnowledgeRetriever:
+        """How ``ai.agent@1`` reaches this organization's documents (M5).
+
+        **A method, not a property, and that is the whole design.** It is handed
+        to ``build_registry`` uncalled, so building the catalogue — which every
+        process does at startup, including deployments with no AI configured —
+        costs no credential, no Chroma connection, and no embedder. The first
+        agent that actually retrieves is what constructs one.
+
+        Cached afterwards: the retriever is stateless, and the memory service
+        underneath receives a unit-of-work *factory*, so concurrent agent nodes
+        share nothing mutable.
+
+        **A missing credential becomes a retrieval error here**, rather than the
+        ``RuntimeError`` ``embedder`` raises. The node's contract is that
+        retrieval either works or fails as retrieval; a bare ``RuntimeError``
+        escaping a runner is read by the engine as a bug in the node and reported
+        as one, which would send whoever is debugging a misconfigured deployment
+        looking in exactly the wrong place.
+        """
+
+        if self._knowledge_retriever is None:
+            try:
+                self._knowledge_retriever = MemoryKnowledgeRetriever(self.memory_service)
+            except RuntimeError as error:
+                raise KnowledgeRetrievalError(
+                    "This deployment has no document retrieval configured.", retryable=False
+                ) from error
+        return self._knowledge_retriever
 
     async def dispose(self) -> None:
         """Release the connection pool. Safe to call if never initialised."""

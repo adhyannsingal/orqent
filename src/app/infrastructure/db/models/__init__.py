@@ -7,6 +7,8 @@ full schema for autogeneration.
 
 from __future__ import annotations
 
+from app.infrastructure.db.models.document import Document
+from app.infrastructure.db.models.document_chunk import DocumentChunk
 from app.infrastructure.db.models.node_execution import NodeExecution
 from app.infrastructure.db.models.organization import Organization
 from app.infrastructure.db.models.queue_task import QueueTask
@@ -24,6 +26,8 @@ from app.infrastructure.db.models.workflow_node import WorkflowNode
 from app.infrastructure.db.models.workflow_version import WorkflowVersion
 
 __all__ = [
+    "Document",
+    "DocumentChunk",
     "NodeExecution",
     "Organization",
     "QueueTask",

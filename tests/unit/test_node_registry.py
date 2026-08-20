@@ -39,6 +39,9 @@ BUILT_IN_NAMES = (
     "core.wait@1",
     "core.condition@1",
     "core.merge@1",
+    # Phase 10 M1. Last in the palette, and the only built-in whose runner takes
+    # a dependency — it reaches a model through the `AgentRunner` port.
+    "ai.agent@1",
 )
 
 # `namespace.name`, lower snake case. Keeps the catalogue readable and the
@@ -255,6 +258,7 @@ async def test_manual_trigger_completes_on_its_output_handle() -> None:
             config=trigger_manual.ManualTriggerConfig(),
             inputs={},
             idempotency_key="1:1:1",
+            organization_public_id="01ORGORGORGORGORGORGORGORG",
             trigger_payload={},
         )
     )
@@ -272,6 +276,7 @@ async def test_webhook_trigger_hands_over_the_payload_unchanged() -> None:
             config=trigger_webhook.WebhookTriggerConfig(),
             inputs={},
             idempotency_key="1:1:1",
+            organization_public_id="01ORGORGORGORGORGORGORGORG",
             trigger_payload=payload,
         )
     )
@@ -295,6 +300,7 @@ async def test_schedule_trigger_hands_over_the_payload_unchanged() -> None:
             config=trigger_schedule.ScheduleTriggerConfig(),
             inputs={},
             idempotency_key="1:1:1",
+            organization_public_id="01ORGORGORGORGORGORGORGORG",
             trigger_payload=payload,
         )
     )
@@ -316,6 +322,7 @@ async def test_the_schedule_runner_is_deterministic() -> None:
         config=trigger_schedule.ScheduleTriggerConfig(),
         inputs={},
         idempotency_key="1:1:1",
+        organization_public_id="01ORGORGORGORGORGORGORGORG",
         trigger_payload={"n": 1},
     )
 
@@ -336,6 +343,7 @@ async def test_a_webhook_trigger_started_with_no_payload_emits_none() -> None:
             config=trigger_webhook.WebhookTriggerConfig(),
             inputs={},
             idempotency_key="1:1:1",
+            organization_public_id="01ORGORGORGORGORGORGORGORG",
             trigger_payload=None,
         )
     )
@@ -350,6 +358,7 @@ async def test_constant_returns_its_configured_value() -> None:
             config=core_constant.ConstantConfig(value="hello"),
             inputs={},
             idempotency_key="1:1:1",
+            organization_public_id="01ORGORGORGORGORGORGORGORG",
             trigger_payload={},
         )
     )
@@ -366,6 +375,7 @@ async def test_noop_passes_its_input_through() -> None:
             config=core_noop.NoOpConfig(),
             inputs={"main": payload},
             idempotency_key="1:1:1",
+            organization_public_id="01ORGORGORGORGORGORGORGORG",
             trigger_payload={},
         )
     )
@@ -380,6 +390,7 @@ async def test_log_completes_with_no_outputs() -> None:
             config=core_log.LogConfig(),
             inputs={"main": "hello"},
             idempotency_key="1:1:1",
+            organization_public_id="01ORGORGORGORGORGORGORGORG",
             trigger_payload={},
         )
     )

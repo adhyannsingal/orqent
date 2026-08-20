@@ -13,6 +13,21 @@ services:
       APP_DATABASE_URL: mysql+asyncmy://app:app@mysql:3306/app
       APP_CHROMA_HOST: chroma
       APP_CHROMA_PORT: "8000"
+      # --- AI agent execution (Phase 10, M2) ---
+      # The credential is **substituted from the developer's environment or the
+      # repo-root .env**, which is git-ignored; only this placeholder is
+      # committed, so no secret ever enters the repository. Compose leaves it
+      # empty when unset, and an empty value is treated as absent — the API still
+      # starts, and only an attempted AI agent execution fails.
+      #
+      # Unprefixed, unlike every APP_ setting below it, because this is Google's
+      # own conventional variable name and translating between two names for one
+      # secret is how a developer ends up exporting the wrong one.
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      # Which model the "default" profile resolves to. Ordinary non-secret
+      # configuration, so it is committed and takes the APP_ prefix.
+      APP_GEMINI_MODEL: gemini-3.5-flash
+
       # LOCAL DEVELOPMENT PLACEHOLDER ONLY — this value is committed, so it is
       # public and must never be used anywhere real. Staging and production
       # inject their own secret from a secret manager.
@@ -28,6 +43,62 @@ services:
     depends_on:
       - mysql
       - chroma
+
+  # --- The two processes that actually execute work (Phase 10, M7) ------------
+  #
+  # **Without these, `docker compose up` starts an API that can accept a run and
+  # never finish one.** Runs would queue in `queue_tasks` forever and schedules
+  # would never fire — a stack that looks healthy and does nothing. The worker
+  # and dispatcher have always been run by hand (`python -m ...`); at backend
+  # closure that is no longer a defensible default, because the only place a
+  # newcomer looks for "how do I run this" is here.
+  #
+  # Same image as the API — one build, three roles. They share the codebase, the
+  # database, and the settings; only the entrypoint differs. A flag deciding
+  # which process this is would be how a deployment ends up running the wrong
+  # one.
+
+  worker:
+    build: .
+    # Advances runs: claims queue tasks, invokes nodes, records outcomes.
+    command: python -m app.infrastructure.worker
+    environment:
+      APP_ENVIRONMENT: local
+      APP_DEBUG: "false"
+      APP_LOG_JSON: "true"
+      APP_LOG_LEVEL: INFO
+      APP_DATABASE_URL: mysql+asyncmy://app:app@mysql:3306/app
+      # **Chroma and the credential belong here, not only on the API.** The
+      # worker is the process that invokes `ai.agent@1`, so it is the process
+      # that reaches Gemini and Chroma. Configuring only the API would configure
+      # the process that never calls either — precisely the trap Phase 10 M3
+      # recorded when it noticed this service was missing.
+      APP_CHROMA_HOST: chroma
+      APP_CHROMA_PORT: "8000"
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      APP_GEMINI_MODEL: gemini-3.5-flash
+      APP_JWT_SECRET_KEY: local-development-only-not-a-real-secret
+    depends_on:
+      - mysql
+      - chroma
+
+  dispatcher:
+    build: .
+    # Fires due schedules into the queue. Creates runs; never executes them.
+    command: python -m app.infrastructure.dispatcher
+    environment:
+      APP_ENVIRONMENT: local
+      APP_DEBUG: "false"
+      APP_LOG_JSON: "true"
+      APP_LOG_LEVEL: INFO
+      APP_DATABASE_URL: mysql+asyncmy://app:app@mysql:3306/app
+      # **No `GEMINI_API_KEY` and no Chroma, deliberately.** The dispatcher
+      # claims a due schedule and enqueues a run; the worker does the work. A
+      # credential it cannot use is a credential in one more process's
+      # environment, one more log, and one more core dump.
+      APP_JWT_SECRET_KEY: local-development-only-not-a-real-secret
+    depends_on:
+      - mysql
 
   mysql:
     image: mysql:8.0

@@ -90,6 +90,7 @@ def build_context(
     node_key: str,
     *,
     run_id: int,
+    organization_public_id: str,
     workflow_node_id: int,
     attempt: int,
     resume_token: str | None = None,
@@ -121,6 +122,10 @@ def build_context(
         config=config,
         inputs=resolve_inputs(snapshot, node_key),
         idempotency_key=idempotency_key(run_id, workflow_node_id, attempt),
+        # The run's tenant, handed down rather than looked up: a runner is
+        # documented as touching no database, and a node that resolved its own
+        # organization would be a node that could resolve the wrong one.
+        organization_public_id=organization_public_id,
         # Every node is handed the payload; only a trigger reads it. That is what
         # lets data enter a graph whose first node has no inbound edge, without
         # the engine learning what a trigger is (ADR-014).
