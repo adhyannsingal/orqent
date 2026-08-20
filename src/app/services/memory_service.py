@@ -11,9 +11,13 @@ exist; Chroma holds the vectors and the chunk text (ADR-002, ADR-003). This
 service is the only place that knows both, which is what keeps the vector store a
 derived index rather than a second database.
 
-**This is not RAG.** Nothing here calls a model to *generate*, and no node
-retrieves. Joining retrieval to generation is M5; keeping them apart until then
-is what makes each testable on its own.
+**This is not RAG.** Nothing here calls a model to *generate*. Joining retrieval
+to generation was M5, and it happens in ``ai.agent@1``'s runner rather than here
+— which is what keeps this service testable on its own.
+
+**Reachable over HTTP since the post-Phase-10 frontend-readiness follow-up.**
+``ingest_for_caller`` is the bridge ``POST /api/v1/documents`` calls; everything
+below it is unchanged from M4.
 """
 
 from __future__ import annotations
@@ -24,10 +28,11 @@ from dataclasses import dataclass
 
 import structlog
 
-from app.domain.errors import ValidationError
+from app.domain.errors import AuthenticationError, ValidationError
 from app.domain.memory.chunking import chunk_text
 from app.domain.ports.embedder import Embedder
 from app.domain.ports.vector_store import RetrievalMatch, StoredChunk, VectorStore
+from app.domain.value_objects.authenticated_user import AuthenticatedUser
 from app.infrastructure.db.models.document import Document
 from app.infrastructure.db.models.document_chunk import DocumentChunk
 from app.infrastructure.db.unit_of_work import SqlAlchemyUnitOfWork
@@ -90,6 +95,55 @@ class MemoryService:
         self._unit_of_work_factory = unit_of_work_factory
         self._embedder = embedder
         self._vectors = vector_store
+
+    async def ingest_for_caller(
+        self,
+        current_user: AuthenticatedUser,
+        *,
+        external_id: str,
+        text: str,
+        title: str | None = None,
+        metadata: Mapping[str, str | int | float | bool] | None = None,
+    ) -> IngestionResult:
+        """Ingest a document **for the tenant the caller belongs to**.
+
+        The API's one entry point, and the reason it exists is tenancy.
+        ``ingest_document`` takes both forms of the organization id because its
+        callers already hold them; an HTTP request holds neither, only a token.
+
+        **Both ids are read from persisted state, not from the token.** The
+        access token carries an organization claim, and it would be the obvious
+        thing to trust — but the authoritative answer to "which tenant is this?"
+        is the caller's own row, exactly as it is for every other use case
+        (``RunService._caller``). Deriving it here means a stale or tampered
+        claim cannot aim an ingestion at another organization's namespace, and
+        it keeps this method's tenancy story identical to the one M5 established
+        for retrieval: the tenant comes from persisted state, never from input.
+
+        Nothing else is added. Chunking, embedding, the content-hash short
+        circuit, the delete-before-upsert that prevents stale chunks, and the
+        write ordering all remain ``ingest_document``'s — this resolves an
+        identity and delegates.
+        """
+
+        async with self._unit_of_work_factory() as uow:
+            caller = await uow.users.get_by_public_id(current_user.public_id)
+            if caller is None:
+                raise AuthenticationError("This account no longer exists.")
+            organization = await uow.organizations.get_by_id(caller.organization_id)
+            if organization is None:  # pragma: no cover - a user cannot outlive its tenant
+                raise AuthenticationError("This account no longer exists.")
+            organization_id = organization.id
+            organization_public_id = organization.public_id
+
+        return await self.ingest_document(
+            organization_public_id,
+            organization_id,
+            external_id=external_id,
+            text=text,
+            title=title,
+            metadata=metadata,
+        )
 
     async def ingest_document(
         self,

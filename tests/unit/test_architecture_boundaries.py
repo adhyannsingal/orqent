@@ -37,6 +37,8 @@ from app.infrastructure.db import models  # noqa: F401  (registers tables)
 from app.infrastructure.db.base import Base
 from app.infrastructure.nodes import build_registry
 from app.infrastructure.tools import CATALOGUE
+from app.schemas.documents import MAX_EXTERNAL_ID_LENGTH as SCHEMA_EXTERNAL_ID_BOUND
+from app.services.memory_service import MAX_EXTERNAL_ID_LENGTH as SERVICE_EXTERNAL_ID_BOUND
 
 SRC = Path(app.__file__).parent
 
@@ -1168,3 +1170,36 @@ def test_only_the_processes_that_use_the_credential_are_given_it() -> None:
 
     # Interpolated from the environment, never written into the file.
     assert services["worker"]["environment"]["GEMINI_API_KEY"].startswith("${")
+
+
+def test_the_document_schema_bound_matches_the_service() -> None:
+    """`app.schemas` may not import a service (the dependency rule), so
+    `IngestDocumentRequest` restates the external-id bound rather than importing
+    it — the same duplication `runs.py` accepts for `PUBLIC_ID_LENGTH`.
+
+    Restated duplication is fine; *drifting* duplication is not. If the service
+    ever widened its bound, the API would start rejecting documents the service
+    would happily accept, and the failure would look like a client bug.
+    """
+
+    assert SCHEMA_EXTERNAL_ID_BOUND == SERVICE_EXTERNAL_ID_BOUND
+
+
+def test_the_document_route_owns_no_persistence() -> None:
+    """Transport only, like every other route module: it resolves a dependency,
+    calls one service method, and maps the result. Ingestion's two-store write
+    ordering stays in `MemoryService`."""
+
+    route = SRC / "api/v1/routes/documents.py"
+
+    assert not _violations(
+        route,
+        (
+            "app.infrastructure.repositories",
+            "app.infrastructure.db.unit_of_work",
+            "app.infrastructure.vector",
+            "app.domain.ports.embedder",
+            "app.domain.ports.vector_store",
+            "sqlalchemy",
+        ),
+    )

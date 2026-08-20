@@ -852,10 +852,35 @@ from the repository at Phase 10 M7.
 - **Execution policy** — retry/backoff, node timeouts, run cancellation.
 - **Trigger management** — registration and schedule APIs, timezone-aware
   schedules, pause/resume, catch-up policy, webhook body limits and dedup.
-- **AI follow-ons** — a public document-ingestion API (the one gap that blocks
-  *using* RAG from a frontend; see the spec §72), per-corpus targeting, citation
-  output, durable tool-call observability, side-effecting tools, structured
-  output, persistent agent memory.
+- **AI follow-ons** — per-corpus targeting, citation output, durable tool-call
+  observability, side-effecting tools, structured output, persistent agent
+  memory. *(Document ingestion is no longer among these — see below.)*
+
+### Post-Phase-10 follow-up: document ingestion API ✅
+
+Phase 10 M7's closure audit found one thing standing between a finished backend
+and a usable one: `MemoryService.ingest_document` worked and `ai.agent@1`
+retrieved from it, but **no route reached either**, so a frontend could publish a
+retrieval-enabled agent and never populate the corpus it retrieves from.
+
+`POST /api/v1/documents` closes that gap. It is a transport bridge and nothing
+more — chunking, embedding, the content-hash short circuit, the
+delete-before-upsert that prevents stale chunks, and the MySQL/Chroma write
+ordering all remain `MemoryService`'s. **Phase 10 is not reopened**; no engine,
+scheduler, queue, worker, dispatcher, adapter, or RAG contract changed, and no
+migration was added.
+
+The organization is derived from the caller's own row rather than the token's
+claim, so a request has no way to name a tenant — proved by a test in which the
+two deliberately disagree.
+
+**`GET` and `DELETE` were considered and deliberately not built.**
+`DocumentRepository` can neither list a corpus nor remove a document, and a
+delete would additionally have to reach the vector store to stay consistent —
+new persistence and new reconciliation, not a transport bridge. A document is
+addressed by the caller's own `external_id`, so re-sending one replaces it and
+no server-side listing is needed to keep a corpus current. **Corpus browsing and
+retraction remain deferred**, and are the natural next follow-up.
 
 **On Phase 4's M12 and M13.** `phase-4-implementation-spec.md` (FROZEN) ends with
 **M12** (workflow HTTP API) and **M13** (documentation sign-off). Neither was
