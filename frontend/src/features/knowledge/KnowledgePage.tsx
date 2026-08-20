@@ -116,7 +116,7 @@ export function KnowledgePage() {
                     : `${result.chunk_count} chunk${result.chunk_count === 1 ? '' : 's'} indexed and available to retrieval.`}
                 </p>
                 <p className="mt-1 font-mono text-[11px] text-ink-muted">
-                  {result.external_id} · {result.document_id}
+                  {result.external_id}
                 </p>
               </div>
             </Card>

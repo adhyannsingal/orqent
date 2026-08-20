@@ -6,6 +6,7 @@ import { RequireAuth } from '@/routes/RequireAuth'
 import { useAuth } from '@/stores/auth'
 
 const LoginPage = lazy(() => import('@/features/auth/LoginPage').then((module) => ({ default: module.LoginPage })))
+const LandingPage = lazy(() => import('@/features/landing/LandingPage').then((module) => ({ default: module.LandingPage })))
 const WorkflowListPage = lazy(() => import('@/features/workflows/WorkflowListPage').then((module) => ({ default: module.WorkflowListPage })))
 const BuilderPage = lazy(() => import('@/features/builder/BuilderPage').then((module) => ({ default: module.BuilderPage })))
 const RunListPage = lazy(() => import('@/features/runs/RunListPage').then((module) => ({ default: module.RunListPage })))
@@ -19,7 +20,9 @@ export function App() {
   return (
     <Suspense fallback={<Spinner label="Loading" />}>
       <Routes>
+        <Route path="/" element={<LandingPage />} />
         <Route path="/login" element={<LoginPage />} />
+        <Route path="/register" element={<LoginPage />} />
         <Route
           element={
             <RequireAuth>
@@ -33,7 +36,7 @@ export function App() {
           <Route path="/runs/:id" element={<RunDetailPage />} />
           <Route path="/knowledge" element={<KnowledgePage />} />
         </Route>
-        <Route path="*" element={<Navigate to="/workflows" replace />} />
+        <Route path="*" element={<Navigate to="/" replace />} />
       </Routes>
     </Suspense>
   )

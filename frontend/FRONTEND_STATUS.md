@@ -1,6 +1,6 @@
 # Orqent frontend - status
 
-**Branch:** `frontend` at `ac1635a`  
+**Branch:** `frontend` at `0e93ae5`
 **Stack:** React 19, TypeScript, Vite, Tailwind v4, React Flow, TanStack Query,
 Zustand, React Router, Lucide, sonner  
 **Run:** `npm run dev` from `frontend/` with the backend on `:8000`
@@ -9,24 +9,24 @@ Zustand, React Router, Lucide, sonner
 
 | Backend capability | Frontend surface | Status | Demo-critical |
 |---|---|---:|---:|
-| auth | Login/register, restore, logout | usable | yes |
-| workflows | List/create/open workflow | usable | yes |
-| drafts | Builder save/reload with revision | usable | yes |
-| validation | Validate action + issue panel | usable | yes |
-| publish | Publish action + one-time webhook result | usable | yes |
-| node types | Palette from `/node-types` | usable | yes |
-| manual trigger | Builder node + Run action | usable | yes |
-| webhook trigger | Publish URL dialog + copy | usable | yes |
-| schedule trigger | Cron field, presets, UTC note | usable | yes |
-| condition | Config form + true/false handles | usable | yes |
-| merge | Catalogue node + named inputs | usable | no |
-| AI agent | Instructions/model/temp/RAG/tools | usable | yes |
-| RAG | Retrieval toggle + top_k | usable | yes |
-| tools | Calculator allow-list toggle | usable | yes |
-| documents | Ingestion/replacement form | usable | yes |
-| runs | Run list/detail/polling | usable | yes |
-| events | Timeline panel | usable | yes |
-| resume | Resume button for waiting run | usable | no |
+| auth | Landing -> login/register, restore, logout | ✅ usable | yes |
+| workflows | List/create/open workflow | ✅ usable | yes |
+| drafts | Builder save/reload with revision | ✅ usable | yes |
+| validation | Validate action + issue panel | ✅ usable | yes |
+| publish | Publish action + one-time webhook result | ✅ usable | yes |
+| node types | Palette from `/node-types` | ✅ usable | yes |
+| manual trigger | Builder node + Run action | ✅ usable | yes |
+| webhook trigger | Publish URL dialog + copy | ✅ usable | yes |
+| schedule trigger | Cron field, presets, UTC note | ✅ usable | yes |
+| condition | Config form + true/false handles | ✅ usable | yes |
+| merge | Catalogue node + named inputs | ✅ usable | no |
+| AI agent | Instructions/model/temp/RAG/tools | ✅ usable | yes |
+| RAG | Retrieval toggle + top_k | ✅ usable | yes |
+| tools | Calculator allow-list toggle | ✅ usable | yes |
+| documents | Ingestion/replacement form | ✅ usable | yes |
+| runs | Run list/detail/polling | ✅ usable | yes |
+| events | Timeline panel | ✅ usable | yes |
+| resume | Resume button for waiting run | ✅ usable | no |
 
 ## P0
 
@@ -37,24 +37,29 @@ inspect run, see final outputs, and see run/node errors.
 
 ## P1
 
-Verified usable against the real backend: webhook publish/token/delivery,
-schedule cron validation/publish, condition branching, skipped node execution,
-run event timeline, suspended run resume.
+Verified usable against the backend: webhook publish/token/delivery, schedule
+cron validation/publish, condition branching, skipped node execution, run event
+timeline, and suspended run resume.
 
-## Fixes In This Pass
+## Final Polish
 
-- Added route-level lazy loading in `src/App.tsx`; React Flow-heavy builder/run
-  chunks no longer sit in the initial JS bundle.
-- Changed run inspector default selection to open the failed node, waiting node,
-  or last node with output automatically, so completed demo output is visible
-  immediately.
+- Added a public landing page at `/` with Ø Orqent branding, a compact product
+  hero, repo link, and direct sign-in/register paths.
+- Added light/dark theme support with a persisted non-secret `orqent.theme`
+  preference and theme-aware toast/canvas styling.
+- Removed visible raw user/org/run/document identifiers from shell, run list,
+  run detail, and knowledge success copy where they were not useful.
+- Added register-only password policy UX and backend request validation:
+  8+ characters, at least one letter, one number, and one special character.
+- Kept existing builder/runtime architecture intact; no backend architecture
+  changes were made.
 
 ## Security Review
 
 - One client env var: `VITE_API_BASE_URL`.
 - No `GEMINI_API_KEY`, `DATABASE_URL`, `PRIVATE_KEY`, `SECRET_KEY`, MySQL URL,
-  or provider credential in frontend source or production assets. The only
-  `GEMINI_API_KEY` match is warning text in `.env.example`.
+  `api_key`, or provider credential in frontend source or production assets.
+  The only secret-scan match is warning text in `frontend/.env.example`.
 - Browser calls only Orqent API routes; no Gemini, Chroma, or MySQL client.
 - Access token stays in memory; refresh token is the only persisted credential.
 - Concurrent 401 responses share one refresh request.
@@ -78,7 +83,7 @@ publish -> run -> `COMPLETED`.
 Agent output included the retrieved allowance fact (`40 GBP`) and calculated
 three-day total (`120 GBP`). Downstream log node succeeded.
 
-Provider-independent P1 checks also passed:
+Provider-independent P1 checks previously passed:
 
 - Webhook workflow published with one-time token and delivered via `/hooks/{token}`.
 - Schedule workflow published with `0 9 * * *` UTC cron.
@@ -88,15 +93,21 @@ Provider-independent P1 checks also passed:
 ## Verification
 
 - TypeScript: `npm run build` passed (`tsc -b`).
-- Lint: `npm run lint` exits 0 with 4 existing advisory React warnings.
+- Lint: `npm run lint` exits 0 with 6 advisory React warnings.
+- Backend auth schema lint: `python -m ruff check src/app/schemas/auth.py tests/unit/test_auth_endpoints.py` passed.
+- Backend auth pytest: blocked in this shell because backend dependencies are
+  not installed (`ModuleNotFoundError: structlog`).
 - Production build: passed.
 - `git diff --check`: clean.
-- Bundle after split:
-  - initial JS `index-BHdKFdgI.js`: 248.66 kB / 76.28 kB gzip
-  - React Flow/node chunk `OrqentNode-CRwDTH2f.js`: 182.10 kB / 59.20 kB gzip
-  - builder route chunk: 24.23 kB / 7.95 kB gzip
-  - run detail route chunk: 10.23 kB / 3.33 kB gzip
-  - CSS: 41.43 kB / 8.22 kB gzip
+- Browser smoke: Playwright Chromium screenshots verified landing/register at
+  desktop and mobile sizes.
+- Bundle:
+  - initial JS `index-B08EzEOw.js`: 256.36 kB / 78.66 kB gzip
+  - React Flow/node chunk `OrqentNode-BXkY5RAi.js`: 181.51 kB / 58.99 kB gzip
+  - builder route chunk: 24.01 kB / 7.83 kB gzip
+  - run detail route chunk: 10.23 kB / 3.32 kB gzip
+  - landing route chunk: 9.08 kB / 2.90 kB gzip
+  - CSS: 50.94 kB / 10.00 kB gzip
 - Vite dev server served the app at `http://127.0.0.1:5173/`.
 
 ## Deferred
@@ -104,8 +115,8 @@ Provider-independent P1 checks also passed:
 - No document list/delete UI; backend exposes ingestion/replacement only.
 - No version history UI, analytics, settings, team management, streaming, or
   collaborative editing.
-- No Playwright test added; browser automation packages are not installed, and
-  time was better spent on live backend acceptance.
+- No committed Playwright suite; browser smoke used the Playwright CLI and
+  cached Chromium without changing project dependencies.
 
 ## Known Limitations
 

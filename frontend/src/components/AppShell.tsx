@@ -7,6 +7,7 @@
  */
 import { NavLink, Outlet, useNavigate } from 'react-router-dom'
 import { FileText, LogOut, Play, Workflow } from 'lucide-react'
+import { ThemeToggle } from '@/components/ThemeToggle'
 import { useAuth } from '@/stores/auth'
 import { cn } from '@/lib/utils'
 
@@ -17,7 +18,6 @@ const NAV = [
 ]
 
 export function AppShell() {
-  const user = useAuth((s) => s.user)
   const logout = useAuth((s) => s.logout)
   const navigate = useNavigate()
 
@@ -26,7 +26,7 @@ export function AppShell() {
       <aside className="flex w-[228px] shrink-0 flex-col bg-nav">
         <div className="flex h-12 items-center gap-2 px-4">
           <div className="grid size-5 place-items-center rounded-[3px] bg-white">
-            <span className="text-[11px] font-bold leading-none text-nav">O</span>
+            <span className="text-[12px] font-bold leading-none text-nav">Ø</span>
           </div>
           <span className="text-[13.5px] font-semibold tracking-tight text-white">Orqent</span>
         </div>
@@ -53,15 +53,7 @@ export function AppShell() {
         </nav>
 
         <div className="border-t border-white/8 p-2">
-          <div className="px-2.5 py-1.5">
-            <p className="truncate text-[12px] font-medium text-white/90">
-              {user?.public_id.slice(0, 12) ?? 'Signed in'}
-            </p>
-            {/* Identity, not a selector: tenancy is decided by the backend. */}
-            <p className="truncate font-mono text-[10.5px] text-nav-ink">
-              org {user?.organization_id.slice(0, 10) ?? '—'}
-            </p>
-          </div>
+          <ThemeToggle className="mb-1.5 w-full justify-start border-white/10 bg-transparent text-nav-ink hover:bg-nav-hover hover:text-white" />
           <button
             onClick={async () => { await logout(); navigate('/login', { replace: true }) }}
             className={cn(

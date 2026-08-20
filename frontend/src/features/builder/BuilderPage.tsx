@@ -249,7 +249,7 @@ function Builder() {
             maxZoom={1.75}
             className="bg-canvas"
           >
-            <Background variant={BackgroundVariant.Dots} gap={16} size={1} color="#d9dbdf" />
+            <Background variant={BackgroundVariant.Dots} gap={16} size={1} color="var(--color-flow-grid)" />
             <Controls showInteractive={false} className="!shadow-none" />
           </ReactFlow>
 

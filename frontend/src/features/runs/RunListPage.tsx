@@ -22,7 +22,7 @@ export function RunListPage() {
   // Names, so the table reads as workflows rather than opaque ids.
   const workflows = useQuery({ queryKey: ['workflows'], queryFn: () => workflowsApi.list() })
   const nameOf = (id: string) =>
-    workflows.data?.items.find((workflow) => workflow.public_id === id)?.name ?? id.slice(0, 10)
+    workflows.data?.items.find((workflow) => workflow.public_id === id)?.name ?? 'Workflow'
 
   const items = runs.data?.items ?? []
 
@@ -54,7 +54,6 @@ export function RunListPage() {
           <table className="w-full border-collapse">
             <thead>
               <tr className="border-b border-line text-left">
-                <th className="px-5 py-2 text-[11.5px] font-medium uppercase tracking-wide text-ink-muted">Run</th>
                 <th className="px-5 py-2 text-[11.5px] font-medium uppercase tracking-wide text-ink-muted">Workflow</th>
                 <th className="w-[130px] px-5 py-2 text-[11.5px] font-medium uppercase tracking-wide text-ink-muted">Status</th>
                 <th className="w-[100px] px-5 py-2 text-[11.5px] font-medium uppercase tracking-wide text-ink-muted">Duration</th>
@@ -68,9 +67,6 @@ export function RunListPage() {
                   onClick={() => navigate(`/runs/${run.public_id}`)}
                   className="cursor-pointer border-b border-line hover:bg-surface"
                 >
-                  <td className="px-5 py-2.5 font-mono text-[12px] text-ink-muted">
-                    {run.public_id.slice(0, 12)}
-                  </td>
                   <td className="px-5 py-2.5">
                     <span className="text-[13px] text-ink">{nameOf(run.workflow_id)}</span>
                     {run.version_no && (

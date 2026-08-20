@@ -6,6 +6,7 @@ import { Toaster } from 'sonner'
 import '@xyflow/react/dist/style.css'
 import './index.css'
 import { App } from './App'
+import { ThemeProvider, useTheme } from '@/components/ThemeProvider'
 
 const queryClient = new QueryClient({
   defaultOptions: {
@@ -24,22 +25,34 @@ const queryClient = new QueryClient({
   },
 })
 
+function ThemedToaster() {
+  const { resolved } = useTheme()
+  return (
+    <Toaster
+      position="bottom-right"
+      theme={resolved}
+      toastOptions={{
+        style: {
+          borderRadius: '6px',
+          border: '1px solid var(--color-line-strong)',
+          background: 'var(--color-surface)',
+          color: 'var(--color-ink)',
+          fontSize: '12.5px',
+        },
+      }}
+    />
+  )
+}
+
 createRoot(document.getElementById('root')!).render(
   <StrictMode>
-    <QueryClientProvider client={queryClient}>
-      <BrowserRouter>
-        <App />
-        <Toaster
-          position="bottom-right"
-          toastOptions={{
-            style: {
-              borderRadius: '6px',
-              border: '1px solid var(--color-line-strong)',
-              fontSize: '12.5px',
-            },
-          }}
-        />
-      </BrowserRouter>
-    </QueryClientProvider>
+    <ThemeProvider>
+      <QueryClientProvider client={queryClient}>
+        <BrowserRouter>
+          <App />
+          <ThemedToaster />
+        </BrowserRouter>
+      </QueryClientProvider>
+    </ThemeProvider>
   </StrictMode>,
 )

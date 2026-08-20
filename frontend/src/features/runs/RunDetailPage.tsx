@@ -180,8 +180,7 @@ function RunInspector() {
             {workflow.data?.name ?? 'Run'}
           </h1>
           <p className="truncate font-mono text-[11px] text-ink-muted">
-            {detail.public_id}
-            {detail.version_no && ` · v${detail.version_no}`}
+            {detail.version_no ? `Published v${detail.version_no}` : 'Execution'}
           </p>
         </div>
 
@@ -235,7 +234,7 @@ function RunInspector() {
               proOptions={{ hideAttribution: true }}
               className="bg-canvas"
             >
-              <Background variant={BackgroundVariant.Dots} gap={16} size={1} color="#d9dbdf" />
+              <Background variant={BackgroundVariant.Dots} gap={16} size={1} color="var(--color-flow-grid)" />
               <Controls showInteractive={false} className="!shadow-none" />
             </ReactFlow>
           )}
