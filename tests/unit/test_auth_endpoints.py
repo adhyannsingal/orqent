@@ -30,7 +30,7 @@ from app.services.auth_service import AuthService
 
 SECRET = "endpoint-test-secret-long-enough-hs256"
 EMAIL = "founder@example.com"
-PASSWORD = "correct horse battery staple"
+PASSWORD = "correct-horse-7!"
 ORGANIZATION = "Acme Inc"
 
 ACCESS_TOKEN = "access-token-value"
@@ -192,6 +192,9 @@ def test_register_infrastructure_failure_becomes_503(
     [
         {**REGISTER_PAYLOAD, "email": "not-an-email"},
         {**REGISTER_PAYLOAD, "password": "short"},
+        {**REGISTER_PAYLOAD, "password": "allletters"},
+        {**REGISTER_PAYLOAD, "password": "12345678!"},
+        {**REGISTER_PAYLOAD, "password": "NoSpecial7"},
         {**REGISTER_PAYLOAD, "password": "x" * 1025},
         {**REGISTER_PAYLOAD, "organization_name": ""},
         {"email": EMAIL, "password": PASSWORD},  # organization_name missing

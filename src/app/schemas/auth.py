@@ -14,15 +14,16 @@ one model would mean a nullable ``email`` that is always null on ``/auth/me``.
 
 from __future__ import annotations
 
-from pydantic import BaseModel, EmailStr, Field
+from pydantic import BaseModel, EmailStr, Field, field_validator
 
 # Argon2 hashes whatever it is given, so an unbounded password is an invitation
 # to burn CPU on a megabyte of input. The ceiling is a resource guard, not a
 # policy; it is far above any real passphrase.
 _MAX_PASSWORD_LENGTH = 1024
 
-# A floor low enough not to reject reasonable passphrases. Richer policy
-# (complexity, breach lists) belongs in the service layer, not at the edge.
+# A floor low enough not to reject reasonable passphrases. Registration also
+# applies a modest composition rule below; login remains shape-agnostic so old
+# accounts cannot be locked out by a policy change.
 _MIN_PASSWORD_LENGTH = 8
 
 # Signed tokens are a few hundred bytes; the ceiling only stops a caller making
@@ -36,6 +37,22 @@ class RegisterRequest(BaseModel):
     email: EmailStr
     password: str = Field(min_length=_MIN_PASSWORD_LENGTH, max_length=_MAX_PASSWORD_LENGTH)
     organization_name: str = Field(min_length=1, max_length=255)
+
+    @field_validator("password")
+    @classmethod
+    def _password_must_meet_complexity(cls, value: str) -> str:
+        """Registration policy; login deliberately stays shape-agnostic below."""
+
+        missing: list[str] = []
+        if not any(character.isalpha() for character in value):
+            missing.append("a letter")
+        if not any(character.isdigit() for character in value):
+            missing.append("a number")
+        if not any(not character.isalnum() and not character.isspace() for character in value):
+            missing.append("a special character")
+        if missing:
+            raise ValueError(f"Password must include {', '.join(missing)}.")
+        return value
 
 
 class LoginRequest(BaseModel):
