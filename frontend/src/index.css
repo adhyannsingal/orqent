@@ -1,0 +1,87 @@
+@import "tailwindcss";
+
+/* ============================================================================
+   Orqent design tokens
+   ----------------------------------------------------------------------------
+   A developer/operations tool: compact, technical, restrained. Dark charcoal
+   navigation against a near-white workspace, thin neutral borders, small radii,
+   and colour reserved almost entirely for run status.
+
+   Drawn from the two references in docs/ui-references: the dense technical
+   canvas chrome of the workflow screenshot, and the light neutral surface and
+   crisp geometric type of the landing page. Neither is copied — the landing
+   page is a crypto marketing site, which is explicitly the look this must not
+   have.
+   ========================================================================== */
+@theme {
+  /* Neutrals. A hair cool, so the workspace reads as paper rather than grey. */
+  --color-canvas: #fafafa;
+  --color-surface: #ffffff;
+  --color-line: #e6e7e9;
+  --color-line-strong: #d3d5d8;
+  --color-ink: #16171a;
+  --color-ink-muted: #6b6f76;
+  --color-ink-subtle: #9096a844;
+
+  /* Navigation: near-black, not a saturated blue-grey. */
+  --color-nav: #17181b;
+  --color-nav-hover: #232529;
+  --color-nav-active: #2c2f35;
+  --color-nav-ink: #a8adb7;
+  --color-nav-ink-active: #ffffff;
+
+  /* One accent, used for selection and focus. Never decoration. */
+  --color-accent: #5b57d1;
+  --color-accent-soft: #eeedfb;
+
+  /* Run + node status. The only place colour carries meaning. */
+  --color-status-pending: #8b909a;
+  --color-status-running: #2563eb;
+  --color-status-succeeded: #15803d;
+  --color-status-failed: #c2410c;
+  --color-status-skipped: #a1a1aa;
+  --color-status-suspended: #a16207;
+
+  --radius-xs: 3px;
+  --radius-sm: 5px;
+  --radius-md: 7px;
+
+  --font-sans: "Inter", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, monospace;
+}
+
+html, body, #root { height: 100%; }
+
+body {
+  background: var(--color-canvas);
+  color: var(--color-ink);
+  font-family: var(--font-sans);
+  font-size: 13.5px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+  font-feature-settings: "cv02", "cv03", "cv04";
+}
+
+/* Tabular figures everywhere numbers line up in a table. */
+.tnum { font-variant-numeric: tabular-nums; }
+
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-thumb {
+  background: #d4d6d9;
+  border-radius: 6px;
+  border: 3px solid transparent;
+  background-clip: content-box;
+}
+::-webkit-scrollbar-thumb:hover { background: #b9bcc1; background-clip: content-box; }
+::-webkit-scrollbar-track { background: transparent; }
+
+/* React Flow adopts the token palette rather than shipping its own look. */
+.react-flow__edge-path { stroke: #b6b9bf; stroke-width: 1.5; }
+.react-flow__edge.selected .react-flow__edge-path { stroke: var(--color-accent); }
+.react-flow__handle {
+  width: 9px; height: 9px;
+  background: #ffffff;
+  border: 1.5px solid #a6aab2;
+}
+.react-flow__handle:hover { border-color: var(--color-accent); }
+.react-flow__attribution { display: none; }
