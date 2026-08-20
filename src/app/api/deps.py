@@ -21,6 +21,7 @@ from app.container import Container
 from app.core.config import Settings
 from app.domain.nodes.registry import NodeRegistry
 from app.services.auth_service import AuthService
+from app.services.memory_service import MemoryService
 from app.services.run_service import RunService
 from app.services.webhook_service import WebhookService
 from app.services.workflow_service import WorkflowService
@@ -83,6 +84,23 @@ def get_run_service(container: ContainerDep) -> RunService:
 
 
 RunServiceDep = Annotated[RunService, Depends(get_run_service)]
+
+
+def get_memory_service(container: ContainerDep) -> MemoryService:
+    """Expose document ingestion and retrieval to routes.
+
+    **Built lazily, and that matters here more than elsewhere.** Constructing
+    this is what first requires an embedding credential; resolving it eagerly
+    would make every request to every route depend on a provider being
+    configured. Because FastAPI calls this only for the routes that declare it,
+    a deployment with no AI configured still serves the whole API and fails only
+    when someone actually asks to ingest.
+    """
+
+    return container.memory_service
+
+
+MemoryServiceDep = Annotated[MemoryService, Depends(get_memory_service)]
 
 
 async def get_session(container: ContainerDep) -> AsyncIterator[AsyncSession]:
