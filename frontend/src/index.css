@@ -1,0 +1,162 @@
+@import "tailwindcss";
+
+/* ============================================================================
+   Orqent design tokens
+   ----------------------------------------------------------------------------
+   A developer/operations tool: compact, technical, restrained. Dark charcoal
+   navigation against a near-white workspace, thin neutral borders, small radii,
+   and colour reserved almost entirely for run status.
+
+   Drawn from the two references in docs/ui-references: the dense technical
+   canvas chrome of the workflow screenshot, and the light neutral surface and
+   crisp geometric type of the landing page. Neither is copied — the landing
+   page is a crypto marketing site, which is explicitly the look this must not
+   have.
+   ========================================================================== */
+@theme {
+  /* Neutrals. A hair cool, so the workspace reads as paper rather than grey. */
+  --color-canvas: #fafafa;
+  --color-surface: #ffffff;
+  --color-line: #e6e7e9;
+  --color-line-strong: #d3d5d8;
+  --color-ink: #16171a;
+  --color-ink-muted: #6b6f76;
+  --color-ink-subtle: #9096a844;
+
+  /* Navigation: near-black, not a saturated blue-grey. */
+  --color-nav: #17181b;
+  --color-nav-hover: #232529;
+  --color-nav-active: #2c2f35;
+  --color-nav-ink: #a8adb7;
+  --color-nav-ink-active: #ffffff;
+
+  /* One accent, used for selection and focus. Never decoration. */
+  --color-accent: #5b57d1;
+  --color-accent-soft: #eeedfb;
+
+  /* Run + node status. The only place colour carries meaning. */
+  --color-status-pending: #8b909a;
+  --color-status-running: #2563eb;
+  --color-status-succeeded: #15803d;
+  --color-status-failed: #c2410c;
+  --color-status-skipped: #a1a1aa;
+  --color-status-suspended: #a16207;
+
+  --color-flow-grid: #d9dbdf;
+
+  --radius-xs: 3px;
+  --radius-sm: 5px;
+  --radius-md: 7px;
+
+  --font-sans: "Inter", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, monospace;
+}
+
+html, body, #root { height: 100%; }
+
+.dark {
+  --color-canvas: #090a0f;
+  --color-surface: #101118;
+  --color-line: #232632;
+  --color-line-strong: #343849;
+  --color-ink: #f4f5f7;
+  --color-ink-muted: #a3a8b5;
+  --color-ink-subtle: #69718455;
+
+  --color-nav: #05060a;
+  --color-nav-hover: #171923;
+  --color-nav-active: #202333;
+  --color-nav-ink: #9ba1b1;
+  --color-nav-ink-active: #ffffff;
+
+  --color-accent: #8f8cff;
+  --color-accent-soft: #242346;
+
+  --color-status-pending: #9aa1af;
+  --color-status-running: #7aa2ff;
+  --color-status-succeeded: #52c47b;
+  --color-status-failed: #ff8a55;
+  --color-status-skipped: #858b98;
+  --color-status-suspended: #f0b34f;
+  --color-flow-grid: #2c3040;
+}
+
+body {
+  background: var(--color-canvas);
+  color: var(--color-ink);
+  font-family: var(--font-sans);
+  font-size: 13.5px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+  font-feature-settings: "cv02", "cv03", "cv04";
+}
+
+::selection {
+  background: var(--color-accent-soft);
+  color: var(--color-ink);
+}
+
+/* Tabular figures everywhere numbers line up in a table. */
+.tnum { font-variant-numeric: tabular-nums; }
+
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-thumb {
+  background: color-mix(in srgb, var(--color-ink-muted) 38%, transparent);
+  border-radius: 6px;
+  border: 3px solid transparent;
+  background-clip: content-box;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: color-mix(in srgb, var(--color-ink-muted) 55%, transparent);
+  background-clip: content-box;
+}
+::-webkit-scrollbar-track { background: transparent; }
+
+/* React Flow adopts the token palette rather than shipping its own look. */
+.react-flow__edge-path {
+  stroke: color-mix(in srgb, var(--color-ink-muted) 58%, transparent);
+  stroke-width: 1.5;
+}
+.react-flow__edge.selected .react-flow__edge-path { stroke: var(--color-accent); }
+.react-flow__handle {
+  width: 9px; height: 9px;
+  background: var(--color-surface);
+  border: 1.5px solid color-mix(in srgb, var(--color-ink-muted) 70%, transparent);
+}
+.react-flow__handle:hover { border-color: var(--color-accent); }
+.react-flow__attribution { display: none; }
+.react-flow__controls {
+  border: 1px solid var(--color-line-strong);
+  border-radius: 6px;
+  overflow: hidden;
+}
+.react-flow__controls-button {
+  background: var(--color-surface) !important;
+  border-color: var(--color-line) !important;
+  color: var(--color-ink-muted) !important;
+}
+.react-flow__controls-button:hover {
+  background: var(--color-canvas) !important;
+  color: var(--color-ink) !important;
+}
+
+/* Tailwind's fixed palette classes are used sparingly for semantic callouts.
+   These overrides keep those callouts readable instead of glowing in dark mode. */
+.dark .bg-green-50 { background-color: #082414; }
+.dark .bg-orange-50 { background-color: #2c1408; }
+.dark .bg-amber-50 { background-color: #261b08; }
+.dark .bg-blue-50 { background-color: #0d1b35; }
+.dark .bg-sky-50 { background-color: #092334; }
+.dark .bg-indigo-50 { background-color: #161539; }
+.dark .bg-violet-50 { background-color: #1d1435; }
+.dark .border-green-200 { border-color: #1f7a43; }
+.dark .border-green-300 { border-color: #2f9b57; }
+.dark .border-orange-200 { border-color: #9a4a20; }
+.dark .border-amber-200 { border-color: #8b6118; }
+.dark .border-blue-200 { border-color: #315d9f; }
+.dark .text-indigo-700,
+.dark .text-sky-700,
+.dark .text-violet-700,
+.dark .text-amber-700 {
+  color: var(--color-ink-muted);
+}
