@@ -14,7 +14,7 @@ type ButtonVariant = 'primary' | 'secondary' | 'ghost' | 'danger'
 type ButtonSize = 'sm' | 'md'
 
 const BUTTON_VARIANTS: Record<ButtonVariant, string> = {
-  primary: 'bg-ink text-white hover:bg-black disabled:bg-ink-muted',
+  primary: 'border border-[#2563eb] bg-[#2563eb] text-white hover:border-[#1d4ed8] hover:bg-[#1d4ed8] disabled:border-ink-muted disabled:bg-ink-muted',
   secondary:
     'bg-surface text-ink border border-line-strong hover:bg-canvas',
   ghost: 'text-ink-muted hover:text-ink hover:bg-canvas',

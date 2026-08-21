@@ -11,7 +11,7 @@ import { workflowsApi } from '@/api/workflows'
 import { nodeTypesApi } from '@/api/nodeTypes'
 import { runsApi } from '@/api/runs'
 import { messageOf } from '@/api/client'
-import { Button, Spinner } from '@/components/ui/primitives'
+import { Button, Field, Modal, Spinner, Textarea } from '@/components/ui/primitives'
 import { NodeLibrary } from '@/components/workflow/NodeLibrary'
 import { Inspector } from '@/components/workflow/Inspector'
 import { OrqentNode } from '@/components/workflow/OrqentNode'
@@ -41,6 +41,9 @@ function Builder() {
 
   const [report, setReport] = useState<ValidationReport | null>(null)
   const [published, setPublished] = useState<PublishResult | null>(null)
+  const [runOpen, setRunOpen] = useState(false)
+  const [runPayload, setRunPayload] = useState('')
+  const [runPayloadError, setRunPayloadError] = useState<string | null>(null)
 
   const state = useBuilder()
 
@@ -124,21 +127,35 @@ function Builder() {
   })
 
   const run = useMutation({
-    mutationFn: () => runsApi.create(id, null),
-    onSuccess: (created) => navigate(`/runs/${created.public_id}`),
+    mutationFn: (payload: Record<string, unknown> | null) => runsApi.create(id, payload),
+    onSuccess: (created) => {
+      setRunOpen(false)
+      setRunPayloadError(null)
+      navigate(`/runs/${created.public_id}`)
+    },
     onError: (error) => toast.error(messageOf(error, 'Could not start a run.')),
   })
 
   const addNode = useCallback(
     (descriptor: NodeType, position?: { x: number; y: number }) => {
-      // Drop point when dragged; a spot near the viewport centre when clicked.
-      const target = position ?? flow.screenToFlowPosition({
-        x: (canvasRef.current?.clientWidth ?? 800) / 2,
-        y: (canvasRef.current?.clientHeight ?? 600) / 2,
+      if (position) {
+        state.addNode(descriptor, { x: position.x - 100, y: position.y - 20 })
+        return
+      }
+
+      // Click-add lays nodes into the visible canvas. Pick the desired screen
+      // point first, then convert it through the current React Flow transform.
+      const rect = canvasRef.current?.getBoundingClientRect()
+      const index = state.nodes.length
+      const target = flow.screenToFlowPosition({
+        x: (rect?.left ?? 0) + (rect?.width ?? 800) / 2,
+        y: index === 0
+          ? (rect?.top ?? 0) + 160
+          : (rect?.top ?? 0) + 580 + (index - 1) * 120,
       })
       state.addNode(descriptor, {
-        x: target.x - 100 + Math.random() * 40,
-        y: target.y - 20 + Math.random() * 40,
+        x: target.x - 100,
+        y: target.y - 40,
       })
     },
     [flow, state],
@@ -188,7 +205,7 @@ function Builder() {
         />
 
         <div className="ml-auto flex items-center gap-1.5">
-          <Button size="sm" onClick={() => save.mutate()} loading={save.isPending} disabled={!state.dirty}>
+          <Button size="sm" variant="ghost" onClick={() => save.mutate()} loading={save.isPending} disabled={!state.dirty}>
             <Save className="size-3.5" />
             Save
           </Button>
@@ -196,14 +213,14 @@ function Builder() {
             <ShieldCheck className="size-3.5" />
             Validate
           </Button>
-          <Button size="sm" onClick={() => publish.mutate()} loading={publish.isPending} disabled={busy}>
+          <Button size="sm" variant="primary" onClick={() => publish.mutate()} loading={publish.isPending} disabled={busy}>
             <Rocket className="size-3.5" />
             Publish
           </Button>
           <Button
             size="sm"
             variant="primary"
-            onClick={() => run.mutate()}
+            onClick={() => setRunOpen(true)}
             loading={run.isPending}
             disabled={!workflow.data?.active_version_no}
             title={workflow.data?.active_version_no ? 'Start a run' : 'Publish before running'}
@@ -293,6 +310,64 @@ function Builder() {
       </div>
 
       <PublishDialog result={published} onClose={() => setPublished(null)} />
+      <Modal
+        open={runOpen}
+        onClose={() => {
+          if (!run.isPending) {
+            setRunOpen(false)
+            setRunPayloadError(null)
+          }
+        }}
+        title="Start run"
+        description="Optional JSON object for the manual trigger."
+      >
+        <form
+          className="space-y-3"
+          onSubmit={(event) => {
+            event.preventDefault()
+            setRunPayloadError(null)
+            const text = runPayload.trim()
+            if (!text) {
+              run.mutate(null)
+              return
+            }
+            try {
+              const parsed = JSON.parse(text) as unknown
+              if (!parsed || Array.isArray(parsed) || typeof parsed !== 'object') {
+                setRunPayloadError('Payload must be a JSON object.')
+                return
+              }
+              run.mutate(parsed as Record<string, unknown>)
+            } catch {
+              setRunPayloadError('Payload must be valid JSON.')
+            }
+          }}
+        >
+          <Field label="Trigger payload" hint="optional">
+            <Textarea
+              rows={5}
+              value={runPayload}
+              onChange={(event) => setRunPayload(event.target.value)}
+              placeholder={'{ "prompt": "Return the word READY." }'}
+              className="font-mono"
+            />
+          </Field>
+          {runPayloadError && (
+            <p className="rounded-sm border border-orange-200 bg-orange-50 px-2.5 py-2 text-[12px] text-status-failed">
+              {runPayloadError}
+            </p>
+          )}
+          <div className="flex justify-end gap-2">
+            <Button type="button" onClick={() => setRunOpen(false)} disabled={run.isPending}>
+              Cancel
+            </Button>
+            <Button type="submit" variant="primary" loading={run.isPending}>
+              <Play className="size-3.5" />
+              Run
+            </Button>
+          </div>
+        </form>
+      </Modal>
     </div>
   )
 }

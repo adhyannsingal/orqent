@@ -178,13 +178,10 @@ function AgentForm({
         />
       </Field>
 
-      <Field label="Model" hint="resolved by the deployment">
-        <Select
-          value={String(config.model ?? 'default')}
-          onChange={(value) => set({ model: value })}
-          options={[{ value: 'default', label: 'Default' }]}
-        />
-      </Field>
+      <div className="flex items-center justify-between border-y border-line py-2">
+        <span className="text-[12px] font-medium text-ink">Model</span>
+        <span className="text-[12px] text-ink-muted">Default</span>
+      </div>
 
       <Field label="Temperature" hint={temperature.toFixed(1)}>
         <input

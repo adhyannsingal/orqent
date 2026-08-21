@@ -146,10 +146,11 @@ export const useBuilder = create<BuilderState>((set, get) => ({
       dirty: true,
       selectedKey: key,
       nodes: [
-        ...state.nodes,
+        ...state.nodes.map((node) => ({ ...node, selected: false })),
         {
           id: key,
           type: 'orqent' as const,
+          selected: true,
           position,
           data: {
             nodeKey: key,
@@ -174,7 +175,11 @@ export const useBuilder = create<BuilderState>((set, get) => ({
       ),
     })),
 
-  select: (nodeKey) => set({ selectedKey: nodeKey }),
+  select: (nodeKey) =>
+    set((state) => ({
+      selectedKey: nodeKey,
+      nodes: state.nodes.map((node) => ({ ...node, selected: node.data.nodeKey === nodeKey })),
+    })),
   setRevision: (revision) => set({ revision }),
   markClean: () => set({ dirty: false }),
 

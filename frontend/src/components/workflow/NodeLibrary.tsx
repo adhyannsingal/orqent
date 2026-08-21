@@ -74,7 +74,9 @@ export function NodeLibrary({
                       {type.display.description}
                     </span>
                   </span>
-                  <Plus className="size-3 shrink-0 text-ink-muted opacity-0 transition-opacity group-hover:opacity-100" />
+                  <span className="grid size-5 shrink-0 place-items-center rounded-sm border border-line-strong text-ink-muted group-hover:border-accent group-hover:text-accent">
+                    <Plus className="size-3" />
+                  </span>
                 </button>
               )
             })}
