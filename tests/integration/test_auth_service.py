@@ -15,10 +15,14 @@ here would buy little.
 from __future__ import annotations
 
 import pytest
+from fastapi import FastAPI
+from httpx import ASGITransport, AsyncClient
 from sqlalchemy import func, select
 from sqlalchemy import update as sql_update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from app.api.deps import get_auth_service
+from app.core.config import Environment, Settings
 from app.domain.errors import AuthenticationError, ConflictError
 from app.domain.value_objects.token import TokenType
 from app.domain.value_objects.token_pair import TokenPair
@@ -30,6 +34,7 @@ from app.infrastructure.repositories.refresh_token_repository import RefreshToke
 from app.infrastructure.security.password_hasher import Argon2PasswordHasher
 from app.infrastructure.security.token_hashing import hash_token
 from app.infrastructure.security.token_service import JwtTokenService
+from app.main import create_app
 from app.services.auth_service import DEFAULT_ROLE, AuthService
 
 pytestmark = pytest.mark.integration
@@ -252,19 +257,35 @@ async def test_refresh_is_rejected_for_a_deactivated_user(
 
 
 async def test_logout_revokes_every_token_in_the_family(
-    service: AuthService, session: AsyncSession
+    service: AuthService, session: AsyncSession, token_service: JwtTokenService
 ) -> None:
     original = await _login(service)
-    await service.refresh(original.refresh_token)
+    rotated = await service.refresh(original.refresh_token)
 
     await service.logout(original.refresh_token)
 
-    live = await session.scalar(
-        select(func.count())
-        .select_from(RefreshTokenModel)
-        .where(RefreshTokenModel.revoked_at.is_(None))
+    # Scoped to this login's own family, resolved through the repository the
+    # rotation tests already use. An unscoped `COUNT(*) WHERE revoked_at IS
+    # NULL` only holds on an empty database: any unrelated account with a live
+    # session fails it, which says nothing about whether logout works.
+    stored = await RefreshTokenRepository(session).get_by_jti(
+        token_service.decode(original.refresh_token).jti
     )
-    assert live == 0
+    assert stored is not None
+    family = (
+        await session.scalars(
+            select(RefreshTokenModel).where(RefreshTokenModel.family_id == stored.family_id)
+        )
+    ).all()
+
+    # Naming both members is what keeps this a proof of *every* token rather
+    # than of some token: asserting only "none of them are live" would pass
+    # just as well against a family that turned out to be empty.
+    assert {row.jti for row in family} == {
+        token_service.decode(original.refresh_token).jti,
+        token_service.decode(rotated.refresh_token).jti,
+    }
+    assert all(row.revoked_at is not None for row in family)
 
 
 async def test_logout_twice_succeeds(service: AuthService) -> None:
@@ -281,3 +302,85 @@ async def test_logout_prevents_further_refresh(service: AuthService) -> None:
 
     with pytest.raises(AuthenticationError):
         await service.refresh(original.refresh_token)
+
+
+# --- Login: account enumeration over HTTP ------------------------------------
+#
+# The unit endpoint tests substitute the service, so they can show the *route*
+# is generic but not that the real service's two failure paths are
+# indistinguishable. These run the genuine article — real MySQL, real Argon2 —
+# through the real app, which is the only place the claim can actually be made.
+
+
+def _app(service: AuthService) -> FastAPI:
+    application = create_app(
+        Settings(
+            _env_file=None,
+            environment=Environment.TEST,
+            log_json=False,
+            database_url=None,
+            jwt_secret_key=SECRET,
+        )
+    )
+    application.dependency_overrides[get_auth_service] = lambda: service
+    return application
+
+
+async def test_unknown_email_and_wrong_password_are_byte_equivalent_over_http(
+    service: AuthService,
+) -> None:
+    await service.register(
+        email="founder@example.com", password=PASSWORD, organization_name="Acme Inc"
+    )
+
+    async with AsyncClient(
+        transport=ASGITransport(app=_app(service)), base_url="http://test"
+    ) as client:
+        unknown = await client.post(
+            "/api/v1/auth/login",
+            json={"email": "nobody@example.com", "password": PASSWORD},
+        )
+        wrong = await client.post(
+            "/api/v1/auth/login",
+            json={"email": "founder@example.com", "password": "not the password"},
+        )
+
+    assert unknown.status_code == wrong.status_code == 401
+
+    # Correlation IDs are request-specific by design; everything else must match
+    # exactly. Comparing whole bodies rather than just the message is what stops
+    # a future field — an error subcode, a hint, a retry-after — from quietly
+    # becoming an oracle without anyone noticing.
+    unknown_body, wrong_body = unknown.json(), wrong.json()
+    unknown_body["error"].pop("correlation_id")
+    wrong_body["error"].pop("correlation_id")
+    assert unknown_body == wrong_body
+    assert unknown_body["error"]["message"] == "Either email or password is incorrect."
+    assert unknown_body["error"]["code"] == "authentication_error"
+
+
+async def test_login_over_http_leaks_no_account_hint_in_headers(
+    service: AuthService,
+) -> None:
+    # A differing header — a length, a cache directive, a custom marker — would
+    # enumerate accounts just as well as a differing body.
+    await service.register(
+        email="founder@example.com", password=PASSWORD, organization_name="Acme Inc"
+    )
+
+    async with AsyncClient(
+        transport=ASGITransport(app=_app(service)), base_url="http://test"
+    ) as client:
+        unknown = await client.post(
+            "/api/v1/auth/login",
+            json={"email": "nobody@example.com", "password": PASSWORD},
+        )
+        wrong = await client.post(
+            "/api/v1/auth/login",
+            json={"email": "founder@example.com", "password": "not the password"},
+        )
+
+    ignored = {"x-correlation-id", "date"}
+    assert {k: v for k, v in unknown.headers.items() if k.lower() not in ignored} == {
+        k: v for k, v in wrong.headers.items() if k.lower() not in ignored
+    }

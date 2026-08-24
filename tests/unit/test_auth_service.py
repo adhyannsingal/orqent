@@ -334,6 +334,21 @@ async def test_login_rejects_an_unknown_email(service: AuthService) -> None:
         await service.login(email="nobody@example.com", password=PASSWORD)
 
 
+async def test_login_failure_carries_the_401_status_whichever_check_failed(
+    service: AuthService,
+) -> None:
+    # Both paths must reach the API layer as the same error class, or the
+    # envelope's status and code would differ even with identical wording.
+    await _register(service)
+
+    for email, password in (("nobody@example.com", PASSWORD), (EMAIL, "wrong")):
+        with pytest.raises(AuthenticationError) as caught:
+            await service.login(email=email, password=password)
+        assert caught.value.http_status == 401
+        assert caught.value.code == "authentication_error"
+        assert caught.value.details == []
+
+
 async def test_login_rejects_a_wrong_password(service: AuthService) -> None:
     await _register(service)
 
@@ -370,7 +385,10 @@ async def test_every_login_failure_reports_the_same_message(
         await service.login(email=EMAIL, password=PASSWORD)
     messages.add(caught.value.message)
 
-    assert len(messages) == 1
+    # Pinned to the literal, not to `_INVALID_CREDENTIALS`. Asserting only that
+    # the three agree passes just as happily when all three say "user not
+    # found" — agreement is not the property under test, saying nothing is.
+    assert messages == {"Either email or password is incorrect."}
 
 
 # --- Login: timing ----------------------------------------------------------

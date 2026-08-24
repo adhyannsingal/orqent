@@ -211,6 +211,31 @@ def test_register_rejects_invalid_payloads(
     assert auth_service.register_calls == []
 
 
+@pytest.mark.parametrize("special", list("!@#$%^&*_-?"))
+def test_register_accepts_each_representative_special_character(
+    client: TestClient, auth_service: FakeAuthService, special: str
+) -> None:
+    payload = {**REGISTER_PAYLOAD, "password": f"abcdefg1{special}"}
+
+    response = client.post("/api/v1/auth/register", json=payload)
+
+    assert response.status_code == 201
+    assert auth_service.register_calls
+
+
+def test_register_accepts_a_long_passphrase(
+    client: TestClient, auth_service: FakeAuthService
+) -> None:
+    # Length alone must not be treated as suspicious: the only ceiling is the
+    # 1024-character resource guard, well above any real passphrase.
+    payload = {**REGISTER_PAYLOAD, "password": "correct horse battery staple 7!" * 8}
+
+    response = client.post("/api/v1/auth/register", json=payload)
+
+    assert response.status_code == 201
+    assert auth_service.register_calls
+
+
 def test_validation_failure_uses_the_standard_envelope(client: TestClient) -> None:
     body = client.post("/api/v1/auth/register", json={}).json()
 
@@ -241,7 +266,7 @@ def test_login_passes_credentials_to_the_service(
 
 
 def test_login_failure_becomes_401(client: TestClient, auth_service: FakeAuthService) -> None:
-    auth_service.login_error = AuthenticationError("Invalid email or password.")
+    auth_service.login_error = AuthenticationError("Either email or password is incorrect.")
 
     response = client.post("/api/v1/auth/login", json=LOGIN_PAYLOAD)
 
@@ -252,7 +277,7 @@ def test_login_failure_becomes_401(client: TestClient, auth_service: FakeAuthSer
 def test_login_failure_does_not_disclose_which_check_failed(
     client: TestClient, auth_service: FakeAuthService
 ) -> None:
-    auth_service.login_error = AuthenticationError("Invalid email or password.")
+    auth_service.login_error = AuthenticationError("Either email or password is incorrect.")
 
     message = client.post("/api/v1/auth/login", json=LOGIN_PAYLOAD).json()["error"]["message"]
 
@@ -261,12 +286,28 @@ def test_login_failure_does_not_disclose_which_check_failed(
     assert "disabled" not in message.lower()
 
 
+def test_failed_login_returns_only_the_error_envelope(
+    client: TestClient, auth_service: FakeAuthService
+) -> None:
+    # No user, no tokens, and no echo of the submitted password: a failed login
+    # must not hand back anything the caller did not already have.
+    auth_service.login_error = AuthenticationError("Either email or password is incorrect.")
+
+    response = client.post("/api/v1/auth/login", json=LOGIN_PAYLOAD)
+
+    assert response.json().keys() == {"error"}
+    assert response.json()["error"]["message"] == "Either email or password is incorrect."
+    assert PASSWORD not in response.text
+    for leaked in ("access_token", "refresh_token", "public_id", "password_hash"):
+        assert leaked not in response.text
+
+
 def test_login_accepts_a_short_password_and_lets_the_service_decide(
     client: TestClient, auth_service: FakeAuthService
 ) -> None:
     # A minimum length here would reject old accounts after a policy change, and
     # would answer with 422 where every login failure should look identical.
-    auth_service.login_error = AuthenticationError("Invalid email or password.")
+    auth_service.login_error = AuthenticationError("Either email or password is incorrect.")
 
     response = client.post("/api/v1/auth/login", json={"email": EMAIL, "password": "x"})
 

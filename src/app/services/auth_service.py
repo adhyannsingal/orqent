@@ -71,7 +71,7 @@ DEFAULT_ROLE = "owner"
 # One message for every credential failure — unknown email, wrong password, and
 # disabled account are indistinguishable to the caller. Telling them apart would
 # turn the login form into an account-enumeration oracle.
-_INVALID_CREDENTIALS = "Invalid email or password."
+_INVALID_CREDENTIALS = "Either email or password is incorrect."
 
 # The same idea for the refresh endpoint: unknown, expired, revoked, replayed,
 # and belonging-to-a-disabled-account all read identically from outside. A
