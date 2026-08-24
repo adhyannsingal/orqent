@@ -59,10 +59,13 @@ class FakeAuthService:
         self.login_calls: list[dict[str, str]] = []
         self.refresh_calls: list[str] = []
         self.logout_calls: list[str] = []
+        self.forgot_password_calls: list[str] = []
+        self.reset_password_calls: list[dict[str, str]] = []
         self.register_error: Exception | None = None
         self.login_error: Exception | None = None
         self.refresh_error: Exception | None = None
         self.logout_error: Exception | None = None
+        self.reset_password_error: Exception | None = None
 
     async def register(self, *, email: str, password: str, organization_name: str) -> User:
         self.register_calls.append(
@@ -88,6 +91,17 @@ class FakeAuthService:
         self.logout_calls.append(refresh_token)
         if self.logout_error is not None:
             raise self.logout_error
+
+    async def forgot_password(self, *, email: str) -> None:
+        # No error hook and no return value: the real one cannot fail visibly
+        # or report anything, and a fake that could would let a route test
+        # assert behaviour the service will never produce.
+        self.forgot_password_calls.append(email)
+
+    async def reset_password(self, *, token: str, new_password: str) -> None:
+        self.reset_password_calls.append({"token": token, "new_password": new_password})
+        if self.reset_password_error is not None:
+            raise self.reset_password_error
 
 
 @pytest.fixture
@@ -528,3 +542,159 @@ def test_new_routes_are_published(app: FastAPI) -> None:
 
     assert "post" in paths["/api/v1/auth/refresh"]
     assert "post" in paths["/api/v1/auth/logout"]
+
+
+# --- Forgot password --------------------------------------------------------
+
+FORGOT_PAYLOAD = {"email": EMAIL}
+RESET_TOKEN = "a-reset-token-value"
+NEW_PASSWORD = "a whole new passphrase 9!"
+RESET_PAYLOAD = {"token": RESET_TOKEN, "new_password": NEW_PASSWORD}
+
+GENERIC_FORGOT_MESSAGE = "If an account exists for that email, a password reset link has been sent."
+
+
+def test_forgot_password_returns_200_and_the_generic_message(client: TestClient) -> None:
+    response = client.post("/api/v1/auth/forgot-password", json=FORGOT_PAYLOAD)
+
+    assert response.status_code == 200
+    assert response.json() == {"message": GENERIC_FORGOT_MESSAGE}
+
+
+def test_forgot_password_passes_the_email_to_the_service(
+    client: TestClient, auth_service: FakeAuthService
+) -> None:
+    client.post("/api/v1/auth/forgot-password", json=FORGOT_PAYLOAD)
+
+    assert auth_service.forgot_password_calls == [EMAIL]
+
+
+def test_forgot_password_answers_identically_for_any_address(client: TestClient) -> None:
+    # The route cannot distinguish the cases — the service returns None for all
+    # of them — so this pins that the *response* is byte-identical too.
+    known = client.post("/api/v1/auth/forgot-password", json={"email": EMAIL})
+    unknown = client.post("/api/v1/auth/forgot-password", json={"email": "nobody@example.com"})
+
+    assert known.status_code == unknown.status_code == 200
+    assert known.json() == unknown.json()
+
+
+def test_forgot_password_response_carries_no_token_or_account_detail(
+    client: TestClient,
+) -> None:
+    body = client.post("/api/v1/auth/forgot-password", json=FORGOT_PAYLOAD).text
+
+    assert "token" not in body
+    # "exists" is deliberately absent from this list: the generic message says
+    # it, in the conditional phrasing that is precisely what reveals nothing.
+    for leaked in ("public_id", "organization", "user_id", "sent_to"):
+        assert leaked not in body
+
+
+@pytest.mark.parametrize("payload", [{"email": "not-an-email"}, {}])
+def test_forgot_password_rejects_invalid_payloads(
+    client: TestClient, auth_service: FakeAuthService, payload: dict[str, str]
+) -> None:
+    response = client.post("/api/v1/auth/forgot-password", json=payload)
+
+    assert response.status_code == 422
+    assert auth_service.forgot_password_calls == []
+
+
+# --- Reset password ---------------------------------------------------------
+
+
+def test_reset_password_returns_200_and_an_acknowledgement(client: TestClient) -> None:
+    response = client.post("/api/v1/auth/reset-password", json=RESET_PAYLOAD)
+
+    assert response.status_code == 200
+    assert response.json() == {"message": "Your password has been reset. Please sign in."}
+
+
+def test_reset_password_passes_the_payload_to_the_service(
+    client: TestClient, auth_service: FakeAuthService
+) -> None:
+    client.post("/api/v1/auth/reset-password", json=RESET_PAYLOAD)
+
+    assert auth_service.reset_password_calls == [
+        {"token": RESET_TOKEN, "new_password": NEW_PASSWORD}
+    ]
+
+
+def test_reset_password_does_not_sign_the_caller_in(client: TestClient) -> None:
+    # Returning a session here would hand it to whoever holds the link, and
+    # would undo the revocation the reset just performed.
+    body = client.post("/api/v1/auth/reset-password", json=RESET_PAYLOAD).text
+
+    for leaked in ("access_token", "refresh_token", "token_type"):
+        assert leaked not in body
+
+
+def test_reset_password_failure_becomes_401(
+    client: TestClient, auth_service: FakeAuthService
+) -> None:
+    # 401 rather than 404: an invalid link is a rejected credential, which is
+    # how the refresh endpoint already treats a token it will not accept.
+    auth_service.reset_password_error = AuthenticationError(
+        "Password reset link is invalid or expired."
+    )
+
+    response = client.post("/api/v1/auth/reset-password", json=RESET_PAYLOAD)
+
+    assert response.status_code == 401
+    assert response.json()["error"]["code"] == "authentication_error"
+    assert response.json()["error"]["message"] == "Password reset link is invalid or expired."
+
+
+def test_reset_password_failure_reveals_nothing_about_the_token(
+    client: TestClient, auth_service: FakeAuthService
+) -> None:
+    auth_service.reset_password_error = AuthenticationError(
+        "Password reset link is invalid or expired."
+    )
+
+    body = client.post("/api/v1/auth/reset-password", json=RESET_PAYLOAD).text.lower()
+
+    for leaked in ("already used", "consumed", "superseded", "expired at", "belongs to"):
+        assert leaked not in body
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"token": RESET_TOKEN, "new_password": "short"},
+        {"token": RESET_TOKEN, "new_password": "allletters"},
+        {"token": RESET_TOKEN, "new_password": "12345678!"},
+        {"token": RESET_TOKEN, "new_password": "NoSpecial7"},
+        {"token": RESET_TOKEN, "new_password": "x" * 1025},
+        {"token": "", "new_password": NEW_PASSWORD},
+        {"new_password": NEW_PASSWORD},
+        {"token": RESET_TOKEN},
+        {},
+    ],
+)
+def test_reset_password_rejects_invalid_payloads(
+    client: TestClient, auth_service: FakeAuthService, payload: dict[str, str]
+) -> None:
+    # The password cases are the same rule registration enforces, from the same
+    # definition — a laxer reset flow would become the way to install a weak
+    # password.
+    response = client.post("/api/v1/auth/reset-password", json=payload)
+
+    assert response.status_code == 422
+    assert auth_service.reset_password_calls == []
+
+
+def test_reset_password_enforces_the_same_policy_as_registration(
+    client: TestClient, auth_service: FakeAuthService
+) -> None:
+    # Not a restatement of the rule but a comparison of the two endpoints: if
+    # they ever disagree about a password, this fails whichever way it drifted.
+    for candidate in ("nospecial7", "NoDigits!", "short1!", "correct-horse-7!"):
+        register = client.post(
+            "/api/v1/auth/register", json={**REGISTER_PAYLOAD, "password": candidate}
+        )
+        reset = client.post(
+            "/api/v1/auth/reset-password", json={"token": RESET_TOKEN, "new_password": candidate}
+        )
+        assert (register.status_code == 422) == (reset.status_code == 422), candidate

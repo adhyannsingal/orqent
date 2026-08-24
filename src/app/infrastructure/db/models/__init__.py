@@ -11,6 +11,7 @@ from app.infrastructure.db.models.document import Document
 from app.infrastructure.db.models.document_chunk import DocumentChunk
 from app.infrastructure.db.models.node_execution import NodeExecution
 from app.infrastructure.db.models.organization import Organization
+from app.infrastructure.db.models.password_reset_token import PasswordResetToken
 from app.infrastructure.db.models.queue_task import QueueTask
 from app.infrastructure.db.models.refresh_token import RefreshToken
 from app.infrastructure.db.models.role import Role
@@ -30,6 +31,7 @@ __all__ = [
     "DocumentChunk",
     "NodeExecution",
     "Organization",
+    "PasswordResetToken",
     "QueueTask",
     "RefreshToken",
     "Role",

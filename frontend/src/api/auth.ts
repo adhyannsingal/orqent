@@ -27,6 +27,24 @@ export const authApi = {
       skipRefresh: true,
     }),
 
+  /** Ask for a reset link. Resolves identically whether or not the address
+   *  has an account — the backend will not say, and neither may the UI. */
+  forgotPassword: (email: string) =>
+    request<{ message: string }>('/api/v1/auth/forgot-password', {
+      method: 'POST',
+      body: { email },
+      skipRefresh: true,
+    }),
+
+  /** Redeem a reset link. Returns no session: every existing one was just
+   *  revoked, and the user signs in again with the new password. */
+  resetPassword: (token: string, newPassword: string) =>
+    request<{ message: string }>('/api/v1/auth/reset-password', {
+      method: 'POST',
+      body: { token, new_password: newPassword },
+      skipRefresh: true,
+    }),
+
   /** Revokes the refresh family server-side. Best-effort: the client clears
    *  its own state regardless of the outcome. */
   logout: (refreshToken: string) =>

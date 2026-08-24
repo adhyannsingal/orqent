@@ -27,6 +27,9 @@ from app.domain.errors import AuthenticationError, ConflictError
 from app.domain.value_objects.token import TokenType
 from app.domain.value_objects.token_pair import TokenPair
 from app.infrastructure.db.models.organization import Organization
+from app.infrastructure.db.models.password_reset_token import (
+    PasswordResetToken as PasswordResetTokenModel,
+)
 from app.infrastructure.db.models.refresh_token import RefreshToken as RefreshTokenModel
 from app.infrastructure.db.models.user import User as UserModel
 from app.infrastructure.db.unit_of_work import SqlAlchemyUnitOfWork
@@ -36,11 +39,15 @@ from app.infrastructure.security.token_hashing import hash_token
 from app.infrastructure.security.token_service import JwtTokenService
 from app.main import create_app
 from app.services.auth_service import DEFAULT_ROLE, AuthService
+from tests.unit.fakes import FakePasswordResetNotifier
 
 pytestmark = pytest.mark.integration
 
 SECRET = "integration-test-secret-long-enough-32"
 PASSWORD = "correct horse battery staple"
+RESET_URL_BASE = "https://app.example.com/reset-password"
+RESET_TTL_SECONDS = 1_800
+NEW_PASSWORD = "a whole new passphrase 9!"
 
 
 @pytest.fixture
@@ -54,9 +61,15 @@ def token_service() -> JwtTokenService:
 
 
 @pytest.fixture
+def notifier() -> FakePasswordResetNotifier:
+    return FakePasswordResetNotifier()
+
+
+@pytest.fixture
 def service(
     session_factory: async_sessionmaker[AsyncSession],
     token_service: JwtTokenService,
+    notifier: FakePasswordResetNotifier,
 ) -> AuthService:
     # No role seeding here: migration 0003 populates the catalog, so these tests
     # run against the same rows production has.
@@ -64,6 +77,9 @@ def service(
         lambda: SqlAlchemyUnitOfWork(session_factory),
         Argon2PasswordHasher(),
         token_service,
+        notifier,
+        password_reset_ttl_seconds=RESET_TTL_SECONDS,
+        password_reset_url_base=RESET_URL_BASE,
     )
 
 
@@ -384,3 +400,161 @@ async def test_login_over_http_leaks_no_account_hint_in_headers(
     assert {k: v for k, v in unknown.headers.items() if k.lower() not in ignored} == {
         k: v for k, v in wrong.headers.items() if k.lower() not in ignored
     }
+
+
+# --- Password reset, against the real schema --------------------------------
+
+
+def _issued_token(notifier: FakePasswordResetNotifier) -> str:
+    return notifier.sent[-1][1].rsplit("token=", 1)[1]
+
+
+async def test_forgot_password_stores_only_a_digest_in_mysql(
+    service: AuthService, session: AsyncSession, notifier: FakePasswordResetNotifier
+) -> None:
+    # The unit tests prove the service hashes; this proves what actually lands
+    # in the column, which is the claim that matters if the database leaks.
+    user = await service.register(
+        email="founder@example.com", password=PASSWORD, organization_name="Acme Inc"
+    )
+
+    await service.forgot_password(email="founder@example.com")
+
+    token = _issued_token(notifier)
+    rows = (
+        await session.scalars(
+            select(PasswordResetTokenModel).where(PasswordResetTokenModel.user_id == user.id)
+        )
+    ).all()
+    assert len(rows) == 1
+    assert rows[0].token_hash == hash_token(token)
+    assert rows[0].consumed_at is None
+    assert token not in rows[0].token_hash
+
+
+async def test_reset_ends_every_session_and_swaps_the_password(
+    service: AuthService, session: AsyncSession, notifier: FakePasswordResetNotifier
+) -> None:
+    """The whole AH2 lifecycle against real MySQL and real Argon2.
+
+    Two logins, a reset, and then the three things that must all be true at
+    once: the old sessions are dead, the old password is dead, and the new one
+    works. Any of the three passing alone would be a reset that only looked
+    like one.
+    """
+
+    user = await service.register(
+        email="founder@example.com", password=PASSWORD, organization_name="Acme Inc"
+    )
+    first = await service.login(email="founder@example.com", password=PASSWORD)
+    second = await service.login(email="founder@example.com", password=PASSWORD)
+
+    await service.forgot_password(email="founder@example.com")
+    await service.reset_password(token=_issued_token(notifier), new_password=NEW_PASSWORD)
+
+    # Scoped to this user, so unrelated rows in the database cannot make the
+    # assertion pass or fail for the wrong reason.
+    live = await session.scalar(
+        select(func.count())
+        .select_from(RefreshTokenModel)
+        .where(RefreshTokenModel.user_id == user.id, RefreshTokenModel.revoked_at.is_(None))
+    )
+    assert live == 0
+
+    for dead in (first, second):
+        with pytest.raises(AuthenticationError):
+            await service.refresh(dead.refresh_token)
+
+    with pytest.raises(AuthenticationError):
+        await service.login(email="founder@example.com", password=PASSWORD)
+
+    assert await service.login(email="founder@example.com", password=NEW_PASSWORD)
+
+
+async def test_reset_password_verifies_against_real_argon2(
+    service: AuthService, session: AsyncSession, notifier: FakePasswordResetNotifier
+) -> None:
+    user = await service.register(
+        email="founder@example.com", password=PASSWORD, organization_name="Acme Inc"
+    )
+    await service.forgot_password(email="founder@example.com")
+
+    await service.reset_password(token=_issued_token(notifier), new_password=NEW_PASSWORD)
+
+    # Re-read through this test's own session: the object `register` returned
+    # belongs to the service's unit of work, which has since closed.
+    stored = await session.scalar(select(UserModel).where(UserModel.id == user.id))
+    assert stored is not None
+    assert stored.password_hash.startswith("$argon2id$")
+    assert Argon2PasswordHasher().verify_password(NEW_PASSWORD, stored.password_hash) is True
+    assert Argon2PasswordHasher().verify_password(PASSWORD, stored.password_hash) is False
+
+
+async def test_supersession_holds_against_the_real_unique_index(
+    service: AuthService, session: AsyncSession, notifier: FakePasswordResetNotifier
+) -> None:
+    # Three requests, three distinct digests, one survivor. Exercises the real
+    # unique constraint on token_hash rather than a list membership test.
+    user = await service.register(
+        email="founder@example.com", password=PASSWORD, organization_name="Acme Inc"
+    )
+    for _ in range(3):
+        await service.forgot_password(email="founder@example.com")
+    newest = _issued_token(notifier)
+
+    rows = (
+        await session.scalars(
+            select(PasswordResetTokenModel).where(PasswordResetTokenModel.user_id == user.id)
+        )
+    ).all()
+    outstanding = [row for row in rows if row.consumed_at is None]
+    assert len(rows) == 3
+    assert len({row.token_hash for row in rows}) == 3
+    assert [row.token_hash for row in outstanding] == [hash_token(newest)]
+
+
+async def test_forgot_password_over_http_is_identical_for_known_and_unknown(
+    service: AuthService,
+) -> None:
+    # The decisive enumeration test: real service, real MySQL, real Argon2,
+    # through the real app. One address has an account and one does not.
+    await service.register(
+        email="founder@example.com", password=PASSWORD, organization_name="Acme Inc"
+    )
+
+    async with AsyncClient(
+        transport=ASGITransport(app=_app(service)), base_url="http://test"
+    ) as client:
+        known = await client.post(
+            "/api/v1/auth/forgot-password", json={"email": "founder@example.com"}
+        )
+        unknown = await client.post(
+            "/api/v1/auth/forgot-password", json={"email": "nobody@example.com"}
+        )
+
+    assert known.status_code == unknown.status_code == 200
+    assert known.json() == unknown.json()
+
+    ignored = {"x-correlation-id", "date"}
+    assert {k: v for k, v in known.headers.items() if k.lower() not in ignored} == {
+        k: v for k, v in unknown.headers.items() if k.lower() not in ignored
+    }
+
+
+async def test_forgot_password_over_http_never_returns_the_token(
+    service: AuthService, notifier: FakePasswordResetNotifier
+) -> None:
+    await service.register(
+        email="founder@example.com", password=PASSWORD, organization_name="Acme Inc"
+    )
+
+    async with AsyncClient(
+        transport=ASGITransport(app=_app(service)), base_url="http://test"
+    ) as client:
+        response = await client.post(
+            "/api/v1/auth/forgot-password", json={"email": "founder@example.com"}
+        )
+
+    # A grant really was issued, so this is a genuine opportunity to leak it.
+    assert notifier.sent
+    assert _issued_token(notifier) not in response.text

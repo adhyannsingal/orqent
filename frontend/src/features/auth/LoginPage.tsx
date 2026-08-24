@@ -1,9 +1,9 @@
 import { useState } from 'react'
 import { Link, Navigate, useLocation, useNavigate } from 'react-router-dom'
-import { Check, Circle } from 'lucide-react'
 import { useAuth } from '@/stores/auth'
 import { Button, Field, Input } from '@/components/ui/primitives'
 import { messageOf } from '@/api/client'
+import { PasswordChecklist, passwordPolicy, POLICY_MESSAGE } from './passwordPolicy'
 import { ThemeToggle } from '@/components/ThemeToggle'
 
 /**
@@ -35,7 +35,7 @@ export function LoginPage() {
     event.preventDefault()
     setError(null)
     if (mode === 'register' && !policy.valid) {
-      setError('Password must include 8+ characters, a letter, a number, and a special character.')
+      setError(POLICY_MESSAGE)
       return
     }
     setBusy(true)
@@ -118,6 +118,18 @@ export function LoginPage() {
           </Button>
         </form>
 
+        {mode === 'login' && (
+          <p className="mt-3 text-center text-[12px]">
+            <Link
+              to="/forgot-password"
+              onClick={() => setError(null)}
+              className="text-ink-muted underline-offset-2 hover:text-ink hover:underline"
+            >
+              Forgot password?
+            </Link>
+          </p>
+        )}
+
         <p className="mt-4 text-center text-[12px] text-ink-muted">
           {mode === 'login' ? "Don't have a workspace?" : 'Already have one?'}{' '}
           <Link
@@ -135,36 +147,5 @@ export function LoginPage() {
         </p>
       </div>
     </div>
-  )
-}
-
-function passwordPolicy(password: string) {
-  const length = password.length >= 8
-  const letter = /\p{L}/u.test(password)
-  const number = /\p{N}/u.test(password)
-  const special = /[^\p{L}\p{N}\s]/u.test(password)
-  return { length, letter, number, special, valid: length && letter && number && special }
-}
-
-function PasswordChecklist({ policy }: { policy: ReturnType<typeof passwordPolicy> }) {
-  return (
-    <div className="rounded-sm border border-line bg-surface px-2.5 py-2">
-      <p className="mb-1 text-[11.5px] font-medium text-ink-muted">Password must include:</p>
-      <div className="grid gap-1 text-[11.5px]">
-        <PasswordRule met={policy.length} label="8+ characters" />
-        <PasswordRule met={policy.letter} label="a letter" />
-        <PasswordRule met={policy.number} label="a number" />
-        <PasswordRule met={policy.special} label="a special character" />
-      </div>
-    </div>
-  )
-}
-
-function PasswordRule({ met, label }: { met: boolean; label: string }) {
-  return (
-    <span className={met ? 'flex items-center gap-1.5 text-status-succeeded' : 'flex items-center gap-1.5 text-ink-muted'}>
-      {met ? <Check className="size-3" /> : <Circle className="size-3" />}
-      {label}
-    </span>
   )
 }

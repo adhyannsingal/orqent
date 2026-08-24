@@ -24,6 +24,9 @@ from app.domain.ports.unit_of_work import UnitOfWork
 from app.infrastructure.repositories.document_repository import DocumentRepository
 from app.infrastructure.repositories.node_execution_repository import NodeExecutionRepository
 from app.infrastructure.repositories.organization_repository import OrganizationRepository
+from app.infrastructure.repositories.password_reset_token_repository import (
+    PasswordResetTokenRepository,
+)
 from app.infrastructure.repositories.queue_task_repository import QueueTaskRepository
 from app.infrastructure.repositories.refresh_token_repository import RefreshTokenRepository
 from app.infrastructure.repositories.role_repository import RoleRepository
@@ -50,6 +53,7 @@ class SqlAlchemyUnitOfWork(UnitOfWork):
         self._users: UserRepository | None = None
         self._roles: RoleRepository | None = None
         self._refresh_tokens: RefreshTokenRepository | None = None
+        self._password_reset_tokens: PasswordResetTokenRepository | None = None
         self._workflows: WorkflowRepository | None = None
         self._workflow_versions: WorkflowVersionRepository | None = None
         self._runs: RunRepository | None = None
@@ -98,6 +102,20 @@ class SqlAlchemyUnitOfWork(UnitOfWork):
         if self._refresh_tokens is None:
             self._refresh_tokens = RefreshTokenRepository(self.session)
         return self._refresh_tokens
+
+    @property
+    def password_reset_tokens(self) -> PasswordResetTokenRepository:
+        """Outstanding reset grants, in this transaction.
+
+        Here rather than behind a port for the reason the others are: a reset
+        consumes its grant, supersedes the user's other grants, replaces the
+        password hash, and revokes every session — and a partially applied
+        reset is a state the system must not be able to reach (ADR-009).
+        """
+
+        if self._password_reset_tokens is None:
+            self._password_reset_tokens = PasswordResetTokenRepository(self.session)
+        return self._password_reset_tokens
 
     @property
     def workflows(self) -> WorkflowRepository:
@@ -210,6 +228,7 @@ class SqlAlchemyUnitOfWork(UnitOfWork):
             self._users = None
             self._roles = None
             self._refresh_tokens = None
+            self._password_reset_tokens = None
             self._workflows = None
             self._workflow_versions = None
             self._runs = None

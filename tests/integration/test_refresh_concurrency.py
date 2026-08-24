@@ -32,6 +32,7 @@ from app.infrastructure.security.password_hasher import Argon2PasswordHasher
 from app.infrastructure.security.token_service import JwtTokenService
 from app.services.auth_service import AuthService
 from tests.integration.conftest import DATABASE_URL
+from tests.unit.fakes import FakePasswordResetNotifier
 
 pytestmark = pytest.mark.integration
 
@@ -69,6 +70,9 @@ async def committed_service() -> AsyncIterator[
             access_ttl_seconds=900,
             refresh_ttl_seconds=2_592_000,
         ),
+        FakePasswordResetNotifier(),
+        password_reset_ttl_seconds=1_800,
+        password_reset_url_base="https://app.example.com/reset-password",
     )
 
     try:

@@ -16,14 +16,25 @@ from app.api.security import CurrentUserDep
 from app.infrastructure.db.models.user import User
 from app.schemas.auth import (
     CurrentUserResponse,
+    ForgotPasswordRequest,
     LoginRequest,
+    MessageResponse,
     RefreshRequest,
     RegisterRequest,
+    ResetPasswordRequest,
     TokenPairResponse,
     UserResponse,
 )
 
 router = APIRouter(tags=["auth"])
+
+# Public wording for the two reset endpoints. Held here rather than in the
+# service because they are what the *API* says: the service's contract is that
+# it reveals nothing, and these are the sentences that reveal nothing.
+PASSWORD_RESET_REQUESTED = (
+    "If an account exists for that email, a password reset link has been sent."
+)
+PASSWORD_RESET_COMPLETED = "Your password has been reset. Please sign in."
 
 
 def _to_user_response(user: User) -> UserResponse:
@@ -96,6 +107,48 @@ async def logout(payload: RefreshRequest, auth_service: AuthServiceDep) -> None:
     # 204: the session is gone and there is nothing meaningful to return.
     # Idempotent, so a client that retries gets the same answer.
     await auth_service.logout(payload.refresh_token)
+
+
+@router.post(
+    "/forgot-password",
+    response_model=MessageResponse,
+    summary="Request a password reset link",
+)
+async def forgot_password(
+    payload: ForgotPasswordRequest, auth_service: AuthServiceDep
+) -> MessageResponse:
+    """Always 200, always the same body.
+
+    The service returns ``None`` whether it issued a link, found no account, or
+    found a disabled one, and this handler cannot tell which — that is
+    deliberate rather than incidental. A 404 for an unknown address, or a
+    different message, would turn this endpoint into a way to test a list of
+    email addresses for membership without ever guessing a password.
+    """
+
+    await auth_service.forgot_password(email=payload.email)
+    return MessageResponse(message=PASSWORD_RESET_REQUESTED)
+
+
+@router.post(
+    "/reset-password",
+    response_model=MessageResponse,
+    summary="Set a new password using a reset link",
+)
+async def reset_password(
+    payload: ResetPasswordRequest, auth_service: AuthServiceDep
+) -> MessageResponse:
+    """Acknowledge, and deliberately do not sign the caller in.
+
+    Returning a token pair here would be convenient and wrong twice over: it
+    would hand a session to whoever holds the link rather than to whoever knows
+    the new password, and it would undo the revocation the reset just
+    performed. The user signs in again, which is also the moment they find out
+    the new password works.
+    """
+
+    await auth_service.reset_password(token=payload.token, new_password=payload.new_password)
+    return MessageResponse(message=PASSWORD_RESET_COMPLETED)
 
 
 @router.get(

@@ -12,6 +12,7 @@ import subprocess
 import sys
 import textwrap
 from datetime import UTC, datetime, timedelta
+from urllib.parse import parse_qs, urlparse
 
 import pytest
 
@@ -21,11 +22,13 @@ from app.domain.value_objects.token_pair import TokenPair
 from app.infrastructure.db.models.user import User
 from app.infrastructure.db.models.user_role import UserRole
 from app.infrastructure.security.password_hasher import Argon2PasswordHasher
+from app.infrastructure.security.password_reset_token import PASSWORD_RESET_TOKEN_LENGTH
 from app.infrastructure.security.token_hashing import hash_token
 from app.services.auth_service import _DUMMY_PASSWORD_HASH, DEFAULT_ROLE, AuthService, _slugify
 from tests.unit.fakes import (
     FakeDatabase,
     FakePasswordHasher,
+    FakePasswordResetNotifier,
     FakeTokenService,
     FakeUnitOfWorkFactory,
     FakeUserRepository,
@@ -59,11 +62,41 @@ def factory(db: FakeDatabase) -> FakeUnitOfWorkFactory:
     return FakeUnitOfWorkFactory(db)
 
 
+RESET_URL_BASE = "https://app.example.com/reset-password"
+RESET_TTL_SECONDS = 1_800
+
+
+@pytest.fixture
+def notifier() -> FakePasswordResetNotifier:
+    return FakePasswordResetNotifier()
+
+
+def build_service(
+    factory: FakeUnitOfWorkFactory,
+    hasher: FakePasswordHasher,
+    tokens: FakeTokenService,
+    notifier: FakePasswordResetNotifier | None = None,
+    *,
+    reset_url_base: str | None = RESET_URL_BASE,
+) -> AuthService:
+    return AuthService(
+        factory,
+        hasher,
+        tokens,
+        notifier or FakePasswordResetNotifier(),
+        password_reset_ttl_seconds=RESET_TTL_SECONDS,
+        password_reset_url_base=reset_url_base,
+    )
+
+
 @pytest.fixture
 def service(
-    factory: FakeUnitOfWorkFactory, hasher: FakePasswordHasher, tokens: FakeTokenService
+    factory: FakeUnitOfWorkFactory,
+    hasher: FakePasswordHasher,
+    tokens: FakeTokenService,
+    notifier: FakePasswordResetNotifier,
 ) -> AuthService:
-    return AuthService(factory, hasher, tokens)
+    return build_service(factory, hasher, tokens, notifier)
 
 
 async def _register(service: AuthService, **overrides: str) -> User:
@@ -163,7 +196,7 @@ async def test_register_fails_when_the_role_catalog_is_not_seeded(
 ) -> None:
     # A deployment that skipped the seeding migration, not a client error.
     empty = FakeDatabase()
-    service = AuthService(FakeUnitOfWorkFactory(empty), hasher, tokens)
+    service = build_service(FakeUnitOfWorkFactory(empty), hasher, tokens)
 
     with pytest.raises(InfrastructureError, match=DEFAULT_ROLE):
         await _register(service)
@@ -242,7 +275,7 @@ async def test_concurrent_duplicate_becomes_a_conflict_error(
     # rather than leaking IntegrityError.
     failing = FakeUserRepository(db, raise_on_add=integrity_error("uq_users_email_active"))
     factory = FakeUnitOfWorkFactory(db, user_repository=failing)
-    service = AuthService(factory, hasher, tokens)
+    service = build_service(factory, hasher, tokens)
 
     with pytest.raises(ConflictError):
         await _register(service)
@@ -255,7 +288,7 @@ async def test_failed_registration_rolls_everything_back(
     # leave an orphan tenant behind.
     failing = FakeUserRepository(db, raise_on_add=integrity_error("uq_users_email_active"))
     factory = FakeUnitOfWorkFactory(db, user_repository=failing)
-    service = AuthService(factory, hasher, tokens)
+    service = build_service(factory, hasher, tokens)
 
     with pytest.raises(ConflictError):
         await _register(service)
@@ -274,7 +307,7 @@ async def test_unexpected_failure_propagates_and_rolls_back(
     # be disguised as a conflict.
     failing = FakeUserRepository(db, raise_on_add=RuntimeError("boom"))
     factory = FakeUnitOfWorkFactory(db, user_repository=failing)
-    service = AuthService(factory, hasher, tokens)
+    service = build_service(factory, hasher, tokens)
 
     with pytest.raises(RuntimeError, match="boom"):
         await _register(service)
@@ -439,7 +472,7 @@ async def test_login_rehashes_when_the_stored_hash_is_outdated(
     factory: FakeUnitOfWorkFactory, db: FakeDatabase, tokens: FakeTokenService
 ) -> None:
     upgrading = FakePasswordHasher(needs_rehash=True)
-    service = AuthService(factory, upgrading, tokens)
+    service = build_service(factory, upgrading, tokens)
     await _register(service)
     upgrading.hashed.clear()
 
@@ -914,3 +947,427 @@ async def test_logout_commits(service: AuthService, factory: FakeUnitOfWorkFacto
     await service.logout(original.refresh_token)
 
     assert factory.created[0].commit_calls == 1
+
+
+# --- Forgot password --------------------------------------------------------
+
+
+def _issued_token(notifier: FakePasswordResetNotifier) -> str:
+    """The raw token, recovered from the only place it legitimately appears."""
+
+    _, url = notifier.sent[-1]
+    return url.rsplit("token=", 1)[1]
+
+
+async def test_forgot_password_issues_a_grant_for_a_known_address(
+    service: AuthService, db: FakeDatabase, notifier: FakePasswordResetNotifier
+) -> None:
+    await _register(service)
+
+    await service.forgot_password(email=EMAIL)
+
+    assert len(db.password_reset_tokens) == 1
+    assert len(notifier.sent) == 1
+
+
+async def test_forgot_password_is_silent_for_an_unknown_address(
+    service: AuthService, db: FakeDatabase, notifier: FakePasswordResetNotifier
+) -> None:
+    await _register(service)
+
+    await service.forgot_password(email="nobody@example.com")
+
+    # Nothing minted and nothing sent — and, critically, nothing raised: the
+    # caller cannot tell this apart from the case above.
+    assert db.password_reset_tokens == []
+    assert notifier.sent == []
+
+
+async def test_forgot_password_is_silent_for_a_disabled_account(
+    service: AuthService, db: FakeDatabase, notifier: FakePasswordResetNotifier
+) -> None:
+    # Letting a deactivated user reset their way back in would make
+    # deactivation advisory rather than enforced.
+    await _register(service)
+    db.users[0].is_active = False
+
+    await service.forgot_password(email=EMAIL)
+
+    assert db.password_reset_tokens == []
+    assert notifier.sent == []
+
+
+async def test_forgot_password_stores_a_digest_and_never_the_token(
+    service: AuthService, db: FakeDatabase, notifier: FakePasswordResetNotifier
+) -> None:
+    # The single most important property of the table: a database leak must
+    # yield no usable reset link.
+    await _register(service)
+
+    await service.forgot_password(email=EMAIL)
+
+    token = _issued_token(notifier)
+    stored = db.password_reset_tokens[0]
+    assert stored.token_hash == hash_token(token)
+    assert stored.token_hash != token
+    assert token not in stored.token_hash
+
+
+async def test_issued_token_is_high_entropy_and_url_safe(
+    service: AuthService, notifier: FakePasswordResetNotifier
+) -> None:
+    await _register(service)
+
+    await service.forgot_password(email=EMAIL)
+
+    token = _issued_token(notifier)
+    assert len(token) == PASSWORD_RESET_TOKEN_LENGTH
+    assert set(token) <= set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_")
+
+
+async def test_forgot_password_records_the_configured_expiry(
+    service: AuthService, db: FakeDatabase
+) -> None:
+    before = datetime.now(UTC)
+
+    await _register(service)
+    await service.forgot_password(email=EMAIL)
+
+    expires_at = db.password_reset_tokens[0].expires_at
+    assert before + timedelta(seconds=RESET_TTL_SECONDS) <= expires_at
+    assert expires_at <= datetime.now(UTC) + timedelta(seconds=RESET_TTL_SECONDS)
+
+
+async def test_a_second_request_supersedes_the_first(
+    service: AuthService, db: FakeDatabase, notifier: FakePasswordResetNotifier
+) -> None:
+    # Only the newest link works, which bounds a token's real lifetime by the
+    # next request as well as by its own expiry.
+    await _register(service)
+    await service.forgot_password(email=EMAIL)
+    first = _issued_token(notifier)
+
+    await service.forgot_password(email=EMAIL)
+    second = _issued_token(notifier)
+
+    outstanding = [t for t in db.password_reset_tokens if t.consumed_at is None]
+    assert [t.token_hash for t in outstanding] == [hash_token(second)]
+    assert first != second
+
+
+async def test_the_reset_link_identifies_nobody(
+    service: AuthService, db: FakeDatabase, notifier: FakePasswordResetNotifier
+) -> None:
+    # The token is the entire proof, so the URL needs no identity — and must
+    # carry none: it passes through mail servers, proxies, and browser history.
+    await _register(service)
+
+    await service.forgot_password(email=EMAIL)
+
+    _, url = notifier.sent[0]
+    user = db.users[0]
+    parsed = urlparse(url)
+    query = parse_qs(parsed.query)
+
+    # The whole query string, not a substring search: `token` must be the only
+    # parameter. Scanning for known identifiers would miss one nobody thought
+    # of, and a bare numeric id is unsearchable anyway — "3" appears in a
+    # base64url token by chance.
+    assert f"{parsed.scheme}://{parsed.netloc}{parsed.path}" == RESET_URL_BASE
+    assert set(query) == {"token"}
+    assert EMAIL not in url
+    assert user.public_id not in url
+    assert user.organization.public_id not in url
+
+
+async def test_delivery_goes_to_the_accounts_own_address(
+    service: AuthService, notifier: FakePasswordResetNotifier
+) -> None:
+    # Sent to the *stored* address, not the submitted one. They are equal after
+    # normalisation here, and using the stored value is what keeps that true
+    # when they are not.
+    await _register(service)
+
+    await service.forgot_password(email="  FOUNDER@EXAMPLE.com ")
+
+    assert notifier.sent[0][0] == EMAIL
+
+
+async def test_a_delivery_failure_is_absorbed(
+    factory: FakeUnitOfWorkFactory,
+    hasher: FakePasswordHasher,
+    tokens: FakeTokenService,
+    db: FakeDatabase,
+) -> None:
+    # Raising would turn a provider outage into a 500 that happens only for
+    # addresses that do have accounts — the enumeration oracle rebuilt by
+    # accident.
+    failing = FakePasswordResetNotifier(fail=True)
+    service = build_service(factory, hasher, tokens, failing)
+    await _register(service)
+
+    await service.forgot_password(email=EMAIL)
+
+    # The grant is still committed: the user can ask again and the link works.
+    assert len(db.password_reset_tokens) == 1
+
+
+async def test_no_link_is_built_when_no_base_url_is_configured(
+    factory: FakeUnitOfWorkFactory,
+    hasher: FakePasswordHasher,
+    tokens: FakeTokenService,
+    db: FakeDatabase,
+) -> None:
+    notifier = FakePasswordResetNotifier()
+    service = build_service(factory, hasher, tokens, notifier, reset_url_base=None)
+    await _register(service)
+
+    await service.forgot_password(email=EMAIL)
+
+    # Nothing delivered, nothing raised, and the grant still written — the
+    # endpoint stays enumeration-safe with no destination configured.
+    assert notifier.sent == []
+    assert len(db.password_reset_tokens) == 1
+
+
+# --- Reset password ---------------------------------------------------------
+
+
+async def _request_reset(service: AuthService, notifier: FakePasswordResetNotifier) -> str:
+    await service.forgot_password(email=EMAIL)
+    return _issued_token(notifier)
+
+
+NEW_PASSWORD = "a whole new passphrase 9!"
+
+
+async def test_reset_replaces_the_password_hash(
+    service: AuthService, db: FakeDatabase, notifier: FakePasswordResetNotifier
+) -> None:
+    await _register(service)
+    before = db.users[0].password_hash
+    token = await _request_reset(service, notifier)
+
+    await service.reset_password(token=token, new_password=NEW_PASSWORD)
+
+    assert db.users[0].password_hash != before
+    assert db.users[0].password_hash == f"hashed::{NEW_PASSWORD}"
+
+
+async def test_reset_lets_the_new_password_log_in(
+    service: AuthService, notifier: FakePasswordResetNotifier
+) -> None:
+    await _register(service)
+    token = await _request_reset(service, notifier)
+
+    await service.reset_password(token=token, new_password=NEW_PASSWORD)
+
+    assert await service.login(email=EMAIL, password=NEW_PASSWORD)
+
+
+async def test_reset_stops_the_old_password_working(
+    service: AuthService, notifier: FakePasswordResetNotifier
+) -> None:
+    await _register(service)
+    token = await _request_reset(service, notifier)
+
+    await service.reset_password(token=token, new_password=NEW_PASSWORD)
+
+    with pytest.raises(AuthenticationError):
+        await service.login(email=EMAIL, password=PASSWORD)
+
+
+async def test_reset_consumes_the_grant(
+    service: AuthService, db: FakeDatabase, notifier: FakePasswordResetNotifier
+) -> None:
+    await _register(service)
+    token = await _request_reset(service, notifier)
+
+    await service.reset_password(token=token, new_password=NEW_PASSWORD)
+
+    assert db.password_reset_tokens[0].consumed_at is not None
+
+
+async def test_a_reset_token_cannot_be_used_twice(
+    service: AuthService, notifier: FakePasswordResetNotifier
+) -> None:
+    await _register(service)
+    token = await _request_reset(service, notifier)
+    await service.reset_password(token=token, new_password=NEW_PASSWORD)
+
+    with pytest.raises(AuthenticationError):
+        await service.reset_password(token=token, new_password="another one entirely 4?")
+
+
+async def test_a_second_reset_does_not_change_the_password_again(
+    service: AuthService, db: FakeDatabase, notifier: FakePasswordResetNotifier
+) -> None:
+    # The replay must be refused *and* inert; a rejection that still wrote
+    # would be worse than no rejection at all.
+    await _register(service)
+    token = await _request_reset(service, notifier)
+    await service.reset_password(token=token, new_password=NEW_PASSWORD)
+    after_first = db.users[0].password_hash
+
+    with pytest.raises(AuthenticationError):
+        await service.reset_password(token=token, new_password="another one entirely 4?")
+
+    assert db.users[0].password_hash == after_first
+
+
+async def test_reset_rejects_an_unknown_token(service: AuthService) -> None:
+    await _register(service)
+
+    with pytest.raises(AuthenticationError):
+        await service.reset_password(token="not a real token", new_password=NEW_PASSWORD)
+
+
+async def test_reset_rejects_an_expired_token(
+    service: AuthService, db: FakeDatabase, notifier: FakePasswordResetNotifier
+) -> None:
+    await _register(service)
+    token = await _request_reset(service, notifier)
+    db.password_reset_tokens[0].expires_at = datetime.now(UTC) - timedelta(seconds=1)
+
+    with pytest.raises(AuthenticationError):
+        await service.reset_password(token=token, new_password=NEW_PASSWORD)
+
+
+async def test_reset_accepts_a_token_that_has_not_yet_expired(
+    service: AuthService, db: FakeDatabase, notifier: FakePasswordResetNotifier
+) -> None:
+    # The other half of the boundary: without this, deleting the expiry check
+    # and hard-expiring everything would both pass.
+    await _register(service)
+    token = await _request_reset(service, notifier)
+    db.password_reset_tokens[0].expires_at = datetime.now(UTC) + timedelta(seconds=1)
+
+    await service.reset_password(token=token, new_password=NEW_PASSWORD)
+
+    assert db.users[0].password_hash == f"hashed::{NEW_PASSWORD}"
+
+
+async def test_reset_rejects_a_superseded_token(
+    service: AuthService, notifier: FakePasswordResetNotifier
+) -> None:
+    await _register(service)
+    first = await _request_reset(service, notifier)
+    await _request_reset(service, notifier)
+
+    with pytest.raises(AuthenticationError):
+        await service.reset_password(token=first, new_password=NEW_PASSWORD)
+
+
+async def test_reset_rejects_a_token_for_a_disabled_account(
+    service: AuthService, db: FakeDatabase, notifier: FakePasswordResetNotifier
+) -> None:
+    await _register(service)
+    token = await _request_reset(service, notifier)
+    db.users[0].is_active = False
+
+    with pytest.raises(AuthenticationError):
+        await service.reset_password(token=token, new_password=NEW_PASSWORD)
+
+
+async def test_every_reset_failure_reports_the_same_message(
+    service: AuthService, db: FakeDatabase, notifier: FakePasswordResetNotifier
+) -> None:
+    # Distinguishable messages would confirm to whoever holds a stale link that
+    # it was once real.
+    await _register(service)
+    messages = set()
+
+    with pytest.raises(AuthenticationError) as caught:
+        await service.reset_password(token="never issued", new_password=NEW_PASSWORD)
+    messages.add(caught.value.message)
+
+    superseded = await _request_reset(service, notifier)
+    await _request_reset(service, notifier)
+    with pytest.raises(AuthenticationError) as caught:
+        await service.reset_password(token=superseded, new_password=NEW_PASSWORD)
+    messages.add(caught.value.message)
+
+    expiring = _issued_token(notifier)
+    db.password_reset_tokens[-1].expires_at = datetime.now(UTC) - timedelta(seconds=1)
+    with pytest.raises(AuthenticationError) as caught:
+        await service.reset_password(token=expiring, new_password=NEW_PASSWORD)
+    messages.add(caught.value.message)
+
+    # Pinned to the literal, not to the constant: asserting only that the three
+    # agree passes just as happily when all three name the reason.
+    assert messages == {"Password reset link is invalid or expired."}
+
+
+async def test_reset_revokes_every_existing_session(
+    service: AuthService, db: FakeDatabase, notifier: FakePasswordResetNotifier
+) -> None:
+    # The point of resetting a compromised password is that whoever knew the
+    # old one is locked out; live refresh tokens would make that cosmetic.
+    await _register(service)
+    await service.login(email=EMAIL, password=PASSWORD)
+    await service.login(email=EMAIL, password=PASSWORD)
+    assert len([t for t in db.refresh_tokens if t.revoked_at is None]) == 2
+
+    token = await _request_reset(service, notifier)
+    await service.reset_password(token=token, new_password=NEW_PASSWORD)
+
+    assert [t for t in db.refresh_tokens if t.revoked_at is None] == []
+
+
+async def test_reset_revokes_sessions_across_separate_logins(
+    service: AuthService, db: FakeDatabase, notifier: FakePasswordResetNotifier
+) -> None:
+    # Two logins are two families. Revoking one family would leave the other
+    # alive, so this is what distinguishes revoke_all_for_user from
+    # revoke_family.
+    await _register(service)
+    await service.login(email=EMAIL, password=PASSWORD)
+    await service.login(email=EMAIL, password=PASSWORD)
+    assert len({t.family_id for t in db.refresh_tokens}) == 2
+
+    token = await _request_reset(service, notifier)
+    await service.reset_password(token=token, new_password=NEW_PASSWORD)
+
+    assert all(t.revoked_at is not None for t in db.refresh_tokens)
+
+
+async def test_an_old_refresh_token_stops_working_after_a_reset(
+    service: AuthService, notifier: FakePasswordResetNotifier
+) -> None:
+    await _register(service)
+    session = await service.login(email=EMAIL, password=PASSWORD)
+    token = await _request_reset(service, notifier)
+
+    await service.reset_password(token=token, new_password=NEW_PASSWORD)
+
+    with pytest.raises(AuthenticationError):
+        await service.refresh(session.refresh_token)
+
+
+async def test_a_failed_reset_commits_nothing(
+    service: AuthService, factory: FakeUnitOfWorkFactory, db: FakeDatabase
+) -> None:
+    await _register(service)
+    before = db.users[0].password_hash
+    commits = sum(uow.commit_calls for uow in factory.created)
+
+    with pytest.raises(AuthenticationError):
+        await service.reset_password(token="never issued", new_password=NEW_PASSWORD)
+
+    assert sum(uow.commit_calls for uow in factory.created) == commits
+    assert db.users[0].password_hash == before
+
+
+async def test_reset_uses_one_transaction(
+    service: AuthService, factory: FakeUnitOfWorkFactory, notifier: FakePasswordResetNotifier
+) -> None:
+    await _register(service)
+    token = await _request_reset(service, notifier)
+    opened = len(factory.created)
+
+    await service.reset_password(token=token, new_password=NEW_PASSWORD)
+
+    # One unit of work, committed once: the hash change, the consumption, and
+    # the revocations must land together or not at all.
+    assert len(factory.created) == opened + 1
+    assert factory.created[-1].commit_calls == 1

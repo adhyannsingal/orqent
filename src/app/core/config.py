@@ -68,6 +68,19 @@ class Settings(BaseSettings):
     # hashed store with rotation, added in Phase 3B.
     refresh_token_ttl_seconds: int = Field(default=2_592_000, gt=0)  # 30 days
 
+    # --- Password reset (AH2) ---
+    # Far shorter than either token above, and for a different reason: a reset
+    # link grants the power to *change* the password, and it travels through
+    # email — a channel the platform does not control and cannot revoke. The
+    # window is sized for someone acting on a link they just asked for.
+    password_reset_token_ttl_seconds: int = Field(default=1_800, gt=0)  # 30 minutes
+    # Where the reset link points: the frontend route that collects the new
+    # password. Configured rather than derived because the API and the UI need
+    # not share an origin, and hard-coding a development address into service
+    # logic would ship it to production. ``None`` means resets cannot be sent —
+    # the endpoint stays enumeration-safe either way.
+    password_reset_url_base: str | None = None
+
     # --- Worker (Phase 8, M5) ---
     # How long a claimed task is owned before another worker may reclaim it.
     # This is a presumption-of-death window, not a work budget: the heartbeat

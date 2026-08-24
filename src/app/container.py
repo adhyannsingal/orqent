@@ -19,6 +19,7 @@ from app.domain.ports.agent_runner import AgentRunner
 from app.domain.ports.embedder import Embedder
 from app.domain.ports.knowledge import KnowledgeRetrievalError, KnowledgeRetriever
 from app.domain.ports.password_hasher import PasswordHasher
+from app.domain.ports.password_reset_notifier import PasswordResetNotifier
 from app.domain.ports.task_queue import LeasePolicy, TaskQueue
 from app.domain.ports.token_service import TokenService
 from app.domain.ports.vector_store import VectorStore
@@ -31,6 +32,9 @@ from app.infrastructure.llm.gemini_agent_runner import GeminiAgentRunner
 from app.infrastructure.llm.gemini_embedder import GeminiEmbedder
 from app.infrastructure.llm.unconfigured_agent_runner import UnconfiguredAgentRunner
 from app.infrastructure.nodes import build_registry
+from app.infrastructure.notifications.unconfigured_notifier import (
+    UnconfiguredPasswordResetNotifier,
+)
 from app.infrastructure.queue.mysql_task_queue import MySqlTaskQueue
 from app.infrastructure.security.password_hasher import Argon2PasswordHasher
 from app.infrastructure.security.token_service import JwtTokenService
@@ -53,6 +57,7 @@ class Container:
         self._engine: AsyncEngine | None = None
         self._session_factory: async_sessionmaker[AsyncSession] | None = None
         self._password_hasher: PasswordHasher | None = None
+        self._password_reset_notifier: PasswordResetNotifier | None = None
         self._token_service: TokenService | None = None
         self._auth_service: AuthService | None = None
         self._node_registry: NodeRegistry | None = None
@@ -190,6 +195,21 @@ class Container:
         return self._node_registry
 
     @property
+    def password_reset_notifier(self) -> PasswordResetNotifier:
+        """How a reset link reaches its owner.
+
+        There is exactly one implementation today and **it delivers nothing** —
+        see ``UnconfiguredPasswordResetNotifier`` for why a "log the link"
+        adapter was rejected rather than merely not written. Selecting a real
+        provider is deployment work; the port is here so that swapping one in
+        touches this property and nothing else.
+        """
+
+        if self._password_reset_notifier is None:
+            self._password_reset_notifier = UnconfiguredPasswordResetNotifier()
+        return self._password_reset_notifier
+
+    @property
     def auth_service(self) -> AuthService:
         """The application's authentication service.
 
@@ -204,6 +224,9 @@ class Container:
                 self.unit_of_work,
                 self.password_hasher,
                 self.token_service,
+                self.password_reset_notifier,
+                password_reset_ttl_seconds=self._settings.password_reset_token_ttl_seconds,
+                password_reset_url_base=self._settings.password_reset_url_base,
             )
         return self._auth_service
 

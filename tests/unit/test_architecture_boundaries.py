@@ -1203,3 +1203,154 @@ def test_the_document_route_owns_no_persistence() -> None:
             "sqlalchemy",
         ),
     )
+
+
+# --- AH2: password reset stays inside the auth boundary ----------------------
+#
+# Four properties, each of which would be quietly easy to break: the service
+# must not learn how mail is sent, the port must not learn either, the reset
+# credential must be minted in one place, and none of this may reach the
+# execution machinery.
+
+# Every mail transport somebody might reasonably reach for. Names only — the
+# point is that *no* concrete delivery vocabulary reaches the service.
+_EMAIL_PROVIDERS = (
+    "smtplib",
+    "email.mime",
+    "aiosmtplib",
+    "sendgrid",
+    "resend",
+    "postmark",
+    "mailgun",
+    "boto3",
+    "ses",
+    "smtp",
+)
+
+
+def test_the_auth_service_imports_no_mail_transport() -> None:
+    """``AuthService`` orchestrates a reset; it must not know how mail leaves.
+
+    The same containment ADR-013 gives LangChain and ADR-010 gives Argon2: the
+    service names a port, and swapping the provider touches one adapter.
+    """
+
+    imported = _imported_names(SRC / "services/auth_service.py")
+    leaked = {
+        name
+        for name in imported
+        for provider in _EMAIL_PROVIDERS
+        if name == provider or name.startswith(f"{provider}.")
+    }
+
+    assert not leaked, f"auth_service imports a mail transport: {leaked}"
+
+
+def test_the_notifier_port_names_no_provider() -> None:
+    # A port that mentions SMTP is not provider-neutral, whatever its name says.
+    source = _code_only(SRC / "domain/ports/password_reset_notifier.py").lower()
+
+    named = [provider for provider in _EMAIL_PROVIDERS if provider in source]
+    assert not named, f"the notifier port names providers: {named}"
+
+
+def test_the_notifier_port_takes_a_finished_url_not_a_credential() -> None:
+    """The adapter is handed a link, never the raw token or the user.
+
+    Handing an adapter the token would make every future provider integration
+    another place the credential could be logged; handing it a user would make
+    it another place tenancy could be got wrong.
+    """
+
+    port = SRC / "domain/ports/password_reset_notifier.py"
+    signature = _code_only(port)
+
+    assert "reset_url" in signature
+    for forbidden in ("token", "user", "user_id", "organization"):
+        assert f"{forbidden}:" not in signature, f"the notifier port accepts {forbidden}"
+
+
+def test_only_one_module_mints_a_reset_token() -> None:
+    """``secrets`` for reset tokens lives in exactly one place.
+
+    A second call site would be a second answer to "how much entropy does a
+    reset link have", and the weaker one would win by being used.
+    """
+
+    minting = {
+        _relative(path)
+        for path in _modules("app")
+        if "new_password_reset_token" in _code_only(path)
+        and "def new_password_reset_token" in path.read_text()
+    }
+
+    assert minting == {"app/infrastructure/security/password_reset_token.py"}
+
+
+def test_the_api_never_mints_a_reset_credential() -> None:
+    # Routes unpack, call one service method, and shape the result. A route
+    # that generated a token would own security policy.
+    for path in _modules("app.api"):
+        source = _code_only(path)
+        assert "new_password_reset_token" not in source, f"{_relative(path)} mints a reset token"
+        assert "secrets" not in _imported_names(path), f"{_relative(path)} imports secrets"
+
+
+def test_password_reset_never_reaches_the_execution_machinery() -> None:
+    """Resetting a password is not a workflow concern.
+
+    Checked because the codebase has a queue and a worker sitting right there,
+    and "enqueue the email" is the obvious wrong turn — it would put a reset
+    credential into ``queue_tasks.payload``, which is durable, inspectable, and
+    not designed to hold secrets.
+    """
+
+    forbidden = (
+        "app.domain.engine",
+        "app.domain.ports.task_queue",
+        "app.infrastructure.queue",
+        "app.infrastructure.worker",
+        "app.services.run_service",
+    )
+    for module in (
+        "domain/ports/password_reset_notifier.py",
+        "infrastructure/notifications/unconfigured_notifier.py",
+        "infrastructure/security/password_reset_token.py",
+        "infrastructure/repositories/password_reset_token_repository.py",
+    ):
+        assert not _violations(SRC / module, forbidden), f"{module} reaches execution code"
+
+
+def test_the_shipped_notifier_cannot_write_the_link_anywhere() -> None:
+    """The adapter must not log, print, or persist what it is given.
+
+    This is the guard that matters most in the whole group. "Log the reset URL
+    so a developer can copy it" is the natural convenience, and it writes a
+    password-changing credential into log aggregation — shipped, retained, and
+    readable by more people than the mailbox would have been.
+
+    The parameters are read from the signature rather than hard-coded, so
+    renaming one cannot silently empty this test.
+    """
+
+    adapter = SRC / "infrastructure/notifications/unconfigured_notifier.py"
+    tree = ast.parse(adapter.read_text())
+
+    send = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == "send_password_reset"
+    )
+    parameters = {argument.arg for argument in send.args.args} - {"self"}
+    assert parameters == {"recipient", "reset_url"}
+
+    # Neither parameter may be read anywhere in the body — not by a logger, not
+    # by a file write, not by anything. The only correct use of an argument
+    # this adapter cannot deliver is to ignore it.
+    used = {
+        node.id for node in ast.walk(send) if isinstance(node, ast.Name) and node.id in parameters
+    }
+    assert not used, f"the notifier reads {used} instead of discarding it"
+
+    for sink in ("print", "open"):
+        assert sink not in _code_only(adapter), f"the notifier reaches {sink}"
