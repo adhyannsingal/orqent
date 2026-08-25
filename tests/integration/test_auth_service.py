@@ -14,6 +14,8 @@ here would buy little.
 
 from __future__ import annotations
 
+from http.cookies import SimpleCookie
+
 import pytest
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
@@ -558,3 +560,144 @@ async def test_forgot_password_over_http_never_returns_the_token(
     # A grant really was issued, so this is a genuine opportunity to leak it.
     assert notifier.sent
     assert _issued_token(notifier) not in response.text
+
+
+# --- AH3: the refresh cookie, end to end over HTTP ---------------------------
+#
+# The unit endpoint tests substitute the service, so they prove the *route*
+# sets and reads a cookie. These run the genuine article — real MySQL, real
+# Argon2, real rotation — through the real app, which is the only place the
+# cookie and the server-side token row can be shown to agree.
+
+REFRESH_COOKIE = "orqent_refresh"
+
+
+def _cookie_value(response: object) -> str | None:
+    """The refresh cookie's value, or ``None`` if it was cleared or absent."""
+
+    jar = SimpleCookie()
+    header = response.headers.get("set-cookie")  # type: ignore[attr-defined]
+    if header is None:
+        return None
+    jar.load(header)
+    return jar[REFRESH_COOKIE].value or None
+
+
+async def test_the_cookie_survives_a_full_login_refresh_logout_cycle(
+    service: AuthService,
+) -> None:
+    """The AH3 lifecycle, with the browser holding the credential throughout.
+
+    `AsyncClient` keeps a cookie jar, so this exercises what a browser actually
+    does: the refresh token is never read, stored, or resent by the caller —
+    it is attached automatically and rotated in place.
+    """
+
+    await service.register(
+        email="founder@example.com", password=PASSWORD, organization_name="Acme Inc"
+    )
+
+    async with AsyncClient(
+        transport=ASGITransport(app=_app(service)), base_url="http://test"
+    ) as client:
+        login = await client.post(
+            "/api/v1/auth/login",
+            json={"email": "founder@example.com", "password": PASSWORD},
+        )
+        assert login.status_code == 200
+        first = _cookie_value(login)
+        assert first is not None
+        # The token is in the jar and nowhere else.
+        assert first not in login.text
+        assert "refresh_token" not in login.json()
+
+        rotated = await client.post("/api/v1/auth/refresh")
+        assert rotated.status_code == 200
+        second = _cookie_value(rotated)
+        assert second is not None and second != first
+        assert rotated.json()["access_token"]
+
+        # The access token actually works, which is what makes the exchange
+        # worth performing at all.
+        me = await client.get(
+            "/api/v1/auth/me",
+            headers={"Authorization": f"Bearer {rotated.json()['access_token']}"},
+        )
+        assert me.status_code == 200
+
+        logout = await client.post("/api/v1/auth/logout")
+        assert logout.status_code == 204
+        assert _cookie_value(logout) is None
+
+        # The jar is now empty, so this is a genuine "no cookie" request.
+        assert (await client.post("/api/v1/auth/refresh")).status_code == 401
+
+
+async def test_replaying_a_rotated_cookie_is_caught_by_reuse_detection(
+    service: AuthService,
+) -> None:
+    """Rotation semantics are unchanged by the transport.
+
+    The browser cannot do this — the cookie was overwritten — but an attacker
+    holding a captured value can, which is exactly whom reuse detection is for.
+    Sending the superseded value by hand is the only way to test it.
+    """
+
+    await service.register(
+        email="founder@example.com", password=PASSWORD, organization_name="Acme Inc"
+    )
+
+    async with AsyncClient(
+        transport=ASGITransport(app=_app(service)), base_url="http://test"
+    ) as client:
+        login = await client.post(
+            "/api/v1/auth/login",
+            json={"email": "founder@example.com", "password": PASSWORD},
+        )
+        original = _cookie_value(login)
+        rotated = await client.post("/api/v1/auth/refresh")
+        successor = _cookie_value(rotated)
+        assert original is not None and successor is not None
+
+        replay = await client.post("/api/v1/auth/refresh", cookies={REFRESH_COOKIE: original})
+        assert replay.status_code == 401
+
+        # The family died with the replay, so even the legitimate successor is
+        # now refused — unchanged from before AH3, and the point of the design.
+        assert (
+            await client.post("/api/v1/auth/refresh", cookies={REFRESH_COOKIE: successor})
+        ).status_code == 401
+
+
+async def test_a_password_reset_makes_the_existing_cookie_useless(
+    service: AuthService, notifier: FakePasswordResetNotifier
+) -> None:
+    """AH2's revocation still reaches a session held in a cookie.
+
+    The browser keeps the cookie — the server cannot reach into a browser it is
+    not currently talking to — so this asserts the honest property: the cookie
+    is still *present* and no longer *works*. Server state is authoritative,
+    and the next request is when the client finds out.
+    """
+
+    await service.register(
+        email="founder@example.com", password=PASSWORD, organization_name="Acme Inc"
+    )
+
+    async with AsyncClient(
+        transport=ASGITransport(app=_app(service)), base_url="http://test"
+    ) as client:
+        login = await client.post(
+            "/api/v1/auth/login",
+            json={"email": "founder@example.com", "password": PASSWORD},
+        )
+        # Held by the client's jar, and about to become worthless.
+        assert _cookie_value(login) is not None
+
+        await service.forgot_password(email="founder@example.com")
+        await service.reset_password(token=_issued_token(notifier), new_password=NEW_PASSWORD)
+
+        rejected = await client.post("/api/v1/auth/refresh")
+        assert rejected.status_code == 401
+        # And the useless cookie is taken off the client's hands.
+        assert _cookie_value(rejected) is None

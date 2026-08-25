@@ -28,9 +28,17 @@ export interface ErrorResponse {
 
 // --- Auth --------------------------------------------------------------------
 
-export interface TokenPair {
+/**
+ * What `/auth/login` and `/auth/refresh` return.
+ *
+ * There is deliberately **no `refresh_token` field** (AH3). The refresh token
+ * travels in an HttpOnly cookie the browser holds and this code cannot read;
+ * a field here would mean the value had passed through JavaScript, which is
+ * exactly what the cookie exists to prevent. Its absence from the type makes
+ * that a compile error rather than a convention.
+ */
+export interface AccessToken {
   access_token: string
-  refresh_token: string
   token_type?: string
 }
 

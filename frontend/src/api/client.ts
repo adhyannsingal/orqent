@@ -34,42 +34,28 @@ export class ApiError extends Error {
 
 // --- Token handling ----------------------------------------------------------
 //
-// The access token lives **in memory only**. A refresh token is persisted,
-// because without it every page reload would log the user out — but the
-// short-lived credential that actually authorises requests is never written to
-// storage, so a successful XSS cannot read it from `localStorage` at leisure.
-// This is the safest split the backend's bearer-token model allows; it does not
-// support cookie sessions, and inventing one would mean changing the backend.
+// The access token lives **in memory only**, and the refresh token is not here
+// at all: it travels in an HttpOnly cookie the backend sets, which this code
+// cannot read, write, or clear (AH3). That is the whole point — a script that
+// compromises this page can still make requests while the tab is open, but it
+// cannot exfiltrate a long-lived credential to mint sessions elsewhere at
+// leisure. There is no `localStorage` key to find, because there is no value.
+//
+// The consequence is that ending a session is a *server* action: `logout()`
+// asks the backend to revoke the family and delete the cookie. Clearing state
+// here alone would end the session in this tab and nowhere else.
 
 let accessToken: string | null = null
 let onUnauthenticated: (() => void) | null = null
-
-const REFRESH_KEY = 'orqent.refresh'
 
 export function setAccessToken(token: string | null): void {
   accessToken = token
 }
 
-export function getRefreshToken(): string | null {
-  try {
-    return localStorage.getItem(REFRESH_KEY)
-  } catch {
-    return null
-  }
-}
-
-export function setRefreshToken(token: string | null): void {
-  try {
-    if (token) localStorage.setItem(REFRESH_KEY, token)
-    else localStorage.removeItem(REFRESH_KEY)
-  } catch {
-    /* storage unavailable (private mode); the session simply won't survive reload */
-  }
-}
-
-export function clearTokens(): void {
+/** Forget the in-memory access token. The refresh cookie is the backend's to
+ *  remove, and only `/auth/logout` or a rejected `/auth/refresh` does so. */
+export function clearAccessToken(): void {
   accessToken = null
-  setRefreshToken(null)
 }
 
 /** Registered once by the auth store, so a 401 can end the session globally. */
@@ -107,33 +93,42 @@ async function send(path: string, options: RequestOptions): Promise<Response> {
     headers,
     body: options.body === undefined ? undefined : JSON.stringify(options.body),
     signal: options.signal,
+    // Sends the HttpOnly refresh cookie on the `/auth` calls that need it.
+    // Applied to every request rather than just those three because
+    // `API_BASE_URL` is a single configured origin — this app's own backend —
+    // so there is no third party for a credential to leak to. Making it
+    // conditional would be one more thing to get wrong on a new endpoint.
+    credentials: 'include',
   })
 }
 
 /**
- * Trade the stored refresh token for a new pair.
+ * Ask the backend to rotate the refresh cookie and issue a new access token.
  *
- * Concurrent 401s share one in-flight refresh: without that, a page rendering
- * four queries would fire four refreshes, and the backend's rotation-with-reuse
- * detection would treat the losers as stolen tokens and revoke the family.
+ * Concurrent 401s share one in-flight refresh, and this matters more after AH3
+ * rather than less: a page rendering four queries would otherwise fire four
+ * refreshes carrying the *same* cookie, and the backend's rotation-with-reuse
+ * detection would correctly treat the losers as stolen tokens and revoke the
+ * whole family — logging the user out for the crime of loading a page.
  */
 let refreshInFlight: Promise<boolean> | null = null
 
-async function refreshSession(): Promise<boolean> {
-  const refresh = getRefreshToken()
-  if (!refresh) return false
-
+export async function refreshSession(): Promise<boolean> {
+  // No precondition to check any more. Before AH3 this returned early when
+  // `localStorage` held no token; now the cookie is invisible here, so the only
+  // way to learn whether a session exists is to ask. A missing cookie is a 401,
+  // which is the same "no" one step later.
   refreshInFlight ??= (async () => {
     try {
       const response = await send('/api/v1/auth/refresh', {
         method: 'POST',
-        body: { refresh_token: refresh },
         skipRefresh: true,
       })
       if (!response.ok) return false
-      const pair = (await response.json()) as { access_token: string; refresh_token: string }
-      setAccessToken(pair.access_token)
-      setRefreshToken(pair.refresh_token)
+      // The rotated refresh token arrived as a `Set-Cookie` the browser has
+      // already stored; only the access token is in this body.
+      const issued = (await response.json()) as { access_token: string }
+      setAccessToken(issued.access_token)
       return true
     } catch {
       return false
@@ -154,7 +149,7 @@ export async function request<T>(path: string, options: RequestOptions = {}): Pr
       response = await send(path, options)
     }
     if (response.status === 401) {
-      clearTokens()
+      clearAccessToken()
       onUnauthenticated?.()
       throw await parseError(response, 'Your session has expired. Please sign in again.')
     }

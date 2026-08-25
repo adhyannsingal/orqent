@@ -9,7 +9,7 @@ the frontend's auth feature.
 |---|---|---|
 | **AH1** | Generic login-failure semantics + password-policy audit | ✅ |
 | **AH2** | Forgot/reset password lifecycle | ✅ |
-| **AH3** | HttpOnly refresh-token persistence | ⬜ |
+| **AH3** | HttpOnly refresh-token persistence | ✅ |
 | **AH4** | Rate limiting + final auth/security acceptance | ⬜ |
 
 ---
@@ -193,3 +193,145 @@ the flow ends at sign-in.
 keyed by client IP and by submitted email — it mints credentials and sends mail
 on an unauthenticated request. `/reset-password` needs one too, to bound
 guessing against the digest index. Nothing has been added for either.
+
+
+---
+
+## AH3 — HttpOnly refresh-token persistence
+
+### What changed
+
+The refresh token moved out of `localStorage` and into a cookie the browser's
+JavaScript cannot read. The access token stays **in memory only**, unchanged.
+
+| | Before | After |
+|---|---|---|
+| Access token | memory | memory |
+| Refresh token | `localStorage['orqent.refresh']` | HttpOnly cookie |
+| `POST /auth/login` body | `access_token`, `refresh_token` | `access_token` only |
+| `POST /auth/refresh` | body `{refresh_token}` | **no body** — reads the cookie |
+| `POST /auth/logout` | body `{refresh_token}` | **no body** — reads the cookie |
+| Session restore | read storage, then refresh | refresh; the cookie is attached automatically |
+
+`TokenPairResponse` is gone, replaced by `AccessTokenResponse`, which has **no
+`refresh_token` field to populate** — a stronger guarantee than remembering not
+to populate one. `RefreshRequest` is gone entirely: a client cannot present a
+refresh token it merely possesses, so one captured from a log or pasted into a
+console is useless without the browser holding the cookie.
+
+**What this does and does not buy.** HttpOnly is not an XSS fix. A script that
+compromises the page can still make requests while the tab is open. What it
+cannot do any more is *exfiltrate* a thirty-day credential to replay elsewhere
+at leisure. That is the whole gain, and it is worth stating narrowly.
+
+### Cookie attributes
+
+| Attribute | Value | Why |
+|---|---|---|
+| Name | `orqent_refresh` | Not a secret; the only part anyone is meant to see. |
+| `HttpOnly` | always `true` | The reason the milestone exists. Asserted from the AST, not by string search. |
+| `Secure` | `false` locally, **required** in production | A Secure cookie is never sent over the plain HTTP local dev runs on. Startup **refuses** `Secure=false` when `APP_ENVIRONMENT=production`. |
+| `SameSite` | `lax` | See below. `none` is accepted but refused without `Secure`. |
+| `Path` | `/api/v1/auth` | The narrowest path covering login, refresh and logout. The browser never attaches this credential to a workflow, run, or document request. |
+| `Domain` | unset | Host-only, which is what localhost needs and what a single-host deployment wants. Setting it widens who receives the cookie. |
+| `Max-Age` | `refresh_token_ttl_seconds` (30 days) | Two expressions of one deadline. The server stays authoritative: a cookie outliving its row is still refused. |
+
+### Why SameSite=Lax
+
+Orqent's frontend and API are **same-site in every supported deployment**:
+
+* **Local, default** — Vite proxies `/api` to the backend, so the browser sees
+  one origin.
+* **Local, direct** — `VITE_API_BASE_URL=http://localhost:8000` is cross-*origin*
+  but same-*site*: SameSite is a site-level rule that ignores the port.
+* **Production** — an `app.` / `api.` split under one registrable domain is
+  same-site.
+
+Lax therefore sends the cookie on the app's own requests while blocking the
+cross-site POSTs CSRF depends on. `SameSite=None` would only be needed for
+genuinely cross-site origins (different registrable domains), which is not this
+model, and it was not chosen casually.
+
+### CSRF analysis
+
+The cookie authenticates exactly **two** endpoints, `/auth/refresh` and
+`/auth/logout`. Every other endpoint uses a bearer `Authorization` header, which
+a cross-site attacker cannot set.
+
+* `SameSite=Lax` does not send the cookie on cross-site POSTs, so a hostile page
+  cannot invoke either endpoint at all.
+* Even if one were invoked, the damage is bounded: logout is a nuisance, and
+  refresh rotates the cookie while the attacker cannot read the response (CORS
+  forbids it) and so never obtains the access token. Neither is an
+  exfiltration path.
+* A **same-site** attacker — a compromised sibling subdomain — would defeat this,
+  as it would defeat most cookie schemes. Out of scope, and stated rather than
+  implied.
+
+**Conclusion: SameSite is sufficient here and no CSRF token subsystem was
+built.** Inventing a half-correct one would add moving parts without closing a
+reachable attack. This conclusion is tied to the same-site assumption above: a
+future genuinely cross-site deployment forcing `SameSite=None` **must** revisit
+it.
+
+### CORS
+
+`allow_credentials=True` is required for the browser to attach the cookie
+cross-origin, so a wildcard origin is never valid. Startup now **refuses**
+`'*'` in `cors_origins` — not because browsers would honour the combination
+(they refuse it), but so the configuration cannot exist and tempt somebody into
+"fixing" the resulting breakage by reflecting arbitrary `Origin` headers.
+
+The default local setup needs no CORS at all: the Vite proxy makes the browser
+see one origin. Explicit origins are only needed when pointing the frontend
+straight at port 8000.
+
+### Session restoration, and a defect the browser caught
+
+On load the app calls `/auth/refresh`; the browser attaches the cookie; a new
+access token comes back. Failure settles cleanly into a logged-out state with no
+retry loop.
+
+Restoration goes through `refreshSession`, which **deduplicates concurrent
+callers** — and this is load-bearing rather than tidy. The first implementation
+called the API directly, bypassing that dedup, and live browser testing found
+the consequence: React StrictMode invokes the mount effect twice, so two
+refreshes carried the *same* cookie, the second was a replay, reuse detection
+revoked the family, and **every reload logged the user out**. It passed every
+unit test and every type check. The fix routes restoration through the shared
+in-flight promise; an architecture guard now pins it.
+
+Worth recording why it appeared only now: before AH3, `setRefreshToken` wrote to
+`localStorage` synchronously, so a second caller read the *new* token. Moving
+storage out of JavaScript removed that synchronous handoff and changed the
+concurrency properties of a code path that looked untouched.
+
+### Invalid-cookie handling
+
+A refresh that is rejected — missing, expired, revoked, replayed — clears the
+cookie. Leaving one the server will never accept again means the app retries
+with it on every page load, turning one dead session into a stream of 401s.
+This is **client-side tidy-up only**: revocation, including reuse detection's
+family sweep, already happened server-side and the row remains authoritative.
+Missing and dead cookies produce byte-identical responses.
+
+### Password-reset interaction
+
+AH2's `revoke_all_for_user` still reaches a session held in a cookie. The
+browser keeps the cookie — a server cannot reach into a browser it is not
+currently talking to — so the honest property is that the cookie is still
+*present* and no longer *works*: the next refresh is rejected and the cookie is
+cleared then. Server state is authoritative.
+
+### Rotation and reuse
+
+Unchanged by the transport. Login issues cookie A; refresh rotates it to B and
+then C; replaying A is caught as reuse and revokes the whole family, so even the
+legitimate successor stops working. The frontend never sees any of these values.
+Verified end-to-end over HTTP against real MySQL.
+
+### AH4 attachment points
+
+`/auth/login`, `/auth/register`, `/auth/forgot-password`, `/auth/reset-password`
+and now `/auth/refresh` — the last because it is unauthenticated in the bearer
+sense and reachable with only a cookie. Nothing has been added.

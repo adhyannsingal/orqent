@@ -38,10 +38,22 @@ def _render(http_status: int, code: str, message: str, details: list[ErrorDetail
     return JSONResponse(status_code=http_status, content=body.model_dump())
 
 
-async def _handle_app_error(_: Request, exc: AppError) -> JSONResponse:
-    log.warning("app_error", code=exc.code, message=exc.message)
+def render_app_error(exc: AppError) -> JSONResponse:
+    """The envelope for a domain error, as a response object.
+
+    Public because a route occasionally needs the response *before* it is sent
+    — ``/auth/refresh`` clears the refresh cookie on rejection, and a header
+    cannot be attached to an exception. Sharing this with the handler below is
+    what keeps the two paths from drifting into two different-looking 401s.
+    """
+
     details = [ErrorDetail.model_validate(d) for d in exc.details]
     return _render(exc.http_status, exc.code, exc.message, details)
+
+
+async def _handle_app_error(_: Request, exc: AppError) -> JSONResponse:
+    log.warning("app_error", code=exc.code, message=exc.message)
+    return render_app_error(exc)
 
 
 async def _handle_validation_error(_: Request, exc: RequestValidationError) -> JSONResponse:

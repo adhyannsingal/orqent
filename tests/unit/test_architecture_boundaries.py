@@ -21,6 +21,7 @@ honour-based.
 from __future__ import annotations
 
 import ast
+import re
 import tokenize
 from collections.abc import Iterator
 from pathlib import Path
@@ -1354,3 +1355,149 @@ def test_the_shipped_notifier_cannot_write_the_link_anywhere() -> None:
 
     for sink in ("print", "open"):
         assert sink not in _code_only(adapter), f"the notifier reaches {sink}"
+
+
+# --- AH3: the refresh cookie stays a transport concern -----------------------
+
+
+def test_the_auth_service_knows_nothing_about_cookies_or_responses() -> None:
+    """``AuthService`` returns a token pair; the route decides how it travels.
+
+    If the service took a FastAPI ``Response`` it could no longer be called
+    from a worker, a CLI, or a test without inventing one — and "where does the
+    refresh token live" would stop being a decision one module owns.
+    """
+
+    source = _code_only(SRC / "services/auth_service.py").lower()
+
+    for transport in ("cookie", "set_cookie", "response", "httponly", "samesite"):
+        assert transport not in source, f"auth_service names {transport}"
+    assert not _violations(SRC / "services/auth_service.py", ("fastapi", "starlette"))
+
+
+def test_only_the_api_layer_writes_the_refresh_cookie() -> None:
+    # One module sets it and clears it, so the attributes cannot drift apart.
+    # A mismatched path or domain on deletion leaves the original cookie live
+    # beside the empty one, and logout would only appear to work.
+    writers = {
+        _relative(path)
+        for path in _modules("app")
+        if "set_cookie" in _code_only(path) or "delete_cookie" in _code_only(path)
+    }
+
+    assert writers == {"app/api/cookies.py"}
+
+
+def test_the_refresh_cookie_is_always_httponly() -> None:
+    """The single attribute AH3 exists for, asserted at its only source.
+
+    Read from the AST rather than by string search: ``httponly`` appearing in
+    the file proves nothing about the value passed.
+    """
+
+    tree = ast.parse((SRC / "api/cookies.py").read_text())
+    calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr in {"set_cookie", "delete_cookie"}
+    ]
+    assert len(calls) == 2
+
+    for call in calls:
+        httponly = next(kw for kw in call.keywords if kw.arg == "httponly")
+        assert isinstance(httponly.value, ast.Constant) and httponly.value.value is True
+
+
+def test_the_frontend_persists_no_refresh_token() -> None:
+    """No web storage API is reachable from the frontend's auth code.
+
+    The decisive check for AH3's client half, and deliberately a search for the
+    *mechanism* rather than for a key name: renaming ``orqent.refresh`` would
+    defeat a name-based test while changing nothing about the exposure.
+    """
+
+    frontend = SRC.parent.parent / "frontend" / "src"
+    if not frontend.exists():  # pragma: no cover - backend-only checkouts
+        pytest.skip("frontend is not present in this checkout")
+
+    offenders: dict[str, list[str]] = {}
+    for path in sorted(frontend.rglob("*.ts")) + sorted(frontend.rglob("*.tsx")):
+        # Comments are stripped so prose explaining the rule does not break it,
+        # the same treatment `_code_only` gives Python.
+        code = re.sub(r"//[^\n]*|/\*.*?\*/", "", path.read_text(), flags=re.DOTALL)
+        used = [
+            api
+            for api in ("localStorage", "sessionStorage", "indexedDB", "document.cookie")
+            if api in code
+        ]
+        if used:
+            offenders[path.relative_to(frontend).as_posix()] = used
+
+    # Theme preference is the one permitted use: a non-secret UI setting.
+    assert offenders == {"components/ThemeProvider.tsx": ["localStorage"]}, offenders
+
+
+# --- AH3: client-side properties the cookie model depends on -----------------
+#
+# These are **structural** assertions over the frontend source, not behavioural
+# tests: the repository has no JavaScript test runner, and standing one up to
+# cover three lines would cost more than it returns. They are included because
+# each corresponds to a regression that is otherwise completely silent — no
+# type error, no failing build, no visible symptom until a user is logged out
+# unexpectedly. A source check that fails loudly beats nothing at all, and the
+# limitation is stated rather than papered over.
+
+
+def _frontend_source(relative: str) -> str:
+    frontend = SRC.parent.parent / "frontend" / "src"
+    if not frontend.exists():  # pragma: no cover - backend-only checkouts
+        pytest.skip("frontend is not present in this checkout")
+    return (frontend / relative).read_text()
+
+
+def test_the_api_client_sends_credentials() -> None:
+    """Without this the cookie is never attached and refresh always 401s.
+
+    Silent by construction: every request still compiles, still runs, and still
+    succeeds while an access token is in memory. The failure only appears after
+    a reload, as "I keep getting logged out".
+    """
+
+    assert "credentials: 'include'" in _frontend_source("api/client.ts")
+
+
+def test_session_restoration_asks_the_backend() -> None:
+    """A reload must exchange the cookie for an access token.
+
+    Before AH3 the store could check `localStorage` and skip the call; now
+    there is nothing to check, so the call *is* the mechanism. Dropping it
+    would silently make every reload a logout.
+    """
+
+    store = _frontend_source("stores/auth.ts")
+
+    # Specifically through `refreshSession`, which deduplicates concurrent
+    # callers. A bare API call here would carry the same cookie twice under
+    # StrictMode's double-invoked effect, and the second would be a replay —
+    # revoking the family and logging the user out on every reload. This was a
+    # real defect found in the browser, not a hypothetical.
+    assert "refreshSession()" in store
+    assert "refreshPair" not in store
+    assert store.count("refreshSession()") == 1
+
+
+def test_concurrent_refreshes_are_deduplicated() -> None:
+    """`??=` is load-bearing, and this is the sharpest failure in AH3.
+
+    Assigning unconditionally would let a page rendering four queries fire four
+    refreshes carrying the *same* cookie. The backend would correctly read three
+    of them as replays, revoke the whole family, and log the user out — for the
+    crime of loading a page. It would pass every type check and every build.
+    """
+
+    client = _frontend_source("api/client.ts")
+
+    assert "refreshInFlight ??= (async () => {" in client
+    assert "refreshInFlight = (async () => {" not in client

@@ -102,26 +102,23 @@ class CurrentUserResponse(BaseModel):
     roles: list[str]
 
 
-class RefreshRequest(BaseModel):
-    """Payload carrying a refresh token.
+class AccessTokenResponse(BaseModel):
+    """A freshly issued access token.
 
-    Used by both ``/auth/refresh`` and ``/auth/logout``: each presents the same
-    credential, and giving them separate identical models would only duplicate
-    the field.
-    """
+    Returned by login *and* refresh, since both hand back the same thing.
 
-    refresh_token: str = Field(min_length=1, max_length=_MAX_TOKEN_LENGTH)
+    **The refresh token is deliberately absent** (AH3). It travels in an
+    HttpOnly cookie the backend sets, so putting it here too would defeat the
+    point entirely: a value in the JSON body is a value JavaScript has read.
+    There is no ``refresh_token`` field to populate, which is a stronger
+    guarantee than remembering not to populate one.
 
-
-class TokenPairResponse(BaseModel):
-    """A freshly issued access and refresh token.
-
-    Returned by login *and* refresh, since both hand back the same thing —
-    named for the payload rather than for one of its callers.
+    ``/auth/refresh`` and ``/auth/logout`` take **no request body** for the same
+    reason — the credential comes from the cookie, so a client cannot present an
+    arbitrary refresh token even if it somehow obtained one.
     """
 
     access_token: str
-    refresh_token: str
     token_type: str = "bearer"
     """How the access token must be presented: ``Authorization: Bearer <token>``."""
 
