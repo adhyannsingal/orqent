@@ -240,31 +240,48 @@ async def test_two_runs_may_each_have_an_outstanding_task(session: AsyncSession)
 # --- Cascades ----------------------------------------------------------------
 
 
+async def _task_exists(session: AsyncSession, task_id: int) -> bool:
+    """Whether one specific queue task is still there.
+
+    Scoped to a single id rather than counting the table. An unscoped
+    ``COUNT(*) == 0`` only holds on an empty database — against one with any
+    unrelated rows it fails while saying nothing about the cascade — and it
+    would also pass vacuously if the row had never been written. Asserting the
+    row exists and then does not proves the cascade itself.
+    """
+
+    return (
+        await session.scalar(
+            select(func.count()).select_from(QueueTask).where(QueueTask.id == task_id)
+        )
+    ) == 1
+
+
 async def test_deleting_a_run_deletes_its_queue_task(session: AsyncSession) -> None:
     """A deleted run cannot have pending work, and an orphan would give a
     worker something to claim that resolves to nothing."""
 
     run = await _run(session)
-    await _task(session, run)
+    task = await _task(session, run)
+    assert await _task_exists(session, task.id)
 
     await session.execute(Run.__table__.delete().where(Run.id == run.id))
 
-    remaining = await session.scalar(select(func.count()).select_from(QueueTask))
-    assert remaining == 0
+    assert not await _task_exists(session, task.id)
 
 
 async def test_deleting_an_organization_deletes_its_queue_tasks(
     session: AsyncSession,
 ) -> None:
     run = await _run(session)
-    await _task(session, run)
+    task = await _task(session, run)
+    assert await _task_exists(session, task.id)
 
     await session.execute(
         Organization.__table__.delete().where(Organization.id == run.organization_id)
     )
 
-    remaining = await session.scalar(select(func.count()).select_from(QueueTask))
-    assert remaining == 0
+    assert not await _task_exists(session, task.id)
 
 
 # --- Eligibility, as a plain query -------------------------------------------

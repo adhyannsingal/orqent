@@ -20,6 +20,7 @@ from app import __version__
 from app.api import routes_hooks
 from app.api.errors import register_exception_handlers
 from app.api.middleware import CorrelationIdMiddleware
+from app.api.rate_limit import get_limiter
 from app.api.v1.router import api_v1_router
 from app.api.v1.routes import health
 from app.container import Container
@@ -77,6 +78,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         lifespan=lifespan,
     )
     app.state.container = container
+    # Read by the rate-limit dependencies. On `state` rather than imported so a
+    # test can swap either without reaching into module globals.
+    app.state.settings = settings
+    app.state.rate_limiter = get_limiter()
 
     _register_middleware(app, settings)
     register_exception_handlers(app)

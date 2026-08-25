@@ -10,7 +10,7 @@ the frontend's auth feature.
 | **AH1** | Generic login-failure semantics + password-policy audit | ✅ |
 | **AH2** | Forgot/reset password lifecycle | ✅ |
 | **AH3** | HttpOnly refresh-token persistence | ✅ |
-| **AH4** | Rate limiting + final auth/security acceptance | ⬜ |
+| **AH4** | Rate limiting + final auth/security acceptance | ✅ |
 
 ---
 
@@ -335,3 +335,134 @@ Verified end-to-end over HTTP against real MySQL.
 `/auth/login`, `/auth/register`, `/auth/forgot-password`, `/auth/reset-password`
 and now `/auth/refresh` — the last because it is unauthenticated in the bearer
 sense and reachable with only a cookie. Nothing has been added.
+
+
+---
+
+## AH4 — rate limiting and final acceptance
+
+### Protected endpoints and limits
+
+| Endpoint | Default | Keys | Why |
+|---|---|---|---|
+| `POST /auth/login` | `8/60` | IP + email digest | The email key bounds credential stuffing spread across addresses. |
+| `POST /auth/register` | `5/60` | IP | **Not** keyed on email: throttling differently per address would let someone probe which are taken. |
+| `POST /auth/forgot-password` | `5/3600` | IP + email digest | Sends mail, so an unbounded one is both an enumeration tool and a way to deliver a stranger's inbox a hundred messages. |
+| `POST /auth/reset-password` | `8/60` | IP + token digest | Bounds guessing against the digest index. |
+| `POST /auth/refresh` | `60/60` | IP | Generous: a browser refreshes on every reload, and a tight limit here looks like a broken session. |
+| `POST /hooks/{token}` | `120/60` | IP + token digest | An order of magnitude higher — a busy integration legitimately delivers continuously. |
+
+`POST /auth/logout` is deliberately **not** limited: a throttled logout leaves
+somebody signed in against their wishes, which is the wrong failure. Everything
+else — workflows, runs, documents — is untouched; the blast radius is the
+unauthenticated, abuse-sensitive surface only.
+
+All values are settings (`APP_RATE_LIMIT_*`), so a deployment tunes them
+without a code change. `APP_RATE_LIMIT_ENABLED=false` turns the whole thing off.
+
+### Algorithm, storage, and the guarantee — stated plainly
+
+**Sliding window log**, in **this process's memory**.
+
+* *Sliding, not fixed*: a fixed window lets a caller spend the whole allowance
+  at 0:59 and the whole of the next at 1:01, sustaining twice the intended rate
+  precisely when someone is trying. It also yields an honest `Retry-After` — the
+  moment the oldest hit ages out, computed rather than guessed.
+* *Clock*: `time.monotonic`, not wall-clock. A limiter on wall-clock time would
+  grant a free allowance whenever an NTP correction stepped the clock backwards.
+* *Refusals are not recorded.* A rejected request that still counted would let a
+  caller hold themselves over the limit indefinitely by retrying — turning a
+  one-minute limit into an indefinite ban driven by the client's own retry loop.
+
+**The guarantee is per process.** Orqent runs one API container with one uvicorn
+worker, so today that is the whole deployment and the limit is the limit. Run
+two replicas and each enforces its own counter, so the effective ceiling
+doubles. This is written here, in the limiter's module docstring, and in the
+settings, because "rate limited" must not be read as "distributed rate limited".
+
+Redis was **not** added: there is none in the deployment, and introducing one to
+gain cross-replica accuracy for a single-replica system buys nothing today at
+the cost of a new operational dependency. MySQL was rejected too — it would put
+a write on the hot path of every login, plus a migration and a sweep job, to
+solve a problem this deployment does not have. The limiter is one small class
+behind one call, so swapping the storage later is a contained change.
+
+**Failure mode:** there is no external store, so there is nothing to be
+unavailable. The limiter cannot fail independently of the process it lives in.
+A distributed backend would need that decision made explicitly; this one does
+not have it to make.
+
+**Concurrency:** `check` performs its read, decision and write with no `await`
+between them, so under asyncio the sequence cannot interleave and concurrent
+requests in this process are counted exactly. Proven, not asserted: ten
+simultaneous requests against a limit of four yield exactly four `200`s. It is
+**not** safe across OS threads or processes and does not claim to be.
+
+**Memory:** keys are swept lazily; any key whose newest hit is older than the
+longest window in use is dropped. Without that the map grows one entry per
+distinct address forever, which an attacker can drive deliberately by rotating
+source addresses — an unbounded-growth bug is a denial-of-service vector, not
+untidiness. A key still inside its own window is never swept.
+
+### Client identity and proxies
+
+**Forwarded headers are ignored by default** (`trusted_proxy_hops = 0`). Any
+client can send `X-Forwarded-For`; honouring it without knowing how many proxies
+the app actually sits behind would let an attacker mint a fresh identity per
+request and make every limit here decorative. The peer address is the only value
+the application can verify.
+
+With `trusted_proxy_hops = N` the Nth entry **from the right** is used: the
+rightmost N were appended by proxies we control, and the one before them is what
+the outermost trusted proxy saw. Counting from the right is essential — a client
+can prepend as many fake entries as it likes, and only the right-hand end is
+trustworthy. Setting N larger than the real number of proxies reintroduces
+exactly the forgery it prevents.
+
+*Local and direct deployment*: no proxy, so the peer address is the client.
+*Behind a reverse proxy*: set `APP_TRUSTED_PROXY_HOPS` to the real hop count.
+
+### The 429 contract
+
+`429` with the standard envelope, code `rate_limit_exceeded`, message *"Too many
+requests. Please try again later."* — and nothing else. No counter, no limit, no
+key, no address, no indication whether the account or token exists. A
+`Retry-After` header carries the computed wait.
+
+### Privacy
+
+Emails and tokens are SHA-256 digested before becoming part of a key, using the
+same helper that stores refresh and webhook tokens. Limiter state and any log
+line built from it hold pseudonyms rather than credentials or personal data —
+abuse prevention must not be bought with a searchable record of every address
+that touched the API. Refusals log the category and correlation id only.
+
+### Enumeration safety, re-verified
+
+Rate limiting is the most plausible way to undo AH1 and AH2, so it is tested
+directly: a known and an unknown address hit the wall at the *same request* on
+both `/auth/login` and `/auth/forgot-password`, because the limiter never looks
+up whether the subject exists. Mutating the code to limit only existing accounts
+fails the suite.
+
+### Known limitations
+
+* Per-process enforcement, as above.
+* No distributed or persistent state: a restart clears every counter, so an
+  attacker who can trigger restarts gets a fresh allowance.
+* `trusted_proxy_hops` is a hop count, not an allowlist of proxy addresses. A
+  hostile host *inside* the trusted chain could still forge the client address.
+
+### A note on running the integration suite
+
+The suite intermittently failed one test (`test_rag_runtime::
+test_the_runs_organization_reaches_the_invoked_node`, a run ending `FAILED`
+instead of `COMPLETED`) while the docker-compose **`worker` and `dispatcher`
+containers were running against the same MySQL**. Those containers poll the
+queue, so they occasionally claim a task a test had just enqueued and execute it
+in a process with none of the test's doubles.
+
+Confirmed by experiment rather than assumed: three consecutive full runs with
+the containers stopped gave **653/653**, against roughly one failure per run
+with them up. Stop `worker` and `dispatcher` before running the integration
+suite, or point the tests at a separate database.

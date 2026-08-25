@@ -17,6 +17,13 @@ from fastapi.responses import JSONResponse
 from app.api.cookies import clear_refresh_cookie, set_refresh_cookie
 from app.api.deps import AuthServiceDep, SettingsDep
 from app.api.errors import render_app_error
+from app.api.rate_limit import (
+    ForgotPasswordRateLimit,
+    LoginRateLimit,
+    RefreshRateLimit,
+    RegisterRateLimit,
+    ResetPasswordRateLimit,
+)
 from app.api.security import CurrentUserDep
 from app.core.config import Settings
 from app.domain.errors import AuthenticationError
@@ -72,6 +79,7 @@ def _to_user_response(user: User) -> UserResponse:
     response_model=UserResponse,
     status_code=status.HTTP_201_CREATED,
     summary="Create an account and its organization",
+    dependencies=[RegisterRateLimit],
 )
 async def register(payload: RegisterRequest, auth_service: AuthServiceDep) -> UserResponse:
     user = await auth_service.register(
@@ -86,6 +94,7 @@ async def register(payload: RegisterRequest, auth_service: AuthServiceDep) -> Us
     "/login",
     response_model=AccessTokenResponse,
     summary="Exchange credentials for an access token and a refresh cookie",
+    dependencies=[LoginRateLimit],
 )
 async def login(
     payload: LoginRequest,
@@ -110,6 +119,7 @@ async def login(
     "/refresh",
     response_model=AccessTokenResponse,
     summary="Rotate the refresh cookie and issue a new access token",
+    dependencies=[RefreshRateLimit],
 )
 async def refresh(
     auth_service: AuthServiceDep,
@@ -194,6 +204,7 @@ async def logout(
     "/forgot-password",
     response_model=MessageResponse,
     summary="Request a password reset link",
+    dependencies=[ForgotPasswordRateLimit],
 )
 async def forgot_password(
     payload: ForgotPasswordRequest, auth_service: AuthServiceDep
@@ -215,6 +226,7 @@ async def forgot_password(
     "/reset-password",
     response_model=MessageResponse,
     summary="Set a new password using a reset link",
+    dependencies=[ResetPasswordRateLimit],
 )
 async def reset_password(
     payload: ResetPasswordRequest, auth_service: AuthServiceDep

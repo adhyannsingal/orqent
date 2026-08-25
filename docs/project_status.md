@@ -1002,6 +1002,40 @@ The backend path is complete. What is left is **not backend work**:
    HTTP node would make it do something externally visible. Neither is required
    for the path to work.
 
+## 11b. Auth Hardening — AH1-AH4 ✅ COMPLETE
+
+A four-milestone security follow-up to the ten-phase backend, on top of the
+frontend. It changed no execution, queue, worker, scheduler, RAG, or tool
+architecture. Full detail in `docs/auth-hardening-spec.md`.
+
+| Milestone | Scope | Status |
+|---|---|---|
+| AH1 | Generic login-failure semantics + password-policy audit | ✅ |
+| AH2 | Forgot/reset password lifecycle | ✅ |
+| AH3 | HttpOnly refresh-token persistence | ✅ |
+| AH4 | Rate limiting + final auth/security acceptance | ✅ |
+
+What the system now does: one indistinguishable answer for every credential
+failure, with a dummy Argon2 verification so a missing account costs what a real
+one does; a reset lifecycle whose tokens are stored only as digests, expire in
+30 minutes, are single-use under a row lock, supersede their predecessors and
+revoke every session on use; refresh tokens in an HttpOnly, `SameSite=Lax`,
+path-scoped cookie that JavaScript cannot read, rotated with reuse detection;
+and per-process rate limiting on the unauthenticated auth and webhook surface.
+
+Honest limitations, stated rather than implied: rate limiting is **per process**
+(one API worker today, so it is the real ceiling); **no email provider is
+configured**, so a password-reset link is generated and discarded rather than
+delivered; and forwarded client-IP headers are ignored unless a proxy hop count
+is configured explicitly. Migration head is unchanged at `0010` — AH4 needed no
+schema change.
+
+Also fixed along the way, in tests only: roughly two dozen integration
+assertions that counted whole tables or deleted all rows, and so only held
+against an empty database. They are now scoped to the rows each test creates.
+
+---
+
 ## 12. Known Technical Debt
 
 Deliberate, tracked compromises:

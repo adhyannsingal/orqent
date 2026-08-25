@@ -24,7 +24,7 @@ from typing import Any
 import pytest
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
-from sqlalchemy import func, select
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.api.deps import get_run_service, get_webhook_service, get_workflow_service
@@ -40,6 +40,7 @@ from app.infrastructure.db.models.run import Run
 from app.infrastructure.db.models.trigger_registration import REVOKED, TriggerRegistration
 from app.infrastructure.db.models.user import User
 from app.infrastructure.db.unit_of_work import SqlAlchemyUnitOfWork
+from app.infrastructure.security.token_hashing import hash_token
 from app.main import create_app
 from app.services.run_service import RunService
 from app.services.webhook_service import WebhookService
@@ -179,6 +180,38 @@ async def _runs_of(session: AsyncSession, organization_id: int) -> list[Run]:
     return list(result)
 
 
+async def _tasks_of(session: AsyncSession, organization_id: int) -> list[QueueTask]:
+    """This tenant's queue tasks.
+
+    Scoped for the same reason ``_runs_of`` is: an unscoped ``select(QueueTask)``
+    only means "exactly one delivery happened" on an empty database, and against
+    one holding unrelated rows it measures somebody else's work.
+    """
+
+    session.expire_all()
+    return list(
+        await session.scalars(select(QueueTask).where(QueueTask.organization_id == organization_id))
+    )
+
+
+async def _registration_for(session: AsyncSession, token: str) -> TriggerRegistration:
+    """The registration this token addresses.
+
+    Looked up by digest rather than by taking the first row in the table. That
+    is not a tidiness point: ``next(iter(select(TriggerRegistration)))`` against
+    a database with any other registration in it selects an *unrelated* one, so
+    a test that revoked "the" registration would revoke the wrong row and then
+    assert about a token that was never touched.
+    """
+
+    session.expire_all()
+    return (
+        await session.scalars(
+            select(TriggerRegistration).where(TriggerRegistration.token_digest == hash_token(token))
+        )
+    ).one()
+
+
 async def _organization_id(session: AsyncSession, user: AuthenticatedUser) -> int:
     row = (
         await session.scalars(
@@ -218,8 +251,7 @@ async def test_a_delivery_leaves_exactly_one_outstanding_queue_task(
 
     await client.post(f"/hooks/{token}", json={})
 
-    session.expire_all()
-    tasks = list(await session.scalars(select(QueueTask)))
+    tasks = await _tasks_of(session, await _organization_id(session, tenant))
     assert len(tasks) == 1
     assert tasks[0].status in OUTSTANDING
     assert (
@@ -238,12 +270,15 @@ async def test_the_run_and_task_belong_to_the_registrations_tenant(
 
     await client.post(f"/hooks/{token}", json={})
 
-    run = (await _runs_of(session, organization_id))[0]
-    task = next(iter(await session.scalars(select(QueueTask))))
-    registration = next(iter(await session.scalars(select(TriggerRegistration))))
-    assert run.organization_id == organization_id
-    assert task.organization_id == organization_id
-    assert registration.organization_id == organization_id
+    # Each tenant is read straight after its own fetch. The scoped helpers
+    # expire the session so they see freshly written rows, and an ORM object
+    # held across a later expiry would lazy-load on attribute access — which
+    # under asyncio raises MissingGreenlet rather than returning a value.
+    run_tenant = (await _runs_of(session, organization_id))[0].organization_id
+    task_tenant = (await _tasks_of(session, organization_id))[0].organization_id
+    registration_tenant = (await _registration_for(session, token)).organization_id
+
+    assert run_tenant == task_tenant == registration_tenant == organization_id
 
 
 async def test_the_request_does_not_run_the_workflow(
@@ -365,7 +400,7 @@ async def test_an_unknown_token_is_rejected(
 
     await _reject(client, "1" * 43)
 
-    assert list(await session.scalars(select(Run))) == []
+    assert await _runs_of(session, await _organization_id(session, tenant)) == []
 
 
 @pytest.mark.parametrize("token", ["", " ", "not-a-token", "../etc/passwd", "%00", "x" * 500])
@@ -389,7 +424,7 @@ async def test_a_revoked_token_looks_exactly_like_an_unknown_one(
 
     _, token = await _publish(client)
     assert token is not None
-    registration = next(iter(await session.scalars(select(TriggerRegistration))))
+    registration = await _registration_for(session, token)
     registration.status = REVOKED
     await session.flush()
 
@@ -399,7 +434,7 @@ async def test_a_revoked_token_looks_exactly_like_an_unknown_one(
     revoked["error"].pop("correlation_id")
     unknown["error"].pop("correlation_id")
     assert revoked == unknown
-    assert list(await session.scalars(select(Run))) == []
+    assert await _runs_of(session, await _organization_id(session, tenant)) == []
 
 
 async def test_a_superseded_registration_cannot_execute(
@@ -420,7 +455,7 @@ async def test_a_superseded_registration_cannot_execute(
     assert republished.status_code == 201, republished.text
 
     await _reject(client, token)
-    assert list(await session.scalars(select(Run))) == []
+    assert await _runs_of(session, await _organization_id(session, tenant)) == []
 
 
 async def test_the_address_works_again_once_the_trigger_returns(
@@ -587,5 +622,6 @@ async def test_a_delivery_creates_no_second_queue_task_or_run(
 
     await client.post(f"/hooks/{token}", json={})
 
-    assert await session.scalar(select(func.count()).select_from(Run)) == 1
-    assert await session.scalar(select(func.count()).select_from(QueueTask)) == 1
+    organization_id = await _organization_id(session, tenant)
+    assert len(await _runs_of(session, organization_id)) == 1
+    assert len(await _tasks_of(session, organization_id)) == 1

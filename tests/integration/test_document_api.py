@@ -188,6 +188,28 @@ class _Tenant:
         self.namespace = namespace_for(public_id)
 
 
+async def _count_for_tenant(
+    sessions: async_sessionmaker[AsyncSession], model: type, organization_id: int
+) -> int:
+    """Rows of ``model`` belonging to one tenant.
+
+    Scoped rather than counting the table. An unscoped count only means what
+    the test intends on an empty database; against one holding any other
+    organization's documents it measures somebody else's corpus, which is both
+    a false failure and — for the ``== 0`` cases — a check that could pass for
+    entirely the wrong reason.
+    """
+
+    async with sessions() as session:
+        return (
+            await session.scalar(
+                select(func.count())
+                .select_from(model)
+                .where(model.organization_id == organization_id)
+            )
+        ) or 0
+
+
 async def _make_tenant(sessions: async_sessionmaker[AsyncSession], name: str) -> _Tenant:
     async with sessions() as session:
         organization = Organization(name=name, slug=f"{name.lower()}-{new_public_id()}")
@@ -497,11 +519,11 @@ async def test_identical_content_is_ingested_once(
     assert second["unchanged"] is True
     assert embedder.document_calls == 1
 
-    async with sessions() as session:
-        documents = await session.scalar(select(func.count()).select_from(Document))
-        chunks = await session.scalar(select(func.count()).select_from(DocumentChunk))
-    assert documents == 1
-    assert chunks == first["chunk_count"]
+    assert await _count_for_tenant(sessions, Document, tenant.organization_id) == 1
+    assert (
+        await _count_for_tenant(sessions, DocumentChunk, tenant.organization_id)
+        == first["chunk_count"]
+    )
 
 
 async def test_changed_content_replaces_the_old_chunks(
@@ -527,9 +549,10 @@ async def test_changed_content_replaces_the_old_chunks(
     assert second["unchanged"] is False
     assert second["chunk_count"] < first["chunk_count"]
 
-    async with sessions() as session:
-        chunks = await session.scalar(select(func.count()).select_from(DocumentChunk))
-    assert chunks == second["chunk_count"]
+    assert (
+        await _count_for_tenant(sessions, DocumentChunk, tenant.organization_id)
+        == second["chunk_count"]
+    )
 
     matches = await store.query(tenant.namespace, embedder._vector(QUESTION), top_k=50)
     assert len(matches) == second["chunk_count"], "stale vectors survived the replacement"
@@ -607,8 +630,7 @@ async def test_an_embedding_failure_is_reported_without_provider_detail(
         response = await client.post("/api/v1/documents", json=_body())
 
     assert response.status_code == 502, response.text
-    async with sessions() as session:
-        assert await session.scalar(select(func.count()).select_from(Document)) == 0
+    assert await _count_for_tenant(sessions, Document, tenant.organization_id) == 0
 
 
 async def test_a_vector_store_failure_leaks_no_address_or_internals(
@@ -640,8 +662,7 @@ async def test_a_vector_store_failure_leaks_no_address_or_internals(
         assert leaked not in lowered, leaked
 
     # Nothing was committed: MySQL still records no document, so a retry is clean.
-    async with sessions() as session:
-        assert await session.scalar(select(func.count()).select_from(Document)) == 0
+    assert await _count_for_tenant(sessions, Document, tenant.organization_id) == 0
 
 
 # =============================================================================

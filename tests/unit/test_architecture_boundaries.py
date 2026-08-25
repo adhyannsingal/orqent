@@ -31,7 +31,7 @@ import yaml
 from pydantic import BaseModel, SecretStr
 
 import app
-from app.core.config import Settings
+from app.core.config import Environment, Settings
 from app.domain.engine.events import RunEventType
 from app.domain.nodes.descriptor import SideEffect
 from app.infrastructure.db import models  # noqa: F401  (registers tables)
@@ -1501,3 +1501,93 @@ def test_concurrent_refreshes_are_deduplicated() -> None:
 
     assert "refreshInFlight ??= (async () => {" in client
     assert "refreshInFlight = (async () => {" not in client
+
+
+# --- AH4: rate limiting stays at the HTTP boundary ---------------------------
+
+
+def test_the_auth_service_knows_nothing_about_rate_limiting() -> None:
+    """Limiting is a property of an HTTP caller, not of a credential check.
+
+    An address, a forwarded header and a proxy hop count are not vocabulary
+    ``AuthService`` should own — importing any of it would also make the
+    service impossible to call from a worker or a test without a ``Request``.
+    """
+
+    service = SRC / "services/auth_service.py"
+    source = _code_only(service).lower()
+
+    for term in ("ratelimit", "rate_limit", "x-forwarded", "client_identity", "remote_addr"):
+        assert term not in source, f"auth_service names {term}"
+    assert not _violations(service, ("app.infrastructure.ratelimit", "app.api"))
+
+
+def test_the_limiter_stays_out_of_the_domain() -> None:
+    # The dependency rule: `app.domain` is the centre. `RateLimitExceededError`
+    # lives there because it is an outcome the API renders; the mechanism does
+    # not follow it in.
+    for path in _modules("app.domain"):
+        assert not _violations(path, ("app.infrastructure.ratelimit", "app.api", "fastapi"))
+
+
+def test_no_raw_secret_becomes_a_limiter_key() -> None:
+    """Every sensitive key component passes through the digest helper.
+
+    Checked structurally: the module must not build a key from an email or a
+    token without hashing it, because limiter state and anything derived from
+    it would then hold credentials and personal data.
+    """
+
+    source = (SRC / "api/rate_limit.py").read_text()
+    tree = ast.parse(source)
+
+    # Every f-string that builds a subject key must interpolate `_digest(...)`,
+    # never a bare value.
+    subject_keys = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.JoinedStr)
+        and any(
+            isinstance(part, ast.Constant) and "subject:" in str(part.value) for part in node.values
+        )
+    ]
+    assert subject_keys, "no subject key construction found; the guard would be vacuous"
+    for key in subject_keys:
+        calls = [
+            node.func.id
+            for node in ast.walk(key)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+        ]
+        assert "_digest" in calls, "a subject key is built without hashing"
+
+
+def test_forwarded_headers_are_not_trusted_by_default() -> None:
+    """The default must be zero trusted hops.
+
+    Any client can send ``X-Forwarded-For``. A default that honoured it would
+    let an attacker mint a fresh identity per request, making every limit in
+    the application decorative — and it would do so silently.
+    """
+
+    settings = Settings(
+        _env_file=None,
+        environment=Environment.TEST,
+        jwt_secret_key="x" * 32,
+        database_url=None,
+    )
+
+    assert settings.trusted_proxy_hops == 0
+
+
+def test_rate_limiting_does_not_reach_the_execution_machinery() -> None:
+    # Limiting the auth surface must not entangle itself with the engine, the
+    # queue, or the worker — none of which are involved in deciding whether a
+    # caller may ask again.
+    forbidden = (
+        "app.domain.engine",
+        "app.infrastructure.queue",
+        "app.infrastructure.worker",
+        "app.services",
+    )
+    for module in ("api/rate_limit.py", "infrastructure/ratelimit/limiter.py"):
+        assert not _violations(SRC / module, forbidden), f"{module} reaches execution code"

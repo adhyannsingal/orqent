@@ -104,6 +104,30 @@ class Settings(BaseSettings):
     # sibling subdomains, which widens who can receive it.
     refresh_cookie_domain: str | None = None
 
+    # --- Rate limiting (AH4) ---
+    # Master switch. On by default; tests that are not about limiting turn it
+    # off rather than tiptoeing around the thresholds.
+    rate_limit_enabled: bool = True
+    # "N per window-seconds", per client, per endpoint group. Values are
+    # deliberately per-endpoint: a login attempt and a webhook delivery are not
+    # the same kind of event and one number for both would be wrong twice.
+    rate_limit_login: str = "8/60"
+    rate_limit_register: str = "5/60"
+    rate_limit_forgot_password: str = "5/3600"
+    rate_limit_reset_password: str = "8/60"
+    # Generous: a browser refreshes on every reload and on every expiry, and a
+    # limit that bit during ordinary use would look like a broken session.
+    rate_limit_refresh: str = "60/60"
+    # Much higher again, and the one most likely to need tuning per deployment:
+    # a busy integration can legitimately deliver continuously.
+    rate_limit_webhook: str = "120/60"
+    # How many reverse proxies sit in front of this app. **Zero means never
+    # trust a forwarded header**, which is the only safe default: any client can
+    # send `X-Forwarded-For`, so honouring it without a known hop count lets an
+    # attacker forge a fresh identity per request and bypass every limit here.
+    # Set it to the real number of proxies you control, and only that.
+    trusted_proxy_hops: int = Field(default=0, ge=0)
+
     # --- Worker (Phase 8, M5) ---
     # How long a claimed task is owned before another worker may reclaim it.
     # This is a presumption-of-death window, not a work budget: the heartbeat

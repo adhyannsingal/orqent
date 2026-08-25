@@ -78,6 +78,29 @@ class InvalidStateTransitionError(DomainRuleError):
     default_message = "That state transition is not allowed."
 
 
+class RateLimitExceededError(AppError):
+    """Too many requests from one caller in the configured window.
+
+    Carries ``retry_after`` — whole seconds until the oldest request in the
+    window ages out — so the API layer can set a ``Retry-After`` header. It is a
+    real figure the limiter computes, not a fixed guess: a client told to wait
+    longer than necessary backs off too far, and one told to wait less comes
+    straight back and is refused again.
+
+    The message is deliberately uninformative. A caller learns that they are
+    limited and nothing else — not the limit, not the counter, and above all not
+    whether the account they were probing exists.
+    """
+
+    code = "rate_limit_exceeded"
+    http_status = 429
+    default_message = "Too many requests. Please try again later."
+
+    def __init__(self, retry_after: int) -> None:
+        super().__init__()
+        self.retry_after = retry_after
+
+
 class InfrastructureError(AppError):
     code = "infrastructure_error"
     http_status = 503

@@ -117,12 +117,15 @@ def auth_service() -> FakeAuthService:
 @pytest.fixture
 def settings() -> Settings:
     # Overrides the conftest fixture: /auth/me needs a real signing key.
+    # Rate limiting stays off for the same reason it is off there — these tests
+    # are about contracts, not about abuse. `test_rate_limit_*` turns it on.
     return Settings(
         _env_file=None,
         environment=Environment.TEST,
         log_json=False,
         database_url=None,
         jwt_secret_key=SECRET,
+        rate_limit_enabled=False,
     )
 
 

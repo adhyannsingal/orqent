@@ -48,7 +48,15 @@ def render_app_error(exc: AppError) -> JSONResponse:
     """
 
     details = [ErrorDetail.model_validate(d) for d in exc.details]
-    return _render(exc.http_status, exc.code, exc.message, details)
+    response = _render(exc.http_status, exc.code, exc.message, details)
+    # `Retry-After` is the one error header the API sets. It carries no
+    # information about the caller or the resource — only how long to wait —
+    # and the limiter computes it rather than guessing, so a client that
+    # honours it comes back exactly when it will be served.
+    retry_after = getattr(exc, "retry_after", None)
+    if retry_after is not None:
+        response.headers["Retry-After"] = str(retry_after)
+    return response
 
 
 async def _handle_app_error(_: Request, exc: AppError) -> JSONResponse:

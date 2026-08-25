@@ -515,5 +515,12 @@ async def test_only_one_registration_exists_however_often_it_is_published(
     for _ in range(4):
         await _publish(service, tenant, workflow_id)
 
-    total = await session.scalar(select(func.count()).select_from(TriggerRegistration))
+    # Scoped to this tenant: an unscoped count asserts "one registration exists
+    # in the database", which is a claim about the fixture rather than about
+    # republishing being idempotent.
+    total = await session.scalar(
+        select(func.count())
+        .select_from(TriggerRegistration)
+        .where(TriggerRegistration.organization_id == tenant.organization.id)
+    )
     assert total == 1

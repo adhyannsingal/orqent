@@ -2,6 +2,7 @@ import { useState } from 'react'
 import { Link } from 'react-router-dom'
 import { MailCheck } from 'lucide-react'
 import { authApi } from '@/api/auth'
+import { ApiError } from '@/api/client'
 import { Button, Field, Input } from '@/components/ui/primitives'
 import { ThemeToggle } from '@/components/ThemeToggle'
 import { AuthShell } from './AuthShell'
@@ -31,11 +32,18 @@ export function ForgotPasswordPage() {
     try {
       await authApi.forgotPassword(email)
       setSent(true)
-    } catch {
-      // Deliberately not `messageOf`: the only failures that reach here are
-      // transport-level, and echoing a backend body would risk surfacing
-      // something account-specific if the API ever changed.
-      setError('Could not reach the server. Please try again.')
+    } catch (caught) {
+      // A 429 is the one backend failure worth showing here. Its message is
+      // fixed and account-independent ("Too many requests…"), so surfacing it
+      // tells the user why nothing happened without telling them — or anyone
+      // watching — whether the address has an account. Every other failure is
+      // reported as transport trouble rather than echoed, so a future backend
+      // change cannot leak something account-specific through this page.
+      setError(
+        caught instanceof ApiError && caught.status === 429
+          ? caught.message
+          : 'Could not reach the server. Please try again.',
+      )
     } finally {
       setBusy(false)
     }
