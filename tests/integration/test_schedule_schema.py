@@ -363,6 +363,19 @@ async def test_one_node_cannot_have_two_schedules(session: AsyncSession) -> None
 
 
 # --- Cascades ----------------------------------------------------------------
+#
+# Scoped to the schedule each test created. An unscoped ``COUNT(*) == 0`` only
+# holds on an empty database, and says nothing about *which* row went — it
+# would pass just as happily if the schedule had never been written. Asserting
+# the row is present and then gone proves the cascade instead.
+
+
+async def _schedule_exists(session: AsyncSession, schedule_id: int) -> bool:
+    return (
+        await session.scalar(
+            select(func.count()).select_from(Schedule).where(Schedule.id == schedule_id)
+        )
+    ) == 1
 
 
 async def test_deleting_the_node_deletes_the_schedule(session: AsyncSession) -> None:
@@ -370,11 +383,12 @@ async def test_deleting_the_node_deletes_the_schedule(session: AsyncSession) -> 
 
     organization = await _organization(session)
     node = await _schedule_node(session, organization)
-    await _schedule(session, node, organization, due=NOW)
+    schedule = await _schedule(session, node, organization, due=NOW)
+    assert await _schedule_exists(session, schedule.id)
 
     await session.execute(WorkflowNode.__table__.delete().where(WorkflowNode.id == node.id))
 
-    assert await session.scalar(select(func.count()).select_from(Schedule)) == 0
+    assert not await _schedule_exists(session, schedule.id)
 
 
 async def test_deleting_the_workflow_deletes_the_schedule(session: AsyncSession) -> None:
@@ -383,7 +397,8 @@ async def test_deleting_the_workflow_deletes_the_schedule(session: AsyncSession)
 
     organization = await _organization(session)
     node = await _schedule_node(session, organization)
-    await _schedule(session, node, organization, due=NOW)
+    schedule = await _schedule(session, node, organization, due=NOW)
+    assert await _schedule_exists(session, schedule.id)
     version = await session.get(WorkflowVersion, node.workflow_version_id)
     assert version is not None
 
@@ -398,13 +413,14 @@ async def test_deleting_the_workflow_deletes_the_schedule(session: AsyncSession)
 
     await session.execute(Workflow.__table__.delete().where(Workflow.id == version.workflow_id))
 
-    assert await session.scalar(select(func.count()).select_from(Schedule)) == 0
+    assert not await _schedule_exists(session, schedule.id)
 
 
 async def test_deleting_the_organization_deletes_its_schedules(session: AsyncSession) -> None:
     organization = await _organization(session)
     node = await _schedule_node(session, organization)
-    await _schedule(session, node, organization, due=NOW)
+    schedule = await _schedule(session, node, organization, due=NOW)
+    assert await _schedule_exists(session, schedule.id)
 
     version = await session.get(WorkflowVersion, node.workflow_version_id)
     assert version is not None
@@ -415,7 +431,7 @@ async def test_deleting_the_organization_deletes_its_schedules(session: AsyncSes
 
     await session.execute(Organization.__table__.delete().where(Organization.id == organization.id))
 
-    assert await session.scalar(select(func.count()).select_from(Schedule)) == 0
+    assert not await _schedule_exists(session, schedule.id)
 
 
 # --- Precision ---------------------------------------------------------------

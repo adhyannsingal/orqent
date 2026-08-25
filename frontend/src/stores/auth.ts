@@ -1,7 +1,10 @@
 import { create } from 'zustand'
 import { authApi } from '@/api/auth'
 import {
-  clearTokens, getRefreshToken, setAccessToken, setRefreshToken, setUnauthenticatedHandler,
+  clearAccessToken,
+  refreshSession,
+  setAccessToken,
+  setUnauthenticatedHandler,
 } from '@/api/client'
 import type { CurrentUser } from '@/types/api'
 
@@ -21,51 +24,63 @@ export const useAuth = create<AuthState>((set) => ({
   initializing: true,
 
   login: async (email, password) => {
-    const pair = await authApi.login(email, password)
-    setAccessToken(pair.access_token)
-    setRefreshToken(pair.refresh_token)
+    // The refresh token is not in this response: the backend set it as an
+    // HttpOnly cookie, and the browser is already holding it.
+    const issued = await authApi.login(email, password)
+    setAccessToken(issued.access_token)
     set({ user: await authApi.me() })
   },
 
   register: async (email, password, organizationName) => {
+    // Registration does not authenticate on its own — it returns a user, not a
+    // session — so it is followed by a real login, which is what establishes
+    // the cookie. Unchanged by AH3 beyond where the refresh token now lives.
     await authApi.register(email, password, organizationName)
-    const pair = await authApi.login(email, password)
-    setAccessToken(pair.access_token)
-    setRefreshToken(pair.refresh_token)
+    const issued = await authApi.login(email, password)
+    setAccessToken(issued.access_token)
     set({ user: await authApi.me() })
   },
 
   logout: async () => {
-    const refresh = getRefreshToken()
-    // Revoking server-side is best effort; the local session ends either way.
-    if (refresh) await authApi.logout(refresh).catch(() => undefined)
-    clearTokens()
+    // Now a genuine server call rather than a courtesy: only the backend can
+    // revoke the family and delete the HttpOnly cookie. Still best effort, so
+    // an offline user is not trapped in a session they asked to leave — but if
+    // it fails, the cookie survives and a reload would restore the session,
+    // which is the honest consequence of the server owning session state.
+    await authApi.logout().catch(() => undefined)
+    clearAccessToken()
     set({ user: null })
   },
 
   /**
-   * Re-establish a session on load from the persisted refresh token.
+   * Re-establish a session on load, from the HttpOnly refresh cookie.
    *
    * The access token is deliberately not persisted, so this exchange is what
-   * makes a reload survivable at all.
+   * makes a reload survivable at all. There is nothing to check first: the
+   * cookie is invisible to this code, so the only way to ask "am I still
+   * signed in?" is to try.
+   *
+   * **Goes through `refreshSession`, not a bare API call.** That routes it
+   * through the same in-flight deduplication the 401 path uses, and it is
+   * load-bearing rather than tidy: React's StrictMode invokes this effect
+   * twice in development, and two independent refreshes would carry the *same*
+   * cookie. The first rotates it; the second is then a replay, which the
+   * backend correctly treats as a stolen token and answers by revoking the
+   * whole family — logging the user out on every reload. Sharing one request
+   * makes the second caller await the first's result instead.
    */
   restore: async () => {
-    const refresh = getRefreshToken()
-    if (!refresh) return set({ initializing: false })
-    try {
-      const pair = await authApi.refreshPair(refresh)
-      setAccessToken(pair.access_token)
-      setRefreshToken(pair.refresh_token)
+    if (await refreshSession()) {
       set({ user: await authApi.me(), initializing: false })
-    } catch {
-      clearTokens()
-      set({ user: null, initializing: false })
+      return
     }
+    clearAccessToken()
+    set({ user: null, initializing: false })
   },
 }))
 
 // A 401 that survives one refresh ends the session, wherever it happened.
 setUnauthenticatedHandler(() => {
-  clearTokens()
+  clearAccessToken()
   useAuth.setState({ user: null })
 })

@@ -14,15 +14,24 @@ here would buy little.
 
 from __future__ import annotations
 
+from http.cookies import SimpleCookie
+
 import pytest
+from fastapi import FastAPI
+from httpx import ASGITransport, AsyncClient
 from sqlalchemy import func, select
 from sqlalchemy import update as sql_update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from app.api.deps import get_auth_service
+from app.core.config import Environment, Settings
 from app.domain.errors import AuthenticationError, ConflictError
 from app.domain.value_objects.token import TokenType
 from app.domain.value_objects.token_pair import TokenPair
 from app.infrastructure.db.models.organization import Organization
+from app.infrastructure.db.models.password_reset_token import (
+    PasswordResetToken as PasswordResetTokenModel,
+)
 from app.infrastructure.db.models.refresh_token import RefreshToken as RefreshTokenModel
 from app.infrastructure.db.models.user import User as UserModel
 from app.infrastructure.db.unit_of_work import SqlAlchemyUnitOfWork
@@ -30,12 +39,17 @@ from app.infrastructure.repositories.refresh_token_repository import RefreshToke
 from app.infrastructure.security.password_hasher import Argon2PasswordHasher
 from app.infrastructure.security.token_hashing import hash_token
 from app.infrastructure.security.token_service import JwtTokenService
+from app.main import create_app
 from app.services.auth_service import DEFAULT_ROLE, AuthService
+from tests.unit.fakes import FakePasswordResetNotifier
 
 pytestmark = pytest.mark.integration
 
 SECRET = "integration-test-secret-long-enough-32"
 PASSWORD = "correct horse battery staple"
+RESET_URL_BASE = "https://app.example.com/reset-password"
+RESET_TTL_SECONDS = 1_800
+NEW_PASSWORD = "a whole new passphrase 9!"
 
 
 @pytest.fixture
@@ -49,9 +63,15 @@ def token_service() -> JwtTokenService:
 
 
 @pytest.fixture
+def notifier() -> FakePasswordResetNotifier:
+    return FakePasswordResetNotifier()
+
+
+@pytest.fixture
 def service(
     session_factory: async_sessionmaker[AsyncSession],
     token_service: JwtTokenService,
+    notifier: FakePasswordResetNotifier,
 ) -> AuthService:
     # No role seeding here: migration 0003 populates the catalog, so these tests
     # run against the same rows production has.
@@ -59,6 +79,9 @@ def service(
         lambda: SqlAlchemyUnitOfWork(session_factory),
         Argon2PasswordHasher(),
         token_service,
+        notifier,
+        password_reset_ttl_seconds=RESET_TTL_SECONDS,
+        password_reset_url_base=RESET_URL_BASE,
     )
 
 
@@ -252,19 +275,35 @@ async def test_refresh_is_rejected_for_a_deactivated_user(
 
 
 async def test_logout_revokes_every_token_in_the_family(
-    service: AuthService, session: AsyncSession
+    service: AuthService, session: AsyncSession, token_service: JwtTokenService
 ) -> None:
     original = await _login(service)
-    await service.refresh(original.refresh_token)
+    rotated = await service.refresh(original.refresh_token)
 
     await service.logout(original.refresh_token)
 
-    live = await session.scalar(
-        select(func.count())
-        .select_from(RefreshTokenModel)
-        .where(RefreshTokenModel.revoked_at.is_(None))
+    # Scoped to this login's own family, resolved through the repository the
+    # rotation tests already use. An unscoped `COUNT(*) WHERE revoked_at IS
+    # NULL` only holds on an empty database: any unrelated account with a live
+    # session fails it, which says nothing about whether logout works.
+    stored = await RefreshTokenRepository(session).get_by_jti(
+        token_service.decode(original.refresh_token).jti
     )
-    assert live == 0
+    assert stored is not None
+    family = (
+        await session.scalars(
+            select(RefreshTokenModel).where(RefreshTokenModel.family_id == stored.family_id)
+        )
+    ).all()
+
+    # Naming both members is what keeps this a proof of *every* token rather
+    # than of some token: asserting only "none of them are live" would pass
+    # just as well against a family that turned out to be empty.
+    assert {row.jti for row in family} == {
+        token_service.decode(original.refresh_token).jti,
+        token_service.decode(rotated.refresh_token).jti,
+    }
+    assert all(row.revoked_at is not None for row in family)
 
 
 async def test_logout_twice_succeeds(service: AuthService) -> None:
@@ -281,3 +320,384 @@ async def test_logout_prevents_further_refresh(service: AuthService) -> None:
 
     with pytest.raises(AuthenticationError):
         await service.refresh(original.refresh_token)
+
+
+# --- Login: account enumeration over HTTP ------------------------------------
+#
+# The unit endpoint tests substitute the service, so they can show the *route*
+# is generic but not that the real service's two failure paths are
+# indistinguishable. These run the genuine article — real MySQL, real Argon2 —
+# through the real app, which is the only place the claim can actually be made.
+
+
+def _app(service: AuthService) -> FastAPI:
+    application = create_app(
+        Settings(
+            _env_file=None,
+            environment=Environment.TEST,
+            log_json=False,
+            database_url=None,
+            jwt_secret_key=SECRET,
+        )
+    )
+    application.dependency_overrides[get_auth_service] = lambda: service
+    return application
+
+
+async def test_unknown_email_and_wrong_password_are_byte_equivalent_over_http(
+    service: AuthService,
+) -> None:
+    await service.register(
+        email="founder@example.com", password=PASSWORD, organization_name="Acme Inc"
+    )
+
+    async with AsyncClient(
+        transport=ASGITransport(app=_app(service)), base_url="http://test"
+    ) as client:
+        unknown = await client.post(
+            "/api/v1/auth/login",
+            json={"email": "nobody@example.com", "password": PASSWORD},
+        )
+        wrong = await client.post(
+            "/api/v1/auth/login",
+            json={"email": "founder@example.com", "password": "not the password"},
+        )
+
+    assert unknown.status_code == wrong.status_code == 401
+
+    # Correlation IDs are request-specific by design; everything else must match
+    # exactly. Comparing whole bodies rather than just the message is what stops
+    # a future field — an error subcode, a hint, a retry-after — from quietly
+    # becoming an oracle without anyone noticing.
+    unknown_body, wrong_body = unknown.json(), wrong.json()
+    unknown_body["error"].pop("correlation_id")
+    wrong_body["error"].pop("correlation_id")
+    assert unknown_body == wrong_body
+    assert unknown_body["error"]["message"] == "Either email or password is incorrect."
+    assert unknown_body["error"]["code"] == "authentication_error"
+
+
+async def test_login_over_http_leaks_no_account_hint_in_headers(
+    service: AuthService,
+) -> None:
+    # A differing header — a length, a cache directive, a custom marker — would
+    # enumerate accounts just as well as a differing body.
+    await service.register(
+        email="founder@example.com", password=PASSWORD, organization_name="Acme Inc"
+    )
+
+    async with AsyncClient(
+        transport=ASGITransport(app=_app(service)), base_url="http://test"
+    ) as client:
+        unknown = await client.post(
+            "/api/v1/auth/login",
+            json={"email": "nobody@example.com", "password": PASSWORD},
+        )
+        wrong = await client.post(
+            "/api/v1/auth/login",
+            json={"email": "founder@example.com", "password": "not the password"},
+        )
+
+    ignored = {"x-correlation-id", "date"}
+    assert {k: v for k, v in unknown.headers.items() if k.lower() not in ignored} == {
+        k: v for k, v in wrong.headers.items() if k.lower() not in ignored
+    }
+
+
+# --- Password reset, against the real schema --------------------------------
+
+
+def _issued_token(notifier: FakePasswordResetNotifier) -> str:
+    return notifier.sent[-1][1].rsplit("token=", 1)[1]
+
+
+async def test_forgot_password_stores_only_a_digest_in_mysql(
+    service: AuthService, session: AsyncSession, notifier: FakePasswordResetNotifier
+) -> None:
+    # The unit tests prove the service hashes; this proves what actually lands
+    # in the column, which is the claim that matters if the database leaks.
+    user = await service.register(
+        email="founder@example.com", password=PASSWORD, organization_name="Acme Inc"
+    )
+
+    await service.forgot_password(email="founder@example.com")
+
+    token = _issued_token(notifier)
+    rows = (
+        await session.scalars(
+            select(PasswordResetTokenModel).where(PasswordResetTokenModel.user_id == user.id)
+        )
+    ).all()
+    assert len(rows) == 1
+    assert rows[0].token_hash == hash_token(token)
+    assert rows[0].consumed_at is None
+    assert token not in rows[0].token_hash
+
+
+async def test_reset_ends_every_session_and_swaps_the_password(
+    service: AuthService, session: AsyncSession, notifier: FakePasswordResetNotifier
+) -> None:
+    """The whole AH2 lifecycle against real MySQL and real Argon2.
+
+    Two logins, a reset, and then the three things that must all be true at
+    once: the old sessions are dead, the old password is dead, and the new one
+    works. Any of the three passing alone would be a reset that only looked
+    like one.
+    """
+
+    user = await service.register(
+        email="founder@example.com", password=PASSWORD, organization_name="Acme Inc"
+    )
+    first = await service.login(email="founder@example.com", password=PASSWORD)
+    second = await service.login(email="founder@example.com", password=PASSWORD)
+
+    await service.forgot_password(email="founder@example.com")
+    await service.reset_password(token=_issued_token(notifier), new_password=NEW_PASSWORD)
+
+    # Scoped to this user, so unrelated rows in the database cannot make the
+    # assertion pass or fail for the wrong reason.
+    live = await session.scalar(
+        select(func.count())
+        .select_from(RefreshTokenModel)
+        .where(RefreshTokenModel.user_id == user.id, RefreshTokenModel.revoked_at.is_(None))
+    )
+    assert live == 0
+
+    for dead in (first, second):
+        with pytest.raises(AuthenticationError):
+            await service.refresh(dead.refresh_token)
+
+    with pytest.raises(AuthenticationError):
+        await service.login(email="founder@example.com", password=PASSWORD)
+
+    assert await service.login(email="founder@example.com", password=NEW_PASSWORD)
+
+
+async def test_reset_password_verifies_against_real_argon2(
+    service: AuthService, session: AsyncSession, notifier: FakePasswordResetNotifier
+) -> None:
+    user = await service.register(
+        email="founder@example.com", password=PASSWORD, organization_name="Acme Inc"
+    )
+    await service.forgot_password(email="founder@example.com")
+
+    await service.reset_password(token=_issued_token(notifier), new_password=NEW_PASSWORD)
+
+    # Re-read through this test's own session: the object `register` returned
+    # belongs to the service's unit of work, which has since closed.
+    stored = await session.scalar(select(UserModel).where(UserModel.id == user.id))
+    assert stored is not None
+    assert stored.password_hash.startswith("$argon2id$")
+    assert Argon2PasswordHasher().verify_password(NEW_PASSWORD, stored.password_hash) is True
+    assert Argon2PasswordHasher().verify_password(PASSWORD, stored.password_hash) is False
+
+
+async def test_supersession_holds_against_the_real_unique_index(
+    service: AuthService, session: AsyncSession, notifier: FakePasswordResetNotifier
+) -> None:
+    # Three requests, three distinct digests, one survivor. Exercises the real
+    # unique constraint on token_hash rather than a list membership test.
+    user = await service.register(
+        email="founder@example.com", password=PASSWORD, organization_name="Acme Inc"
+    )
+    for _ in range(3):
+        await service.forgot_password(email="founder@example.com")
+    newest = _issued_token(notifier)
+
+    rows = (
+        await session.scalars(
+            select(PasswordResetTokenModel).where(PasswordResetTokenModel.user_id == user.id)
+        )
+    ).all()
+    outstanding = [row for row in rows if row.consumed_at is None]
+    assert len(rows) == 3
+    assert len({row.token_hash for row in rows}) == 3
+    assert [row.token_hash for row in outstanding] == [hash_token(newest)]
+
+
+async def test_forgot_password_over_http_is_identical_for_known_and_unknown(
+    service: AuthService,
+) -> None:
+    # The decisive enumeration test: real service, real MySQL, real Argon2,
+    # through the real app. One address has an account and one does not.
+    await service.register(
+        email="founder@example.com", password=PASSWORD, organization_name="Acme Inc"
+    )
+
+    async with AsyncClient(
+        transport=ASGITransport(app=_app(service)), base_url="http://test"
+    ) as client:
+        known = await client.post(
+            "/api/v1/auth/forgot-password", json={"email": "founder@example.com"}
+        )
+        unknown = await client.post(
+            "/api/v1/auth/forgot-password", json={"email": "nobody@example.com"}
+        )
+
+    assert known.status_code == unknown.status_code == 200
+    assert known.json() == unknown.json()
+
+    ignored = {"x-correlation-id", "date"}
+    assert {k: v for k, v in known.headers.items() if k.lower() not in ignored} == {
+        k: v for k, v in unknown.headers.items() if k.lower() not in ignored
+    }
+
+
+async def test_forgot_password_over_http_never_returns_the_token(
+    service: AuthService, notifier: FakePasswordResetNotifier
+) -> None:
+    await service.register(
+        email="founder@example.com", password=PASSWORD, organization_name="Acme Inc"
+    )
+
+    async with AsyncClient(
+        transport=ASGITransport(app=_app(service)), base_url="http://test"
+    ) as client:
+        response = await client.post(
+            "/api/v1/auth/forgot-password", json={"email": "founder@example.com"}
+        )
+
+    # A grant really was issued, so this is a genuine opportunity to leak it.
+    assert notifier.sent
+    assert _issued_token(notifier) not in response.text
+
+
+# --- AH3: the refresh cookie, end to end over HTTP ---------------------------
+#
+# The unit endpoint tests substitute the service, so they prove the *route*
+# sets and reads a cookie. These run the genuine article — real MySQL, real
+# Argon2, real rotation — through the real app, which is the only place the
+# cookie and the server-side token row can be shown to agree.
+
+REFRESH_COOKIE = "orqent_refresh"
+
+
+def _cookie_value(response: object) -> str | None:
+    """The refresh cookie's value, or ``None`` if it was cleared or absent."""
+
+    jar = SimpleCookie()
+    header = response.headers.get("set-cookie")  # type: ignore[attr-defined]
+    if header is None:
+        return None
+    jar.load(header)
+    return jar[REFRESH_COOKIE].value or None
+
+
+async def test_the_cookie_survives_a_full_login_refresh_logout_cycle(
+    service: AuthService,
+) -> None:
+    """The AH3 lifecycle, with the browser holding the credential throughout.
+
+    `AsyncClient` keeps a cookie jar, so this exercises what a browser actually
+    does: the refresh token is never read, stored, or resent by the caller —
+    it is attached automatically and rotated in place.
+    """
+
+    await service.register(
+        email="founder@example.com", password=PASSWORD, organization_name="Acme Inc"
+    )
+
+    async with AsyncClient(
+        transport=ASGITransport(app=_app(service)), base_url="http://test"
+    ) as client:
+        login = await client.post(
+            "/api/v1/auth/login",
+            json={"email": "founder@example.com", "password": PASSWORD},
+        )
+        assert login.status_code == 200
+        first = _cookie_value(login)
+        assert first is not None
+        # The token is in the jar and nowhere else.
+        assert first not in login.text
+        assert "refresh_token" not in login.json()
+
+        rotated = await client.post("/api/v1/auth/refresh")
+        assert rotated.status_code == 200
+        second = _cookie_value(rotated)
+        assert second is not None and second != first
+        assert rotated.json()["access_token"]
+
+        # The access token actually works, which is what makes the exchange
+        # worth performing at all.
+        me = await client.get(
+            "/api/v1/auth/me",
+            headers={"Authorization": f"Bearer {rotated.json()['access_token']}"},
+        )
+        assert me.status_code == 200
+
+        logout = await client.post("/api/v1/auth/logout")
+        assert logout.status_code == 204
+        assert _cookie_value(logout) is None
+
+        # The jar is now empty, so this is a genuine "no cookie" request.
+        assert (await client.post("/api/v1/auth/refresh")).status_code == 401
+
+
+async def test_replaying_a_rotated_cookie_is_caught_by_reuse_detection(
+    service: AuthService,
+) -> None:
+    """Rotation semantics are unchanged by the transport.
+
+    The browser cannot do this — the cookie was overwritten — but an attacker
+    holding a captured value can, which is exactly whom reuse detection is for.
+    Sending the superseded value by hand is the only way to test it.
+    """
+
+    await service.register(
+        email="founder@example.com", password=PASSWORD, organization_name="Acme Inc"
+    )
+
+    async with AsyncClient(
+        transport=ASGITransport(app=_app(service)), base_url="http://test"
+    ) as client:
+        login = await client.post(
+            "/api/v1/auth/login",
+            json={"email": "founder@example.com", "password": PASSWORD},
+        )
+        original = _cookie_value(login)
+        rotated = await client.post("/api/v1/auth/refresh")
+        successor = _cookie_value(rotated)
+        assert original is not None and successor is not None
+
+        replay = await client.post("/api/v1/auth/refresh", cookies={REFRESH_COOKIE: original})
+        assert replay.status_code == 401
+
+        # The family died with the replay, so even the legitimate successor is
+        # now refused — unchanged from before AH3, and the point of the design.
+        assert (
+            await client.post("/api/v1/auth/refresh", cookies={REFRESH_COOKIE: successor})
+        ).status_code == 401
+
+
+async def test_a_password_reset_makes_the_existing_cookie_useless(
+    service: AuthService, notifier: FakePasswordResetNotifier
+) -> None:
+    """AH2's revocation still reaches a session held in a cookie.
+
+    The browser keeps the cookie — the server cannot reach into a browser it is
+    not currently talking to — so this asserts the honest property: the cookie
+    is still *present* and no longer *works*. Server state is authoritative,
+    and the next request is when the client finds out.
+    """
+
+    await service.register(
+        email="founder@example.com", password=PASSWORD, organization_name="Acme Inc"
+    )
+
+    async with AsyncClient(
+        transport=ASGITransport(app=_app(service)), base_url="http://test"
+    ) as client:
+        login = await client.post(
+            "/api/v1/auth/login",
+            json={"email": "founder@example.com", "password": PASSWORD},
+        )
+        # Held by the client's jar, and about to become worthless.
+        assert _cookie_value(login) is not None
+
+        await service.forgot_password(email="founder@example.com")
+        await service.reset_password(token=_issued_token(notifier), new_password=NEW_PASSWORD)
+
+        rejected = await client.post("/api/v1/auth/refresh")
+        assert rejected.status_code == 401
+        # And the useless cookie is taken off the client's hands.
+        assert _cookie_value(rejected) is None

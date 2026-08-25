@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from enum import StrEnum
 from functools import lru_cache
+from typing import Literal
 
 from pydantic import AliasChoices, Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -67,6 +68,65 @@ class Settings(BaseSettings):
     # Refresh tokens are long-lived; revocability comes from the server-side
     # hashed store with rotation, added in Phase 3B.
     refresh_token_ttl_seconds: int = Field(default=2_592_000, gt=0)  # 30 days
+
+    # --- Password reset (AH2) ---
+    # Far shorter than either token above, and for a different reason: a reset
+    # link grants the power to *change* the password, and it travels through
+    # email — a channel the platform does not control and cannot revoke. The
+    # window is sized for someone acting on a link they just asked for.
+    password_reset_token_ttl_seconds: int = Field(default=1_800, gt=0)  # 30 minutes
+    # Where the reset link points: the frontend route that collects the new
+    # password. Configured rather than derived because the API and the UI need
+    # not share an origin, and hard-coding a development address into service
+    # logic would ship it to production. ``None`` means resets cannot be sent —
+    # the endpoint stays enumeration-safe either way.
+    password_reset_url_base: str | None = None
+
+    # --- Refresh cookie (AH3) ---
+    # The refresh token lives in an HttpOnly cookie rather than in storage the
+    # browser's JavaScript can read. The name is not a secret — it is the only
+    # part of the cookie anyone is meant to see.
+    refresh_cookie_name: str = Field(default="orqent_refresh", min_length=1)
+    # `Secure` refuses to send the cookie over plain HTTP. False by default so
+    # local development on http://localhost works at all; the validator below
+    # makes shipping that default to production impossible.
+    refresh_cookie_secure: bool = False
+    # `Lax` is the deliberate choice, not the lazy one. Orqent's frontend and
+    # API are same-*site* in every supported deployment — a Vite proxy in
+    # development, a shared registrable domain (app./api.) in production — and
+    # SameSite is a site-level rule that ignores the port. Lax therefore sends
+    # the cookie on the app's own requests while blocking the cross-site POSTs
+    # that CSRF depends on. `none` exists for a genuinely cross-site
+    # deployment and is refused without `Secure`.
+    refresh_cookie_samesite: Literal["lax", "strict", "none"] = "lax"
+    # Left unset for host-only cookies, which is what localhost needs and what
+    # a single-host deployment wants. Set it only to share one cookie across
+    # sibling subdomains, which widens who can receive it.
+    refresh_cookie_domain: str | None = None
+
+    # --- Rate limiting (AH4) ---
+    # Master switch. On by default; tests that are not about limiting turn it
+    # off rather than tiptoeing around the thresholds.
+    rate_limit_enabled: bool = True
+    # "N per window-seconds", per client, per endpoint group. Values are
+    # deliberately per-endpoint: a login attempt and a webhook delivery are not
+    # the same kind of event and one number for both would be wrong twice.
+    rate_limit_login: str = "8/60"
+    rate_limit_register: str = "5/60"
+    rate_limit_forgot_password: str = "5/3600"
+    rate_limit_reset_password: str = "8/60"
+    # Generous: a browser refreshes on every reload and on every expiry, and a
+    # limit that bit during ordinary use would look like a broken session.
+    rate_limit_refresh: str = "60/60"
+    # Much higher again, and the one most likely to need tuning per deployment:
+    # a busy integration can legitimately deliver continuously.
+    rate_limit_webhook: str = "120/60"
+    # How many reverse proxies sit in front of this app. **Zero means never
+    # trust a forwarded header**, which is the only safe default: any client can
+    # send `X-Forwarded-For`, so honouring it without a known hop count lets an
+    # attacker forge a fresh identity per request and bypass every limit here.
+    # Set it to the real number of proxies you control, and only that.
+    trusted_proxy_hops: int = Field(default=0, ge=0)
 
     # --- Worker (Phase 8, M5) ---
     # How long a claimed task is owned before another worker may reclaim it.
@@ -149,6 +209,60 @@ class Settings(BaseSettings):
     @property
     def is_production(self) -> bool:
         return self.environment is Environment.PRODUCTION
+
+    @property
+    def refresh_cookie_path(self) -> str:
+        """The narrowest path that still covers every endpoint using the cookie.
+
+        Login sets it, refresh rotates it, logout clears it — all three live
+        under ``/auth``, so the browser never attaches this credential to a
+        workflow, run, or document request. Scoping it to ``/auth/refresh``
+        alone would be narrower still and would break logout.
+        """
+
+        return f"{self.api_v1_prefix}/auth"
+
+    @model_validator(mode="after")
+    def _cookie_settings_must_be_safe(self) -> Settings:
+        """Refuse the two cookie configurations that are silently insecure.
+
+        ``SameSite=None`` without ``Secure`` is rejected by every current
+        browser, so the cookie would simply never be stored — a failure that
+        looks like "sessions don't persist" rather than like a misconfiguration.
+        Shipping ``Secure=False`` to production would send a refresh token over
+        plain HTTP, which is the whole thing this milestone moved it away from.
+        """
+
+        if self.refresh_cookie_samesite == "none" and not self.refresh_cookie_secure:
+            raise ValueError(
+                "refresh_cookie_samesite='none' requires refresh_cookie_secure=True; "
+                "browsers reject the combination and the cookie would never be stored."
+            )
+        if self.is_production and not self.refresh_cookie_secure:
+            raise ValueError(
+                "refresh_cookie_secure must be True in production, "
+                "or the refresh token is sent over plain HTTP."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _credentialed_cors_cannot_be_open(self) -> Settings:
+        """Refuse a wildcard origin, because credentials are always allowed.
+
+        ``allow_credentials=True`` with ``Access-Control-Allow-Origin: *`` is
+        the combination that lets any site on the internet make credentialed
+        requests to this API. Browsers refuse to *honour* it, but the danger is
+        the configuration existing at all: a reflected-origin workaround added
+        later to "fix" the resulting breakage would be a real vulnerability.
+        Refusing here means the mistake never reaches middleware.
+        """
+
+        if "*" in self.cors_origins:
+            raise ValueError(
+                "cors_origins must not contain '*': the API allows credentials, "
+                "and a wildcard origin with credentials is never valid."
+            )
+        return self
 
     @model_validator(mode="after")
     def _heartbeat_must_outpace_expiry(self) -> Settings:

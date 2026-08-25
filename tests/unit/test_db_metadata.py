@@ -14,6 +14,7 @@ def test_exactly_the_expected_tables_exist() -> None:
     # tests/unit/test_refresh_token_model.py.
     assert set(TABLES) == {
         "organizations",
+        "password_reset_tokens",
         "users",
         "roles",
         "user_roles",

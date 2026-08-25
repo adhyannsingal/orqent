@@ -375,6 +375,22 @@ async def test_a_run_cannot_reference_a_version_that_does_not_exist(
 
 
 # --- Cascades ---------------------------------------------------------------
+#
+# Every assertion below is scoped to the rows the test itself created. An
+# unscoped ``COUNT(*) == 0`` only holds on an empty database: against one with
+# any unrelated data it fails while saying nothing about the cascade. Scoping
+# also removes a second, quieter weakness — a table-wide count reaching zero
+# says nothing about *which* row went, and would pass just as happily if the
+# row had never been inserted. Each test therefore asserts presence first.
+
+
+async def _count_where(session: AsyncSession, model: type, **equals: int) -> int:
+    """How many rows of ``model`` match every column/value pair given."""
+
+    statement = select(func.count()).select_from(model)
+    for column, value in equals.items():
+        statement = statement.where(getattr(model, column) == value)
+    return (await session.scalar(statement)) or 0
 
 
 async def test_deleting_a_run_cascades_to_its_executions_and_events(
@@ -385,14 +401,15 @@ async def test_deleting_a_run_cascades_to_its_executions_and_events(
     run = await _run(session, organization, workflow, version)
     await _node_execution(session, run, node)
     await _event(session, run, seq=1)
+    run_id = run.id
+    assert await _count_where(session, NodeExecution, run_id=run_id) == 1
+    assert await _count_where(session, RunEvent, run_id=run_id) == 1
 
     await session.delete(run)
     await session.flush()
 
-    executions = await session.scalar(select(func.count()).select_from(NodeExecution))
-    events = await session.scalar(select(func.count()).select_from(RunEvent))
-    assert executions == 0
-    assert events == 0
+    assert await _count_where(session, NodeExecution, run_id=run_id) == 0
+    assert await _count_where(session, RunEvent, run_id=run_id) == 0
 
 
 async def test_deleting_a_workflow_cascades_all_the_way_to_events(
@@ -406,25 +423,26 @@ async def test_deleting_a_workflow_cascades_all_the_way_to_events(
     run = await _run(session, organization, workflow, version)
     await _node_execution(session, run, node)
     await _event(session, run, seq=1)
+    run_id = run.id
+    assert await _count_where(session, Run, id=run_id) == 1
+    assert await _count_where(session, NodeExecution, run_id=run_id) == 1
+    assert await _count_where(session, RunEvent, run_id=run_id) == 1
 
     await session.execute(Workflow.__table__.delete().where(Workflow.id == workflow.id))
 
-    runs = await session.scalar(select(func.count()).select_from(Run))
-    executions = await session.scalar(select(func.count()).select_from(NodeExecution))
-    events = await session.scalar(select(func.count()).select_from(RunEvent))
-    assert runs == 0
-    assert executions == 0
-    assert events == 0
+    assert await _count_where(session, Run, id=run_id) == 0
+    assert await _count_where(session, NodeExecution, run_id=run_id) == 0
+    assert await _count_where(session, RunEvent, run_id=run_id) == 0
 
 
 async def test_deleting_an_organization_cascades_to_its_runs(session: AsyncSession) -> None:
     organization, workflow, version = await _fixture(session)
-    await _run(session, organization, workflow, version)
+    run = await _run(session, organization, workflow, version)
+    assert await _count_where(session, Run, id=run.id) == 1
 
     await session.execute(Organization.__table__.delete().where(Organization.id == organization.id))
 
-    runs = await session.scalar(select(func.count()).select_from(Run))
-    assert runs == 0
+    assert await _count_where(session, Run, id=run.id) == 0
 
 
 # --- Tenancy ----------------------------------------------------------------

@@ -31,6 +31,33 @@ _MIN_PASSWORD_LENGTH = 8
 _MAX_TOKEN_LENGTH = 4096
 
 
+def enforce_password_complexity(value: str) -> str:
+    """Apply the platform's password composition rule, or raise ``ValueError``.
+
+    **The single definition.** Registration and password reset both call it, so
+    the two cannot drift into disagreeing about what a valid password is — a
+    reset flow with a laxer rule would quietly become the way to install a weak
+    password. Login deliberately does not call it: raising the standard must
+    never lock out an account created under the old one.
+
+    "Special" is defined as *not alphanumeric and not whitespace*, evaluated
+    over Unicode rather than an ASCII allowlist. An allowlist would silently
+    reject a legitimate character somebody's keyboard produces, and the
+    complement is both shorter and more permissive in the right direction.
+    """
+
+    missing: list[str] = []
+    if not any(character.isalpha() for character in value):
+        missing.append("a letter")
+    if not any(character.isdigit() for character in value):
+        missing.append("a number")
+    if not any(not character.isalnum() and not character.isspace() for character in value):
+        missing.append("a special character")
+    if missing:
+        raise ValueError(f"Password must include {', '.join(missing)}.")
+    return value
+
+
 class RegisterRequest(BaseModel):
     """Payload for creating an account and its organization."""
 
@@ -38,21 +65,7 @@ class RegisterRequest(BaseModel):
     password: str = Field(min_length=_MIN_PASSWORD_LENGTH, max_length=_MAX_PASSWORD_LENGTH)
     organization_name: str = Field(min_length=1, max_length=255)
 
-    @field_validator("password")
-    @classmethod
-    def _password_must_meet_complexity(cls, value: str) -> str:
-        """Registration policy; login deliberately stays shape-agnostic below."""
-
-        missing: list[str] = []
-        if not any(character.isalpha() for character in value):
-            missing.append("a letter")
-        if not any(character.isdigit() for character in value):
-            missing.append("a number")
-        if not any(not character.isalnum() and not character.isspace() for character in value):
-            missing.append("a special character")
-        if missing:
-            raise ValueError(f"Password must include {', '.join(missing)}.")
-        return value
+    _check_password = field_validator("password")(enforce_password_complexity)
 
 
 class LoginRequest(BaseModel):
@@ -89,25 +102,57 @@ class CurrentUserResponse(BaseModel):
     roles: list[str]
 
 
-class RefreshRequest(BaseModel):
-    """Payload carrying a refresh token.
+class AccessTokenResponse(BaseModel):
+    """A freshly issued access token.
 
-    Used by both ``/auth/refresh`` and ``/auth/logout``: each presents the same
-    credential, and giving them separate identical models would only duplicate
-    the field.
-    """
+    Returned by login *and* refresh, since both hand back the same thing.
 
-    refresh_token: str = Field(min_length=1, max_length=_MAX_TOKEN_LENGTH)
+    **The refresh token is deliberately absent** (AH3). It travels in an
+    HttpOnly cookie the backend sets, so putting it here too would defeat the
+    point entirely: a value in the JSON body is a value JavaScript has read.
+    There is no ``refresh_token`` field to populate, which is a stronger
+    guarantee than remembering not to populate one.
 
-
-class TokenPairResponse(BaseModel):
-    """A freshly issued access and refresh token.
-
-    Returned by login *and* refresh, since both hand back the same thing —
-    named for the payload rather than for one of its callers.
+    ``/auth/refresh`` and ``/auth/logout`` take **no request body** for the same
+    reason — the credential comes from the cookie, so a client cannot present an
+    arbitrary refresh token even if it somehow obtained one.
     """
 
     access_token: str
-    refresh_token: str
     token_type: str = "bearer"
     """How the access token must be presented: ``Authorization: Bearer <token>``."""
+
+
+class ForgotPasswordRequest(BaseModel):
+    """Payload for requesting a password-reset link."""
+
+    email: EmailStr
+
+
+class ResetPasswordRequest(BaseModel):
+    """Payload for setting a new password with a reset token.
+
+    ``new_password`` rather than ``password``: the field is unambiguous next to
+    the old one it replaces, and a client that sends the wrong one gets a
+    validation error instead of silently resetting to the current value.
+
+    The same length bounds and the same composition rule as registration, from
+    the one definition above.
+    """
+
+    token: str = Field(min_length=1, max_length=_MAX_TOKEN_LENGTH)
+    new_password: str = Field(min_length=_MIN_PASSWORD_LENGTH, max_length=_MAX_PASSWORD_LENGTH)
+
+    _check_password = field_validator("new_password")(enforce_password_complexity)
+
+
+class MessageResponse(BaseModel):
+    """A bare acknowledgement.
+
+    Used by both password-reset endpoints. Neither has anything to return:
+    forgot-password must not say whether the account exists, and reset-password
+    must not hand back a session — see ``routes.auth`` for why the user is made
+    to sign in again.
+    """
+
+    message: str

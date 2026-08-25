@@ -43,22 +43,29 @@ import asyncio
 import re
 import unicodedata
 from collections.abc import Callable
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
+from urllib.parse import quote
 
 import structlog
 from sqlalchemy.exc import IntegrityError
 
 from app.domain.errors import AuthenticationError, ConflictError, InfrastructureError
 from app.domain.ports.password_hasher import PasswordHasher
+from app.domain.ports.password_reset_notifier import (
+    PasswordResetDeliveryError,
+    PasswordResetNotifier,
+)
 from app.domain.ports.token_service import TokenService
 from app.domain.value_objects.authenticated_user import AuthenticatedUser
 from app.domain.value_objects.token import TokenClaims, TokenType
 from app.domain.value_objects.token_pair import TokenPair
 from app.infrastructure.db.identifiers import new_public_id
 from app.infrastructure.db.models.organization import Organization
+from app.infrastructure.db.models.password_reset_token import PasswordResetToken
 from app.infrastructure.db.models.refresh_token import RefreshToken
 from app.infrastructure.db.models.user import User
 from app.infrastructure.db.unit_of_work import SqlAlchemyUnitOfWork
+from app.infrastructure.security.password_reset_token import new_password_reset_token
 from app.infrastructure.security.token_hashing import hash_token, verify_token_hash
 
 log = structlog.get_logger(__name__)
@@ -71,7 +78,7 @@ DEFAULT_ROLE = "owner"
 # One message for every credential failure — unknown email, wrong password, and
 # disabled account are indistinguishable to the caller. Telling them apart would
 # turn the login form into an account-enumeration oracle.
-_INVALID_CREDENTIALS = "Invalid email or password."
+_INVALID_CREDENTIALS = "Either email or password is incorrect."
 
 # The same idea for the refresh endpoint: unknown, expired, revoked, replayed,
 # and belonging-to-a-disabled-account all read identically from outside. A
@@ -79,6 +86,18 @@ _INVALID_CREDENTIALS = "Invalid email or password."
 # in particular, "this token was replayed" must not be observable, or probing
 # would reveal which stolen tokens are still live.
 _INVALID_REFRESH = "Invalid or expired refresh token."
+
+# The one answer `forgot_password` ever gives. It is phrased conditionally
+# because the server genuinely will not say which case it is in: an address with
+# an account and one without must be indistinguishable, or the endpoint becomes
+# a bulk membership oracle that needs no password guessing at all.
+_RESET_REQUESTED = "If an account exists for that email, a password reset link has been sent."
+
+# The same idea for redeeming a link: unknown, expired, already used, and
+# superseded by a newer request all read identically. A client cannot act on the
+# difference, and telling them apart would confirm to an attacker holding a
+# stale token that it was once real and whose it was.
+_INVALID_RESET = "Password reset link is invalid or expired."
 
 # A real Argon2id hash of a random throwaway string, used only to spend the same
 # CPU time verifying a password for an email that does not exist as for one that
@@ -136,6 +155,10 @@ class AuthService:
         unit_of_work_factory: Callable[[], SqlAlchemyUnitOfWork],
         password_hasher: PasswordHasher,
         token_service: TokenService,
+        password_reset_notifier: PasswordResetNotifier,
+        *,
+        password_reset_ttl_seconds: int,
+        password_reset_url_base: str | None,
     ) -> None:
         """Take a *factory* for units of work, not a unit of work.
 
@@ -148,6 +171,9 @@ class AuthService:
         self._unit_of_work_factory = unit_of_work_factory
         self._password_hasher = password_hasher
         self._token_service = token_service
+        self._password_reset_notifier = password_reset_notifier
+        self._password_reset_ttl_seconds = password_reset_ttl_seconds
+        self._password_reset_url_base = password_reset_url_base
 
     async def register(
         self,
@@ -366,7 +392,150 @@ class AuthService:
             # undo either way.
             await uow.commit()
 
+    async def forgot_password(self, *, email: str) -> None:
+        """Issue a reset link for ``email``, if that address can receive one.
+
+        Returns ``None`` in every case, including the ones where nothing
+        happened. That is the whole design: the caller is told the request was
+        accepted and never whether it did anything, so the endpoint cannot be
+        used to test which addresses have accounts.
+
+        Issuing a link **supersedes** any the user already holds. Only the
+        newest link works, which bounds a token's real lifetime by the next
+        request as well as by its own expiry, and removes the question of which
+        of three emails in an inbox is the live one.
+
+        Raises nothing a client can see. A delivery failure is logged and
+        swallowed, because surfacing it would confirm the address exists.
+        """
+
+        normalized_email = self._normalize_email(email)
+
+        async with self._unit_of_work_factory() as uow:
+            user = await uow.users.get_by_email(normalized_email)
+
+            # A disabled account is treated exactly as a missing one. Letting a
+            # deactivated user reset their way back in would make deactivation
+            # advisory, and answering differently would leak that the address is
+            # known.
+            if user is None or not user.is_active:
+                return
+
+            now = datetime.now(UTC)
+            # Supersede first, then insert: the new grant must not be caught by
+            # the bulk consume that retires the old ones. Both statements are in
+            # this transaction, so there is no instant at which the user has no
+            # usable link because the old ones died before the new one existed.
+            superseded = await uow.password_reset_tokens.consume_outstanding_for_user(user.id, now)
+
+            token = new_password_reset_token()
+            await uow.password_reset_tokens.add(
+                PasswordResetToken(
+                    user_id=user.id,
+                    # Only the digest is stored; the token itself is never
+                    # persisted, exactly as with refresh tokens.
+                    token_hash=hash_token(token),
+                    expires_at=now + timedelta(seconds=self._password_reset_ttl_seconds),
+                )
+            )
+
+            await uow.commit()
+            recipient = user.email
+            user_public_id = user.public_id
+
+        log.info("password_reset_requested", user=user_public_id, superseded_tokens=superseded)
+
+        # Delivered *after* the commit and outside the transaction: a slow or
+        # unreachable provider must not hold a database lock, and a grant that
+        # was written but not delivered is recoverable by asking again, whereas
+        # one delivered but not written is a link that would never work.
+        await self._deliver_reset_link(recipient, token)
+
+    async def reset_password(self, *, token: str, new_password: str) -> None:
+        """Redeem a reset link and set a new password.
+
+        Every session the user has ends. That is the point of the operation
+        rather than a side effect: someone resets a password because the old one
+        may be known to another party, and leaving that party's refresh tokens
+        live would make the reset cosmetic.
+
+        Raises :class:`AuthenticationError`, with one identical message, for
+        every way this can fail.
+        """
+
+        digest = hash_token(token)
+        now = datetime.now(UTC)
+
+        async with self._unit_of_work_factory() as uow:
+            # Locked for the same reason rotation locks: two requests carrying
+            # the same link must not both succeed. The row is found through a
+            # unique index, so this is a single record lock, and the second
+            # request blocks until the first commits and then sees `consumed_at`
+            # set. See the module note on concurrency.
+            grant = await uow.password_reset_tokens.get_by_digest(digest, for_update=True)
+
+            if grant is None:
+                raise AuthenticationError(_INVALID_RESET)
+
+            # Consumed covers both "already used" and "superseded by a newer
+            # request" — one column, so neither case can be forgotten here.
+            if grant.consumed_at is not None:
+                raise AuthenticationError(_INVALID_RESET)
+
+            if _as_utc(grant.expires_at) <= now:
+                raise AuthenticationError(_INVALID_RESET)
+
+            user = await uow.users.get_by_id(grant.user_id)
+            if user is None or not user.is_active:
+                raise AuthenticationError(_INVALID_RESET)
+
+            user.password_hash = await self._hash_password(new_password)
+            await uow.password_reset_tokens.consume(grant, now)
+            # Any *other* outstanding grant dies too. Without this, a user who
+            # asked twice could reset again from the older mail after the newer
+            # one had already been used.
+            await uow.password_reset_tokens.consume_outstanding_for_user(user.id, now)
+            revoked = await uow.refresh_tokens.revoke_all_for_user(user.id, now)
+
+            # One transaction: a reset that changed the password but left the
+            # sessions live, or consumed the grant without changing anything,
+            # are both worse than a reset that did not happen.
+            await uow.commit()
+            user_public_id = user.public_id
+
+        log.info("password_reset_completed", user=user_public_id, revoked_sessions=revoked)
+
     # --- Internals ----------------------------------------------------------
+
+    async def _deliver_reset_link(self, recipient: str, token: str) -> None:
+        """Hand the finished link to the notifier, absorbing every failure.
+
+        Nothing here may raise. This runs after the grant is committed, and the
+        caller's contract is to answer identically whether or not an account
+        exists — an exception escaping would turn a delivery outage into a 500
+        that only ever happens for addresses that *do* have accounts, which is
+        the enumeration oracle rebuilt by accident.
+        """
+
+        if self._password_reset_url_base is None:
+            # No configured destination: the grant exists and is unreachable.
+            # Logged as a warning because it is an operational fault, not a
+            # user error, and it is invisible from outside by design.
+            log.warning("password_reset_url_base_not_configured")
+            return
+
+        # The token is the entire proof, so the link carries nothing else — no
+        # email, no user id, no organization id. A URL that identified the
+        # account would leak it to every proxy, mail scanner, and browser
+        # history the message passes through.
+        reset_url = f"{self._password_reset_url_base}?token={quote(token, safe='')}"
+
+        try:
+            await self._password_reset_notifier.send_password_reset(recipient, reset_url)
+        except PasswordResetDeliveryError:
+            # Deliberately not re-raised, and deliberately logged without the
+            # recipient or the URL.
+            log.warning("password_reset_delivery_failed")
 
     @staticmethod
     def _normalize_email(email: str) -> str:

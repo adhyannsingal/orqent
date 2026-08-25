@@ -86,3 +86,26 @@ class RefreshTokenRepository:
             ),
         )
         return result.rowcount
+
+    async def revoke_all_for_user(self, user_id: int, revoked_at: datetime) -> int:
+        """Revoke every live token belonging to ``user_id`` and return how many.
+
+        Broader than :meth:`revoke_family` on purpose. A family is one login;
+        this is every login, which is what a password reset must close — the
+        point of resetting a compromised password is that whoever knew the old
+        one is locked out, and leaving their other sessions alive would defeat
+        it entirely.
+
+        Already-revoked rows are skipped so their original revocation time is
+        not overwritten, matching :meth:`revoke_family`.
+        """
+
+        result = cast(
+            "CursorResult[Any]",
+            await self._session.execute(
+                update(RefreshToken)
+                .where(RefreshToken.user_id == user_id, RefreshToken.revoked_at.is_(None))
+                .values(revoked_at=revoked_at)
+            ),
+        )
+        return result.rowcount

@@ -6,6 +6,8 @@ import { RequireAuth } from '@/routes/RequireAuth'
 import { useAuth } from '@/stores/auth'
 
 const LoginPage = lazy(() => import('@/features/auth/LoginPage').then((module) => ({ default: module.LoginPage })))
+const ForgotPasswordPage = lazy(() => import('@/features/auth/ForgotPasswordPage').then((module) => ({ default: module.ForgotPasswordPage })))
+const ResetPasswordPage = lazy(() => import('@/features/auth/ResetPasswordPage').then((module) => ({ default: module.ResetPasswordPage })))
 const LandingPage = lazy(() => import('@/features/landing/LandingPage').then((module) => ({ default: module.LandingPage })))
 const WorkflowListPage = lazy(() => import('@/features/workflows/WorkflowListPage').then((module) => ({ default: module.WorkflowListPage })))
 const BuilderPage = lazy(() => import('@/features/builder/BuilderPage').then((module) => ({ default: module.BuilderPage })))
@@ -23,6 +25,8 @@ export function App() {
         <Route path="/" element={<LandingPage />} />
         <Route path="/login" element={<LoginPage />} />
         <Route path="/register" element={<LoginPage />} />
+        <Route path="/forgot-password" element={<ForgotPasswordPage />} />
+        <Route path="/reset-password" element={<ResetPasswordPage />} />
         <Route
           element={
             <RequireAuth>

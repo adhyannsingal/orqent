@@ -246,16 +246,33 @@ async def test_a_revoked_registration_still_holds_its_token(
 # --- Cascades ----------------------------------------------------------------
 
 
+async def _registration_exists(session: AsyncSession, registration_id: int) -> bool:
+    """Whether one specific registration survives.
+
+    Scoped rather than counting the table: an unscoped ``COUNT(*) == 0`` only
+    holds on an empty database, and would pass vacuously if the registration
+    had never been written.
+    """
+
+    return (
+        await session.scalar(
+            select(func.count())
+            .select_from(TriggerRegistration)
+            .where(TriggerRegistration.id == registration_id)
+        )
+    ) == 1
+
+
 async def test_deleting_the_node_deletes_the_registration(session: AsyncSession) -> None:
     """An address that resolves to nothing is worse than no address."""
 
     node = await _hook_node(session)
-    await _register(session, node)
+    registration, _ = await _register(session, node)
+    assert await _registration_exists(session, registration.id)
 
     await session.execute(WorkflowNode.__table__.delete().where(WorkflowNode.id == node.id))
 
-    remaining = await session.scalar(select(func.count()).select_from(TriggerRegistration))
-    assert remaining == 0
+    assert not await _registration_exists(session, registration.id)
 
 
 async def test_deleting_the_organization_deletes_its_registrations(
@@ -263,13 +280,13 @@ async def test_deleting_the_organization_deletes_its_registrations(
 ) -> None:
     node = await _hook_node(session)
     registration, _ = await _register(session, node)
+    assert await _registration_exists(session, registration.id)
 
     await session.execute(
         Organization.__table__.delete().where(Organization.id == registration.organization_id)
     )
 
-    remaining = await session.scalar(select(func.count()).select_from(TriggerRegistration))
-    assert remaining == 0
+    assert not await _registration_exists(session, registration.id)
 
 
 # --- Precision ---------------------------------------------------------------

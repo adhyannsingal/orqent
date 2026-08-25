@@ -21,6 +21,7 @@ honour-based.
 from __future__ import annotations
 
 import ast
+import re
 import tokenize
 from collections.abc import Iterator
 from pathlib import Path
@@ -30,7 +31,7 @@ import yaml
 from pydantic import BaseModel, SecretStr
 
 import app
-from app.core.config import Settings
+from app.core.config import Environment, Settings
 from app.domain.engine.events import RunEventType
 from app.domain.nodes.descriptor import SideEffect
 from app.infrastructure.db import models  # noqa: F401  (registers tables)
@@ -1203,3 +1204,390 @@ def test_the_document_route_owns_no_persistence() -> None:
             "sqlalchemy",
         ),
     )
+
+
+# --- AH2: password reset stays inside the auth boundary ----------------------
+#
+# Four properties, each of which would be quietly easy to break: the service
+# must not learn how mail is sent, the port must not learn either, the reset
+# credential must be minted in one place, and none of this may reach the
+# execution machinery.
+
+# Every mail transport somebody might reasonably reach for. Names only — the
+# point is that *no* concrete delivery vocabulary reaches the service.
+_EMAIL_PROVIDERS = (
+    "smtplib",
+    "email.mime",
+    "aiosmtplib",
+    "sendgrid",
+    "resend",
+    "postmark",
+    "mailgun",
+    "boto3",
+    "ses",
+    "smtp",
+)
+
+
+def test_the_auth_service_imports_no_mail_transport() -> None:
+    """``AuthService`` orchestrates a reset; it must not know how mail leaves.
+
+    The same containment ADR-013 gives LangChain and ADR-010 gives Argon2: the
+    service names a port, and swapping the provider touches one adapter.
+    """
+
+    imported = _imported_names(SRC / "services/auth_service.py")
+    leaked = {
+        name
+        for name in imported
+        for provider in _EMAIL_PROVIDERS
+        if name == provider or name.startswith(f"{provider}.")
+    }
+
+    assert not leaked, f"auth_service imports a mail transport: {leaked}"
+
+
+def test_the_notifier_port_names_no_provider() -> None:
+    # A port that mentions SMTP is not provider-neutral, whatever its name says.
+    source = _code_only(SRC / "domain/ports/password_reset_notifier.py").lower()
+
+    named = [provider for provider in _EMAIL_PROVIDERS if provider in source]
+    assert not named, f"the notifier port names providers: {named}"
+
+
+def test_the_notifier_port_takes_a_finished_url_not_a_credential() -> None:
+    """The adapter is handed a link, never the raw token or the user.
+
+    Handing an adapter the token would make every future provider integration
+    another place the credential could be logged; handing it a user would make
+    it another place tenancy could be got wrong.
+    """
+
+    port = SRC / "domain/ports/password_reset_notifier.py"
+    signature = _code_only(port)
+
+    assert "reset_url" in signature
+    for forbidden in ("token", "user", "user_id", "organization"):
+        assert f"{forbidden}:" not in signature, f"the notifier port accepts {forbidden}"
+
+
+def test_only_one_module_mints_a_reset_token() -> None:
+    """``secrets`` for reset tokens lives in exactly one place.
+
+    A second call site would be a second answer to "how much entropy does a
+    reset link have", and the weaker one would win by being used.
+    """
+
+    minting = {
+        _relative(path)
+        for path in _modules("app")
+        if "new_password_reset_token" in _code_only(path)
+        and "def new_password_reset_token" in path.read_text()
+    }
+
+    assert minting == {"app/infrastructure/security/password_reset_token.py"}
+
+
+def test_the_api_never_mints_a_reset_credential() -> None:
+    # Routes unpack, call one service method, and shape the result. A route
+    # that generated a token would own security policy.
+    for path in _modules("app.api"):
+        source = _code_only(path)
+        assert "new_password_reset_token" not in source, f"{_relative(path)} mints a reset token"
+        assert "secrets" not in _imported_names(path), f"{_relative(path)} imports secrets"
+
+
+def test_password_reset_never_reaches_the_execution_machinery() -> None:
+    """Resetting a password is not a workflow concern.
+
+    Checked because the codebase has a queue and a worker sitting right there,
+    and "enqueue the email" is the obvious wrong turn — it would put a reset
+    credential into ``queue_tasks.payload``, which is durable, inspectable, and
+    not designed to hold secrets.
+    """
+
+    forbidden = (
+        "app.domain.engine",
+        "app.domain.ports.task_queue",
+        "app.infrastructure.queue",
+        "app.infrastructure.worker",
+        "app.services.run_service",
+    )
+    for module in (
+        "domain/ports/password_reset_notifier.py",
+        "infrastructure/notifications/unconfigured_notifier.py",
+        "infrastructure/security/password_reset_token.py",
+        "infrastructure/repositories/password_reset_token_repository.py",
+    ):
+        assert not _violations(SRC / module, forbidden), f"{module} reaches execution code"
+
+
+def test_the_shipped_notifier_cannot_write_the_link_anywhere() -> None:
+    """The adapter must not log, print, or persist what it is given.
+
+    This is the guard that matters most in the whole group. "Log the reset URL
+    so a developer can copy it" is the natural convenience, and it writes a
+    password-changing credential into log aggregation — shipped, retained, and
+    readable by more people than the mailbox would have been.
+
+    The parameters are read from the signature rather than hard-coded, so
+    renaming one cannot silently empty this test.
+    """
+
+    adapter = SRC / "infrastructure/notifications/unconfigured_notifier.py"
+    tree = ast.parse(adapter.read_text())
+
+    send = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == "send_password_reset"
+    )
+    parameters = {argument.arg for argument in send.args.args} - {"self"}
+    assert parameters == {"recipient", "reset_url"}
+
+    # Neither parameter may be read anywhere in the body — not by a logger, not
+    # by a file write, not by anything. The only correct use of an argument
+    # this adapter cannot deliver is to ignore it.
+    used = {
+        node.id for node in ast.walk(send) if isinstance(node, ast.Name) and node.id in parameters
+    }
+    assert not used, f"the notifier reads {used} instead of discarding it"
+
+    for sink in ("print", "open"):
+        assert sink not in _code_only(adapter), f"the notifier reaches {sink}"
+
+
+# --- AH3: the refresh cookie stays a transport concern -----------------------
+
+
+def test_the_auth_service_knows_nothing_about_cookies_or_responses() -> None:
+    """``AuthService`` returns a token pair; the route decides how it travels.
+
+    If the service took a FastAPI ``Response`` it could no longer be called
+    from a worker, a CLI, or a test without inventing one — and "where does the
+    refresh token live" would stop being a decision one module owns.
+    """
+
+    source = _code_only(SRC / "services/auth_service.py").lower()
+
+    for transport in ("cookie", "set_cookie", "response", "httponly", "samesite"):
+        assert transport not in source, f"auth_service names {transport}"
+    assert not _violations(SRC / "services/auth_service.py", ("fastapi", "starlette"))
+
+
+def test_only_the_api_layer_writes_the_refresh_cookie() -> None:
+    # One module sets it and clears it, so the attributes cannot drift apart.
+    # A mismatched path or domain on deletion leaves the original cookie live
+    # beside the empty one, and logout would only appear to work.
+    writers = {
+        _relative(path)
+        for path in _modules("app")
+        if "set_cookie" in _code_only(path) or "delete_cookie" in _code_only(path)
+    }
+
+    assert writers == {"app/api/cookies.py"}
+
+
+def test_the_refresh_cookie_is_always_httponly() -> None:
+    """The single attribute AH3 exists for, asserted at its only source.
+
+    Read from the AST rather than by string search: ``httponly`` appearing in
+    the file proves nothing about the value passed.
+    """
+
+    tree = ast.parse((SRC / "api/cookies.py").read_text())
+    calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr in {"set_cookie", "delete_cookie"}
+    ]
+    assert len(calls) == 2
+
+    for call in calls:
+        httponly = next(kw for kw in call.keywords if kw.arg == "httponly")
+        assert isinstance(httponly.value, ast.Constant) and httponly.value.value is True
+
+
+def test_the_frontend_persists_no_refresh_token() -> None:
+    """No web storage API is reachable from the frontend's auth code.
+
+    The decisive check for AH3's client half, and deliberately a search for the
+    *mechanism* rather than for a key name: renaming ``orqent.refresh`` would
+    defeat a name-based test while changing nothing about the exposure.
+    """
+
+    frontend = SRC.parent.parent / "frontend" / "src"
+    if not frontend.exists():  # pragma: no cover - backend-only checkouts
+        pytest.skip("frontend is not present in this checkout")
+
+    offenders: dict[str, list[str]] = {}
+    for path in sorted(frontend.rglob("*.ts")) + sorted(frontend.rglob("*.tsx")):
+        # Comments are stripped so prose explaining the rule does not break it,
+        # the same treatment `_code_only` gives Python.
+        code = re.sub(r"//[^\n]*|/\*.*?\*/", "", path.read_text(), flags=re.DOTALL)
+        used = [
+            api
+            for api in ("localStorage", "sessionStorage", "indexedDB", "document.cookie")
+            if api in code
+        ]
+        if used:
+            offenders[path.relative_to(frontend).as_posix()] = used
+
+    # Theme preference is the one permitted use: a non-secret UI setting.
+    assert offenders == {"components/ThemeProvider.tsx": ["localStorage"]}, offenders
+
+
+# --- AH3: client-side properties the cookie model depends on -----------------
+#
+# These are **structural** assertions over the frontend source, not behavioural
+# tests: the repository has no JavaScript test runner, and standing one up to
+# cover three lines would cost more than it returns. They are included because
+# each corresponds to a regression that is otherwise completely silent — no
+# type error, no failing build, no visible symptom until a user is logged out
+# unexpectedly. A source check that fails loudly beats nothing at all, and the
+# limitation is stated rather than papered over.
+
+
+def _frontend_source(relative: str) -> str:
+    frontend = SRC.parent.parent / "frontend" / "src"
+    if not frontend.exists():  # pragma: no cover - backend-only checkouts
+        pytest.skip("frontend is not present in this checkout")
+    return (frontend / relative).read_text()
+
+
+def test_the_api_client_sends_credentials() -> None:
+    """Without this the cookie is never attached and refresh always 401s.
+
+    Silent by construction: every request still compiles, still runs, and still
+    succeeds while an access token is in memory. The failure only appears after
+    a reload, as "I keep getting logged out".
+    """
+
+    assert "credentials: 'include'" in _frontend_source("api/client.ts")
+
+
+def test_session_restoration_asks_the_backend() -> None:
+    """A reload must exchange the cookie for an access token.
+
+    Before AH3 the store could check `localStorage` and skip the call; now
+    there is nothing to check, so the call *is* the mechanism. Dropping it
+    would silently make every reload a logout.
+    """
+
+    store = _frontend_source("stores/auth.ts")
+
+    # Specifically through `refreshSession`, which deduplicates concurrent
+    # callers. A bare API call here would carry the same cookie twice under
+    # StrictMode's double-invoked effect, and the second would be a replay —
+    # revoking the family and logging the user out on every reload. This was a
+    # real defect found in the browser, not a hypothetical.
+    assert "refreshSession()" in store
+    assert "refreshPair" not in store
+    assert store.count("refreshSession()") == 1
+
+
+def test_concurrent_refreshes_are_deduplicated() -> None:
+    """`??=` is load-bearing, and this is the sharpest failure in AH3.
+
+    Assigning unconditionally would let a page rendering four queries fire four
+    refreshes carrying the *same* cookie. The backend would correctly read three
+    of them as replays, revoke the whole family, and log the user out — for the
+    crime of loading a page. It would pass every type check and every build.
+    """
+
+    client = _frontend_source("api/client.ts")
+
+    assert "refreshInFlight ??= (async () => {" in client
+    assert "refreshInFlight = (async () => {" not in client
+
+
+# --- AH4: rate limiting stays at the HTTP boundary ---------------------------
+
+
+def test_the_auth_service_knows_nothing_about_rate_limiting() -> None:
+    """Limiting is a property of an HTTP caller, not of a credential check.
+
+    An address, a forwarded header and a proxy hop count are not vocabulary
+    ``AuthService`` should own — importing any of it would also make the
+    service impossible to call from a worker or a test without a ``Request``.
+    """
+
+    service = SRC / "services/auth_service.py"
+    source = _code_only(service).lower()
+
+    for term in ("ratelimit", "rate_limit", "x-forwarded", "client_identity", "remote_addr"):
+        assert term not in source, f"auth_service names {term}"
+    assert not _violations(service, ("app.infrastructure.ratelimit", "app.api"))
+
+
+def test_the_limiter_stays_out_of_the_domain() -> None:
+    # The dependency rule: `app.domain` is the centre. `RateLimitExceededError`
+    # lives there because it is an outcome the API renders; the mechanism does
+    # not follow it in.
+    for path in _modules("app.domain"):
+        assert not _violations(path, ("app.infrastructure.ratelimit", "app.api", "fastapi"))
+
+
+def test_no_raw_secret_becomes_a_limiter_key() -> None:
+    """Every sensitive key component passes through the digest helper.
+
+    Checked structurally: the module must not build a key from an email or a
+    token without hashing it, because limiter state and anything derived from
+    it would then hold credentials and personal data.
+    """
+
+    source = (SRC / "api/rate_limit.py").read_text()
+    tree = ast.parse(source)
+
+    # Every f-string that builds a subject key must interpolate `_digest(...)`,
+    # never a bare value.
+    subject_keys = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.JoinedStr)
+        and any(
+            isinstance(part, ast.Constant) and "subject:" in str(part.value) for part in node.values
+        )
+    ]
+    assert subject_keys, "no subject key construction found; the guard would be vacuous"
+    for key in subject_keys:
+        calls = [
+            node.func.id
+            for node in ast.walk(key)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+        ]
+        assert "_digest" in calls, "a subject key is built without hashing"
+
+
+def test_forwarded_headers_are_not_trusted_by_default() -> None:
+    """The default must be zero trusted hops.
+
+    Any client can send ``X-Forwarded-For``. A default that honoured it would
+    let an attacker mint a fresh identity per request, making every limit in
+    the application decorative — and it would do so silently.
+    """
+
+    settings = Settings(
+        _env_file=None,
+        environment=Environment.TEST,
+        jwt_secret_key="x" * 32,
+        database_url=None,
+    )
+
+    assert settings.trusted_proxy_hops == 0
+
+
+def test_rate_limiting_does_not_reach_the_execution_machinery() -> None:
+    # Limiting the auth surface must not entangle itself with the engine, the
+    # queue, or the worker — none of which are involved in deciding whether a
+    # caller may ask again.
+    forbidden = (
+        "app.domain.engine",
+        "app.infrastructure.queue",
+        "app.infrastructure.worker",
+        "app.services",
+    )
+    for module in ("api/rate_limit.py", "infrastructure/ratelimit/limiter.py"):
+        assert not _violations(SRC / module, forbidden), f"{module} reaches execution code"

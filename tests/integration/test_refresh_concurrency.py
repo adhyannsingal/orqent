@@ -9,6 +9,13 @@ Unlike the rest of the integration suite, these tests commit for real — the
 concurrency being tested *is* the interaction between separate committed
 transactions, so they cannot run inside one rolled-back transaction. They clean
 up after themselves explicitly instead.
+
+Cleanup and assertions are both **scoped to the rows this module creates**. An
+earlier version emptied ``organizations`` outright and counted every live
+refresh token in the database, which made the suite depend on starting from an
+empty schema: against a development database holding unrelated data it either
+failed on a foreign key or measured somebody else's sessions. Neither says
+anything about whether rotation is single-use.
 """
 
 from __future__ import annotations
@@ -24,6 +31,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 from app.domain.errors import AuthenticationError
 from app.domain.value_objects.token_pair import TokenPair
 from app.infrastructure.db.models.organization import Organization
+from app.infrastructure.db.models.password_reset_token import PasswordResetToken
 from app.infrastructure.db.models.refresh_token import RefreshToken
 from app.infrastructure.db.models.user import User
 from app.infrastructure.db.models.user_role import UserRole
@@ -32,6 +40,7 @@ from app.infrastructure.security.password_hasher import Argon2PasswordHasher
 from app.infrastructure.security.token_service import JwtTokenService
 from app.services.auth_service import AuthService
 from tests.integration.conftest import DATABASE_URL
+from tests.unit.fakes import FakePasswordResetNotifier
 
 pytestmark = pytest.mark.integration
 
@@ -48,7 +57,7 @@ _TIMEOUT_SECONDS = 30
 async def committed_service() -> AsyncIterator[
     tuple[AuthService, async_sessionmaker[AsyncSession]]
 ]:
-    """An AuthService whose transactions really commit, with explicit cleanup."""
+    """An AuthService whose transactions really commit, with scoped cleanup."""
 
     engine = create_async_engine(DATABASE_URL)
     try:
@@ -69,29 +78,61 @@ async def committed_service() -> AsyncIterator[
             access_ttl_seconds=900,
             refresh_ttl_seconds=2_592_000,
         ),
+        FakePasswordResetNotifier(),
+        password_reset_ttl_seconds=1_800,
+        password_reset_url_base="https://app.example.com/reset-password",
     )
 
+    # A previous aborted run would collide with the unique email, so this
+    # module clears its own rows first — and only its own.
+    await _purge(factory)
     try:
         yield service, factory
     finally:
-        # Order matters: children before parents, since the FKs are enforced.
-        async with factory() as cleanup:
-            await cleanup.execute(delete(RefreshToken))
-            await cleanup.execute(delete(UserRole))
-            await cleanup.execute(delete(User))
-            await cleanup.execute(delete(Organization))
-            # `roles` is deliberately untouched: migration 0003 owns those rows.
-            await cleanup.commit()
+        await _purge(factory)
         await engine.dispose()
 
 
-async def _live_token_count(factory: async_sessionmaker[AsyncSession]) -> int:
+async def _purge(factory: async_sessionmaker[AsyncSession]) -> None:
+    """Remove only this module's rows, children before parents.
+
+    Scoped by the email this module registers. Emptying the tables would be
+    simpler and wrong: a shared development database routinely holds unrelated
+    data that such a fixture either destroys or trips over.
+    """
+
+    async with factory() as session:
+        user_ids = list((await session.scalars(select(User.id).where(User.email == EMAIL))).all())
+        organization_ids = list(
+            (await session.scalars(select(User.organization_id).where(User.email == EMAIL))).all()
+        )
+        if user_ids:
+            await session.execute(
+                delete(PasswordResetToken).where(PasswordResetToken.user_id.in_(user_ids))
+            )
+            await session.execute(delete(RefreshToken).where(RefreshToken.user_id.in_(user_ids)))
+            await session.execute(delete(UserRole).where(UserRole.user_id.in_(user_ids)))
+            await session.execute(delete(User).where(User.id.in_(user_ids)))
+        if organization_ids:
+            await session.execute(delete(Organization).where(Organization.id.in_(organization_ids)))
+        # `roles` is deliberately untouched: migration 0003 owns those rows.
+        await session.commit()
+
+
+async def _live_token_count(factory: async_sessionmaker[AsyncSession], user_id: int) -> int:
+    """Live tokens belonging to *this* user.
+
+    Scoped deliberately. An unscoped count only holds on an empty database, and
+    would pass or fail on unrelated sessions — which is not the property under
+    test.
+    """
+
     async with factory() as session:
         return (
             await session.scalar(
                 select(func.count())
                 .select_from(RefreshToken)
-                .where(RefreshToken.revoked_at.is_(None))
+                .where(RefreshToken.user_id == user_id, RefreshToken.revoked_at.is_(None))
             )
         ) or 0
 
@@ -139,7 +180,7 @@ async def test_losing_the_race_is_treated_as_reuse_and_kills_the_session(
     """
 
     service, factory = committed_service
-    await service.register(email=EMAIL, password=PASSWORD, organization_name="Race Co")
+    user = await service.register(email=EMAIL, password=PASSWORD, organization_name="Race Co")
     original = await service.login(email=EMAIL, password=PASSWORD)
 
     await asyncio.wait_for(
@@ -153,7 +194,7 @@ async def test_losing_the_race_is_treated_as_reuse_and_kills_the_session(
 
     # The winner's successor is revoked too: reuse detection revokes the family,
     # not just the token presented.
-    assert await _live_token_count(factory) == 0
+    assert await _live_token_count(factory, user.id) == 0
 
 
 async def test_sequential_refreshes_are_unaffected(
@@ -161,13 +202,13 @@ async def test_sequential_refreshes_are_unaffected(
 ) -> None:
     # The lock must not make ordinary, one-at-a-time rotation fail.
     service, factory = committed_service
-    await service.register(email=EMAIL, password=PASSWORD, organization_name="Race Co")
+    user = await service.register(email=EMAIL, password=PASSWORD, organization_name="Race Co")
     tokens = await service.login(email=EMAIL, password=PASSWORD)
 
     for _ in range(3):
         tokens = await service.refresh(tokens.refresh_token)
 
-    assert await _live_token_count(factory) == 1
+    assert await _live_token_count(factory, user.id) == 1
 
 
 async def test_concurrent_refreshes_of_different_sessions_both_succeed(
@@ -175,7 +216,7 @@ async def test_concurrent_refreshes_of_different_sessions_both_succeed(
 ) -> None:
     # The lock is per row, so unrelated sessions never contend.
     service, factory = committed_service
-    await service.register(email=EMAIL, password=PASSWORD, organization_name="Race Co")
+    user = await service.register(email=EMAIL, password=PASSWORD, organization_name="Race Co")
     first = await service.login(email=EMAIL, password=PASSWORD)
     second = await service.login(email=EMAIL, password=PASSWORD)
 
@@ -189,4 +230,4 @@ async def test_concurrent_refreshes_of_different_sessions_both_succeed(
     )
 
     assert all(isinstance(result, TokenPair) for result in results), results
-    assert await _live_token_count(factory) == 2
+    assert await _live_token_count(factory, user.id) == 2

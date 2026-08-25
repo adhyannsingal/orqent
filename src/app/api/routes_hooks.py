@@ -21,6 +21,7 @@ from fastapi import APIRouter, Body, Path
 from starlette import status
 
 from app.api.deps import WebhookServiceDep
+from app.api.rate_limit import WebhookRateLimit
 from app.infrastructure.security.webhook_token import WEBHOOK_TOKEN_LENGTH
 from app.schemas.common import ErrorResponse
 from app.schemas.hooks import WebhookAcceptedResponse
@@ -33,6 +34,7 @@ router = APIRouter(tags=["hooks"])
     response_model=WebhookAcceptedResponse,
     status_code=status.HTTP_202_ACCEPTED,
     summary="Deliver a webhook to the workflow registered at this address",
+    dependencies=[WebhookRateLimit],
     responses={
         status.HTTP_404_NOT_FOUND: {
             "model": ErrorResponse,

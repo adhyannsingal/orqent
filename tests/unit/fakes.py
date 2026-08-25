@@ -23,12 +23,17 @@ from sqlalchemy.exc import IntegrityError
 from app.domain.errors import AuthenticationError
 from app.domain.graph.model import GraphEdge, GraphNode, WorkflowGraph
 from app.domain.ports.password_hasher import PasswordHasher
+from app.domain.ports.password_reset_notifier import (
+    PasswordResetDeliveryError,
+    PasswordResetNotifier,
+)
 from app.domain.ports.token_service import TokenService
 from app.domain.value_objects.authenticated_user import AuthenticatedUser
 from app.domain.value_objects.token import IssuedToken, TokenClaims, TokenType
 from app.infrastructure.db.identifiers import new_public_id
 from app.infrastructure.db.models.node_execution import NodeExecution
 from app.infrastructure.db.models.organization import Organization
+from app.infrastructure.db.models.password_reset_token import PasswordResetToken
 from app.infrastructure.db.models.queue_task import QueueTask
 from app.infrastructure.db.models.refresh_token import RefreshToken
 from app.infrastructure.db.models.role import Role
@@ -65,6 +70,7 @@ class FakeDatabase:
     roles: list[Role] = field(default_factory=list)
     user_roles: list[UserRole] = field(default_factory=list)
     refresh_tokens: list[RefreshToken] = field(default_factory=list)
+    password_reset_tokens: list[PasswordResetToken] = field(default_factory=list)
     workflows: list[Workflow] = field(default_factory=list)
     workflow_versions: list[WorkflowVersion] = field(default_factory=list)
     # Graph rows, keyed by version id. Replaced wholesale, like the real one.
@@ -79,6 +85,7 @@ class FakeDatabase:
     pending_users: list[User] = field(default_factory=list)
     pending_user_roles: list[UserRole] = field(default_factory=list)
     pending_refresh_tokens: list[RefreshToken] = field(default_factory=list)
+    pending_password_reset_tokens: list[PasswordResetToken] = field(default_factory=list)
     pending_workflows: list[Workflow] = field(default_factory=list)
     pending_workflow_versions: list[WorkflowVersion] = field(default_factory=list)
     pending_runs: list[Run] = field(default_factory=list)
@@ -113,6 +120,10 @@ class FakeDatabase:
         return [*self.refresh_tokens, *self.pending_refresh_tokens]
 
     @property
+    def visible_password_reset_tokens(self) -> list[PasswordResetToken]:
+        return self.password_reset_tokens + self.pending_password_reset_tokens
+
+    @property
     def visible_workflows(self) -> list[Workflow]:
         return [*self.workflows, *self.pending_workflows]
 
@@ -145,6 +156,7 @@ class FakeDatabase:
         self.users.extend(self.pending_users)
         self.user_roles.extend(self.pending_user_roles)
         self.refresh_tokens.extend(self.pending_refresh_tokens)
+        self.password_reset_tokens.extend(self.pending_password_reset_tokens)
         self.workflows.extend(self.pending_workflows)
         self.workflow_versions.extend(self.pending_workflow_versions)
         self.runs.extend(self.pending_runs)
@@ -162,6 +174,7 @@ class FakeDatabase:
         self.pending_users.clear()
         self.pending_user_roles.clear()
         self.pending_refresh_tokens.clear()
+        self.pending_password_reset_tokens.clear()
         self.pending_workflows.clear()
         self.pending_workflow_versions.clear()
         self.pending_runs.clear()
@@ -288,6 +301,49 @@ class FakeRefreshTokenRepository:
         for token in live:
             token.revoked_at = revoked_at
         return len(live)
+
+    async def revoke_all_for_user(self, user_id: int, revoked_at: datetime) -> int:
+        live = [
+            token
+            for token in self._db.visible_refresh_tokens
+            if token.user_id == user_id and token.revoked_at is None
+        ]
+        for token in live:
+            token.revoked_at = revoked_at
+        return len(live)
+
+
+class FakePasswordResetTokenRepository:
+    def __init__(self, db: FakeDatabase) -> None:
+        self._db = db
+
+    async def add(self, reset_token: PasswordResetToken) -> PasswordResetToken:
+        reset_token.id = self._db.next_id()
+        self._db.pending_password_reset_tokens.append(reset_token)
+        return reset_token
+
+    async def get_by_digest(
+        self, token_hash: str, *, for_update: bool = False
+    ) -> PasswordResetToken | None:
+        # `for_update` is a locking hint with no in-process meaning; the real
+        # concurrency behaviour is covered by the MySQL integration tests.
+        return next(
+            (t for t in self._db.visible_password_reset_tokens if t.token_hash == token_hash),
+            None,
+        )
+
+    async def consume(self, reset_token: PasswordResetToken, consumed_at: datetime) -> None:
+        reset_token.consumed_at = consumed_at
+
+    async def consume_outstanding_for_user(self, user_id: int, consumed_at: datetime) -> int:
+        outstanding = [
+            token
+            for token in self._db.visible_password_reset_tokens
+            if token.user_id == user_id and token.consumed_at is None
+        ]
+        for token in outstanding:
+            token.consumed_at = consumed_at
+        return len(outstanding)
 
 
 # --- Unit of work -----------------------------------------------------------
@@ -696,6 +752,7 @@ class FakeUnitOfWork:
         self.users = user_repository or FakeUserRepository(db)
         self.roles = FakeRoleRepository(db)
         self.refresh_tokens = FakeRefreshTokenRepository(db)
+        self.password_reset_tokens = FakePasswordResetTokenRepository(db)
         self.workflows = FakeWorkflowRepository(db)
         self.workflow_versions = FakeWorkflowVersionRepository(db)
         self.runs = run_repository or FakeRunRepository(db)
@@ -828,3 +885,21 @@ class FakeTokenService(TokenService):
         issued = IssuedToken(token=f"{token_type.value}.{claims.jti}", claims=claims)
         self.issued.append(issued)
         return issued
+
+
+class FakePasswordResetNotifier(PasswordResetNotifier):
+    """Records what would have been delivered, and can be told to fail.
+
+    Holding the URL rather than the token is deliberate: it is what a real
+    provider would receive, so a test asserting the link carries no identity is
+    asserting against the actual payload.
+    """
+
+    def __init__(self, *, fail: bool = False) -> None:
+        self.sent: list[tuple[str, str]] = []
+        self._fail = fail
+
+    async def send_password_reset(self, recipient: str, reset_url: str) -> None:
+        if self._fail:
+            raise PasswordResetDeliveryError("delivery unavailable")
+        self.sent.append((recipient, reset_url))

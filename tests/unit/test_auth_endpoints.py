@@ -10,10 +10,12 @@ is the API layer's own job.
 from __future__ import annotations
 
 from collections.abc import Iterator
+from http.cookies import SimpleCookie
 
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from pydantic import ValidationError
 
 from app.api.deps import get_auth_service
 from app.container import Container
@@ -38,6 +40,9 @@ REFRESH_TOKEN = "refresh-token-value"
 NEW_ACCESS_TOKEN = "rotated-access-token"
 NEW_REFRESH_TOKEN = "rotated-refresh-token"
 
+# The cookie the backend sets. Not a secret — it is the only part anyone sees.
+REFRESH_COOKIE = "orqent_refresh"
+
 
 def _build_user(email: str = EMAIL) -> User:
     """An in-memory user shaped like one the service returns: relationships loaded."""
@@ -59,10 +64,13 @@ class FakeAuthService:
         self.login_calls: list[dict[str, str]] = []
         self.refresh_calls: list[str] = []
         self.logout_calls: list[str] = []
+        self.forgot_password_calls: list[str] = []
+        self.reset_password_calls: list[dict[str, str]] = []
         self.register_error: Exception | None = None
         self.login_error: Exception | None = None
         self.refresh_error: Exception | None = None
         self.logout_error: Exception | None = None
+        self.reset_password_error: Exception | None = None
 
     async def register(self, *, email: str, password: str, organization_name: str) -> User:
         self.register_calls.append(
@@ -89,6 +97,17 @@ class FakeAuthService:
         if self.logout_error is not None:
             raise self.logout_error
 
+    async def forgot_password(self, *, email: str) -> None:
+        # No error hook and no return value: the real one cannot fail visibly
+        # or report anything, and a fake that could would let a route test
+        # assert behaviour the service will never produce.
+        self.forgot_password_calls.append(email)
+
+    async def reset_password(self, *, token: str, new_password: str) -> None:
+        self.reset_password_calls.append({"token": token, "new_password": new_password})
+        if self.reset_password_error is not None:
+            raise self.reset_password_error
+
 
 @pytest.fixture
 def auth_service() -> FakeAuthService:
@@ -98,12 +117,15 @@ def auth_service() -> FakeAuthService:
 @pytest.fixture
 def settings() -> Settings:
     # Overrides the conftest fixture: /auth/me needs a real signing key.
+    # Rate limiting stays off for the same reason it is off there — these tests
+    # are about contracts, not about abuse. `test_rate_limit_*` turns it on.
     return Settings(
         _env_file=None,
         environment=Environment.TEST,
         log_json=False,
         database_url=None,
         jwt_secret_key=SECRET,
+        rate_limit_enabled=False,
     )
 
 
@@ -211,6 +233,31 @@ def test_register_rejects_invalid_payloads(
     assert auth_service.register_calls == []
 
 
+@pytest.mark.parametrize("special", list("!@#$%^&*_-?"))
+def test_register_accepts_each_representative_special_character(
+    client: TestClient, auth_service: FakeAuthService, special: str
+) -> None:
+    payload = {**REGISTER_PAYLOAD, "password": f"abcdefg1{special}"}
+
+    response = client.post("/api/v1/auth/register", json=payload)
+
+    assert response.status_code == 201
+    assert auth_service.register_calls
+
+
+def test_register_accepts_a_long_passphrase(
+    client: TestClient, auth_service: FakeAuthService
+) -> None:
+    # Length alone must not be treated as suspicious: the only ceiling is the
+    # 1024-character resource guard, well above any real passphrase.
+    payload = {**REGISTER_PAYLOAD, "password": "correct horse battery staple 7!" * 8}
+
+    response = client.post("/api/v1/auth/register", json=payload)
+
+    assert response.status_code == 201
+    assert auth_service.register_calls
+
+
 def test_validation_failure_uses_the_standard_envelope(client: TestClient) -> None:
     body = client.post("/api/v1/auth/register", json={}).json()
 
@@ -221,15 +268,11 @@ def test_validation_failure_uses_the_standard_envelope(client: TestClient) -> No
 # --- Login ------------------------------------------------------------------
 
 
-def test_login_returns_200_and_a_token_pair(client: TestClient) -> None:
+def test_login_returns_200_and_an_access_token(client: TestClient) -> None:
     response = client.post("/api/v1/auth/login", json=LOGIN_PAYLOAD)
 
     assert response.status_code == 200
-    assert response.json() == {
-        "access_token": ACCESS_TOKEN,
-        "refresh_token": REFRESH_TOKEN,
-        "token_type": "bearer",
-    }
+    assert response.json() == {"access_token": ACCESS_TOKEN, "token_type": "bearer"}
 
 
 def test_login_passes_credentials_to_the_service(
@@ -241,7 +284,7 @@ def test_login_passes_credentials_to_the_service(
 
 
 def test_login_failure_becomes_401(client: TestClient, auth_service: FakeAuthService) -> None:
-    auth_service.login_error = AuthenticationError("Invalid email or password.")
+    auth_service.login_error = AuthenticationError("Either email or password is incorrect.")
 
     response = client.post("/api/v1/auth/login", json=LOGIN_PAYLOAD)
 
@@ -252,7 +295,7 @@ def test_login_failure_becomes_401(client: TestClient, auth_service: FakeAuthSer
 def test_login_failure_does_not_disclose_which_check_failed(
     client: TestClient, auth_service: FakeAuthService
 ) -> None:
-    auth_service.login_error = AuthenticationError("Invalid email or password.")
+    auth_service.login_error = AuthenticationError("Either email or password is incorrect.")
 
     message = client.post("/api/v1/auth/login", json=LOGIN_PAYLOAD).json()["error"]["message"]
 
@@ -261,12 +304,28 @@ def test_login_failure_does_not_disclose_which_check_failed(
     assert "disabled" not in message.lower()
 
 
+def test_failed_login_returns_only_the_error_envelope(
+    client: TestClient, auth_service: FakeAuthService
+) -> None:
+    # No user, no tokens, and no echo of the submitted password: a failed login
+    # must not hand back anything the caller did not already have.
+    auth_service.login_error = AuthenticationError("Either email or password is incorrect.")
+
+    response = client.post("/api/v1/auth/login", json=LOGIN_PAYLOAD)
+
+    assert response.json().keys() == {"error"}
+    assert response.json()["error"]["message"] == "Either email or password is incorrect."
+    assert PASSWORD not in response.text
+    for leaked in ("access_token", "refresh_token", "public_id", "password_hash"):
+        assert leaked not in response.text
+
+
 def test_login_accepts_a_short_password_and_lets_the_service_decide(
     client: TestClient, auth_service: FakeAuthService
 ) -> None:
     # A minimum length here would reject old accounts after a policy change, and
     # would answer with 422 where every login failure should look identical.
-    auth_service.login_error = AuthenticationError("Invalid email or password.")
+    auth_service.login_error = AuthenticationError("Either email or password is incorrect.")
 
     response = client.post("/api/v1/auth/login", json={"email": EMAIL, "password": "x"})
 
@@ -371,36 +430,197 @@ def test_container_builds_a_usable_auth_service(settings: Settings) -> None:
 
 
 # --- Refresh ----------------------------------------------------------------
-
-REFRESH_PAYLOAD = {"refresh_token": REFRESH_TOKEN}
-
-
-def test_refresh_returns_200_and_a_rotated_pair(client: TestClient) -> None:
-    response = client.post("/api/v1/auth/refresh", json=REFRESH_PAYLOAD)
-
-    assert response.status_code == 200
-    assert response.json() == {
-        "access_token": NEW_ACCESS_TOKEN,
-        "refresh_token": NEW_REFRESH_TOKEN,
-        "token_type": "bearer",
-    }
+#
+# After AH3 the credential is a cookie, not a body field. These tests therefore
+# assert on `Set-Cookie` and on what the service was handed, which is the whole
+# contract: a client that cannot put a refresh token in a request cannot
+# present one it merely happens to possess.
 
 
-def test_refresh_passes_the_token_to_the_service(
+def _cookie_attributes(response: object) -> dict[str, str]:
+    """Parse the response's ``Set-Cookie`` into a case-folded attribute map.
+
+    Parsed rather than substring-matched so the assertions do not depend on the
+    order Starlette happens to emit attributes in.
+    """
+
+    header = response.headers.get("set-cookie")  # type: ignore[attr-defined]
+    assert header is not None, "no Set-Cookie on the response"
+    jar = SimpleCookie()
+    jar.load(header)
+    morsel = jar[REFRESH_COOKIE]
+    attributes = {key.lower(): str(value) for key, value in morsel.items() if value != ""}
+    attributes["value"] = morsel.value
+    return attributes
+
+
+def test_login_sets_an_httponly_refresh_cookie(client: TestClient) -> None:
+    response = client.post("/api/v1/auth/login", json=LOGIN_PAYLOAD)
+
+    attributes = _cookie_attributes(response)
+    assert attributes["value"] == REFRESH_TOKEN
+    # The decisive attribute: without HttpOnly the cookie is readable by any
+    # script on the page and AH3 has achieved nothing.
+    assert "httponly" in attributes
+    assert attributes["samesite"].lower() == "lax"
+    assert attributes["path"] == "/api/v1/auth"
+
+
+def test_login_never_puts_the_refresh_token_in_the_body(client: TestClient) -> None:
+    # The strong form: not "the field is absent" but "the value appears
+    # nowhere in the body", which also catches it being smuggled into a
+    # message or a differently named field.
+    response = client.post("/api/v1/auth/login", json=LOGIN_PAYLOAD)
+
+    assert "refresh_token" not in response.json()
+    assert REFRESH_TOKEN not in response.text
+
+
+def test_the_refresh_cookie_lives_as_long_as_the_token(
+    client: TestClient, settings: Settings
+) -> None:
+    # Two expressions of one deadline. A cookie outliving its row would make the
+    # browser retry a credential the server already refuses.
+    attributes = _cookie_attributes(client.post("/api/v1/auth/login", json=LOGIN_PAYLOAD))
+
+    assert int(attributes["max-age"]) == settings.refresh_token_ttl_seconds
+
+
+def test_the_refresh_cookie_is_not_secure_for_local_http(
+    client: TestClient, settings: Settings
+) -> None:
+    # Local development runs on plain HTTP, where a Secure cookie would never
+    # be sent. Production is prevented from inheriting this by a Settings
+    # validator, which `test_production_settings_demand_a_secure_cookie` pins.
+    assert settings.refresh_cookie_secure is False
+    assert "secure" not in _cookie_attributes(client.post("/api/v1/auth/login", json=LOGIN_PAYLOAD))
+
+
+def test_production_settings_demand_a_secure_cookie() -> None:
+    with pytest.raises(ValidationError, match="refresh_cookie_secure"):
+        Settings(
+            _env_file=None,
+            environment=Environment.PRODUCTION,
+            jwt_secret_key="x" * 32,
+            database_url=None,
+            refresh_cookie_secure=False,
+        )
+
+
+def test_samesite_none_demands_a_secure_cookie() -> None:
+    # Browsers reject the pair outright, so the cookie would silently never be
+    # stored — a failure that looks like "sessions don't persist".
+    with pytest.raises(ValidationError, match="refresh_cookie_secure"):
+        Settings(
+            _env_file=None,
+            environment=Environment.TEST,
+            jwt_secret_key="x" * 32,
+            database_url=None,
+            refresh_cookie_samesite="none",
+            refresh_cookie_secure=False,
+        )
+
+
+def test_credentialed_cors_refuses_a_wildcard_origin() -> None:
+    # The API always allows credentials, so a wildcard origin is never valid.
+    with pytest.raises(ValidationError, match="cors_origins"):
+        Settings(
+            _env_file=None,
+            environment=Environment.TEST,
+            jwt_secret_key="x" * 32,
+            database_url=None,
+            cors_origins=["*"],
+        )
+
+
+def test_refresh_reads_the_cookie_not_the_body(
     client: TestClient, auth_service: FakeAuthService
 ) -> None:
-    client.post("/api/v1/auth/refresh", json=REFRESH_PAYLOAD)
+    client.cookies.set(REFRESH_COOKIE, REFRESH_TOKEN)
 
+    response = client.post("/api/v1/auth/refresh")
+
+    assert response.status_code == 200
+    assert response.json() == {"access_token": NEW_ACCESS_TOKEN, "token_type": "bearer"}
     assert auth_service.refresh_calls == [REFRESH_TOKEN]
+
+
+def test_refresh_rotates_the_cookie(client: TestClient) -> None:
+    client.cookies.set(REFRESH_COOKIE, REFRESH_TOKEN)
+
+    attributes = _cookie_attributes(client.post("/api/v1/auth/refresh"))
+
+    assert attributes["value"] == NEW_REFRESH_TOKEN
+    assert "httponly" in attributes
+
+
+def test_refresh_ignores_a_refresh_token_in_the_body(
+    client: TestClient, auth_service: FakeAuthService
+) -> None:
+    """A client cannot present a token it merely possesses.
+
+    This is the property that makes the cookie worth more than the storage
+    change alone: a refresh token pasted into a console, or captured from a log,
+    is useless without also controlling the browser that holds the cookie.
+    """
+
+    response = client.post("/api/v1/auth/refresh", json={"refresh_token": "smuggled"})
+
+    assert response.status_code == 401
+    assert auth_service.refresh_calls == []
+
+
+def test_refresh_without_a_cookie_is_rejected(
+    client: TestClient, auth_service: FakeAuthService
+) -> None:
+    response = client.post("/api/v1/auth/refresh")
+
+    assert response.status_code == 401
+    assert response.json()["error"]["code"] == "authentication_error"
+    assert auth_service.refresh_calls == []
 
 
 def test_refresh_failure_becomes_401(client: TestClient, auth_service: FakeAuthService) -> None:
     auth_service.refresh_error = AuthenticationError("Invalid or expired refresh token.")
+    client.cookies.set(REFRESH_COOKIE, REFRESH_TOKEN)
 
-    response = client.post("/api/v1/auth/refresh", json=REFRESH_PAYLOAD)
+    response = client.post("/api/v1/auth/refresh")
 
     assert response.status_code == 401
     assert response.json()["error"]["code"] == "authentication_error"
+
+
+def test_a_rejected_refresh_clears_the_cookie(
+    client: TestClient, auth_service: FakeAuthService
+) -> None:
+    # Leaving a token the server will never accept again means the app retries
+    # with it on every page load, turning one dead session into a stream of
+    # 401s. Clearing it is client-side tidy-up; revocation already happened.
+    auth_service.refresh_error = AuthenticationError("Invalid or expired refresh token.")
+    client.cookies.set(REFRESH_COOKIE, REFRESH_TOKEN)
+
+    attributes = _cookie_attributes(client.post("/api/v1/auth/refresh"))
+
+    assert attributes["value"] == ""
+    assert attributes["path"] == "/api/v1/auth"
+
+
+def test_a_missing_cookie_and_a_dead_one_look_identical(
+    client: TestClient, auth_service: FakeAuthService
+) -> None:
+    # "You sent no cookie" and "your cookie is dead" are the same answer to a
+    # client and the same non-answer to an attacker.
+    missing = client.post("/api/v1/auth/refresh")
+
+    auth_service.refresh_error = AuthenticationError("Invalid or expired refresh token.")
+    client.cookies.set(REFRESH_COOKIE, REFRESH_TOKEN)
+    dead = client.post("/api/v1/auth/refresh")
+
+    assert missing.status_code == dead.status_code == 401
+    missing_body, dead_body = missing.json(), dead.json()
+    missing_body["error"].pop("correlation_id")
+    dead_body["error"].pop("correlation_id")
+    assert missing_body == dead_body
 
 
 def test_refresh_failure_does_not_disclose_a_replay(
@@ -409,56 +629,97 @@ def test_refresh_failure_does_not_disclose_a_replay(
     # A caller must not learn that the server detected reuse; that would tell an
     # attacker which stolen tokens are still live.
     auth_service.refresh_error = AuthenticationError("Invalid or expired refresh token.")
+    client.cookies.set(REFRESH_COOKIE, REFRESH_TOKEN)
 
-    message = client.post("/api/v1/auth/refresh", json=REFRESH_PAYLOAD).json()["error"]["message"]
+    message = client.post("/api/v1/auth/refresh").json()["error"]["message"]
 
     assert "reuse" not in message.lower()
     assert "revoked" not in message.lower()
     assert "replay" not in message.lower()
 
 
-@pytest.mark.parametrize(
-    "payload",
-    [{}, {"refresh_token": ""}, {"refresh_token": "x" * 4097}, {"token": REFRESH_TOKEN}],
-)
-def test_refresh_rejects_invalid_payloads(
-    client: TestClient, auth_service: FakeAuthService, payload: dict[str, str]
-) -> None:
-    response = client.post("/api/v1/auth/refresh", json=payload)
-
-    assert response.status_code == 422
-    assert auth_service.refresh_calls == []
-
-
 def test_refresh_and_login_share_one_response_shape(client: TestClient) -> None:
-    # Both hand back a token pair, so a client can treat the two identically.
+    # Both hand back an access token, so a client can treat the two identically.
     login = client.post("/api/v1/auth/login", json=LOGIN_PAYLOAD).json()
-    refreshed = client.post("/api/v1/auth/refresh", json=REFRESH_PAYLOAD).json()
+    client.cookies.set(REFRESH_COOKIE, REFRESH_TOKEN)
+    refreshed = client.post("/api/v1/auth/refresh").json()
 
-    assert set(login) == set(refreshed)
+    assert set(login) == set(refreshed) == {"access_token", "token_type"}
+
+
+def test_neither_endpoint_documents_a_refresh_token_field(app: FastAPI) -> None:
+    # The published contract, not just the runtime behaviour: a client reading
+    # the OpenAPI document must not be told to send or expect one.
+    schema = app.openapi()
+    body = schema["components"]["schemas"]["AccessTokenResponse"]["properties"]
+
+    assert "refresh_token" not in body
+    for path in ("/api/v1/auth/refresh", "/api/v1/auth/logout"):
+        assert "requestBody" not in schema["paths"][path]["post"]
 
 
 # --- Logout -----------------------------------------------------------------
 
 
 def test_logout_returns_204_with_no_body(client: TestClient) -> None:
-    response = client.post("/api/v1/auth/logout", json=REFRESH_PAYLOAD)
+    client.cookies.set(REFRESH_COOKIE, REFRESH_TOKEN)
+
+    response = client.post("/api/v1/auth/logout")
 
     assert response.status_code == 204
     assert response.content == b""
 
 
-def test_logout_passes_the_token_to_the_service(
+def test_logout_passes_the_cookie_to_the_service(
     client: TestClient, auth_service: FakeAuthService
 ) -> None:
-    client.post("/api/v1/auth/logout", json=REFRESH_PAYLOAD)
+    client.cookies.set(REFRESH_COOKIE, REFRESH_TOKEN)
+
+    client.post("/api/v1/auth/logout")
 
     assert auth_service.logout_calls == [REFRESH_TOKEN]
 
 
+def test_logout_clears_the_cookie(client: TestClient) -> None:
+    client.cookies.set(REFRESH_COOKIE, REFRESH_TOKEN)
+
+    attributes = _cookie_attributes(client.post("/api/v1/auth/logout"))
+
+    # Name, path and domain must all match the cookie that was set, or the
+    # browser keeps the original happily alongside the empty one and logout
+    # only appears to work.
+    assert attributes["value"] == ""
+    assert attributes["path"] == "/api/v1/auth"
+
+
+def test_logout_revokes_before_it_clears(client: TestClient, auth_service: FakeAuthService) -> None:
+    # Clearing alone would end the session in this browser and leave the family
+    # live for anyone holding a copy.
+    client.cookies.set(REFRESH_COOKIE, REFRESH_TOKEN)
+
+    response = client.post("/api/v1/auth/logout")
+
+    assert auth_service.logout_calls == [REFRESH_TOKEN]
+    assert _cookie_attributes(response)["value"] == ""
+
+
+def test_logout_without_a_cookie_still_succeeds(
+    client: TestClient, auth_service: FakeAuthService
+) -> None:
+    # A client asking to be logged out ends up logged out; that state already
+    # holds if it was already true. Nothing to revoke, so the service is spared.
+    response = client.post("/api/v1/auth/logout")
+
+    assert response.status_code == 204
+    assert auth_service.logout_calls == []
+    assert _cookie_attributes(response)["value"] == ""
+
+
 def test_logout_is_idempotent_over_http(client: TestClient, auth_service: FakeAuthService) -> None:
-    first = client.post("/api/v1/auth/logout", json=REFRESH_PAYLOAD)
-    second = client.post("/api/v1/auth/logout", json=REFRESH_PAYLOAD)
+    client.cookies.set(REFRESH_COOKIE, REFRESH_TOKEN)
+    first = client.post("/api/v1/auth/logout")
+    client.cookies.set(REFRESH_COOKIE, REFRESH_TOKEN)
+    second = client.post("/api/v1/auth/logout")
 
     assert (first.status_code, second.status_code) == (204, 204)
     assert auth_service.logout_calls == [REFRESH_TOKEN, REFRESH_TOKEN]
@@ -466,24 +727,164 @@ def test_logout_is_idempotent_over_http(client: TestClient, auth_service: FakeAu
 
 def test_logout_failure_becomes_401(client: TestClient, auth_service: FakeAuthService) -> None:
     auth_service.logout_error = AuthenticationError("Invalid or expired refresh token.")
+    client.cookies.set(REFRESH_COOKIE, REFRESH_TOKEN)
 
-    response = client.post("/api/v1/auth/logout", json=REFRESH_PAYLOAD)
+    response = client.post("/api/v1/auth/logout")
 
     assert response.status_code == 401
 
 
-@pytest.mark.parametrize("payload", [{}, {"refresh_token": ""}])
-def test_logout_rejects_invalid_payloads(
+# --- Forgot password --------------------------------------------------------
+
+FORGOT_PAYLOAD = {"email": EMAIL}
+RESET_TOKEN = "a-reset-token-value"
+NEW_PASSWORD = "a whole new passphrase 9!"
+RESET_PAYLOAD = {"token": RESET_TOKEN, "new_password": NEW_PASSWORD}
+
+GENERIC_FORGOT_MESSAGE = "If an account exists for that email, a password reset link has been sent."
+
+
+def test_forgot_password_returns_200_and_the_generic_message(client: TestClient) -> None:
+    response = client.post("/api/v1/auth/forgot-password", json=FORGOT_PAYLOAD)
+
+    assert response.status_code == 200
+    assert response.json() == {"message": GENERIC_FORGOT_MESSAGE}
+
+
+def test_forgot_password_passes_the_email_to_the_service(
+    client: TestClient, auth_service: FakeAuthService
+) -> None:
+    client.post("/api/v1/auth/forgot-password", json=FORGOT_PAYLOAD)
+
+    assert auth_service.forgot_password_calls == [EMAIL]
+
+
+def test_forgot_password_answers_identically_for_any_address(client: TestClient) -> None:
+    # The route cannot distinguish the cases — the service returns None for all
+    # of them — so this pins that the *response* is byte-identical too.
+    known = client.post("/api/v1/auth/forgot-password", json={"email": EMAIL})
+    unknown = client.post("/api/v1/auth/forgot-password", json={"email": "nobody@example.com"})
+
+    assert known.status_code == unknown.status_code == 200
+    assert known.json() == unknown.json()
+
+
+def test_forgot_password_response_carries_no_token_or_account_detail(
+    client: TestClient,
+) -> None:
+    body = client.post("/api/v1/auth/forgot-password", json=FORGOT_PAYLOAD).text
+
+    assert "token" not in body
+    # "exists" is deliberately absent from this list: the generic message says
+    # it, in the conditional phrasing that is precisely what reveals nothing.
+    for leaked in ("public_id", "organization", "user_id", "sent_to"):
+        assert leaked not in body
+
+
+@pytest.mark.parametrize("payload", [{"email": "not-an-email"}, {}])
+def test_forgot_password_rejects_invalid_payloads(
     client: TestClient, auth_service: FakeAuthService, payload: dict[str, str]
 ) -> None:
-    response = client.post("/api/v1/auth/logout", json=payload)
+    response = client.post("/api/v1/auth/forgot-password", json=payload)
 
     assert response.status_code == 422
-    assert auth_service.logout_calls == []
+    assert auth_service.forgot_password_calls == []
 
 
-def test_new_routes_are_published(app: FastAPI) -> None:
-    paths = app.openapi()["paths"]
+# --- Reset password ---------------------------------------------------------
 
-    assert "post" in paths["/api/v1/auth/refresh"]
-    assert "post" in paths["/api/v1/auth/logout"]
+
+def test_reset_password_returns_200_and_an_acknowledgement(client: TestClient) -> None:
+    response = client.post("/api/v1/auth/reset-password", json=RESET_PAYLOAD)
+
+    assert response.status_code == 200
+    assert response.json() == {"message": "Your password has been reset. Please sign in."}
+
+
+def test_reset_password_passes_the_payload_to_the_service(
+    client: TestClient, auth_service: FakeAuthService
+) -> None:
+    client.post("/api/v1/auth/reset-password", json=RESET_PAYLOAD)
+
+    assert auth_service.reset_password_calls == [
+        {"token": RESET_TOKEN, "new_password": NEW_PASSWORD}
+    ]
+
+
+def test_reset_password_does_not_sign_the_caller_in(client: TestClient) -> None:
+    # Returning a session here would hand it to whoever holds the link, and
+    # would undo the revocation the reset just performed.
+    body = client.post("/api/v1/auth/reset-password", json=RESET_PAYLOAD).text
+
+    for leaked in ("access_token", "refresh_token", "token_type"):
+        assert leaked not in body
+
+
+def test_reset_password_failure_becomes_401(
+    client: TestClient, auth_service: FakeAuthService
+) -> None:
+    # 401 rather than 404: an invalid link is a rejected credential, which is
+    # how the refresh endpoint already treats a token it will not accept.
+    auth_service.reset_password_error = AuthenticationError(
+        "Password reset link is invalid or expired."
+    )
+
+    response = client.post("/api/v1/auth/reset-password", json=RESET_PAYLOAD)
+
+    assert response.status_code == 401
+    assert response.json()["error"]["code"] == "authentication_error"
+    assert response.json()["error"]["message"] == "Password reset link is invalid or expired."
+
+
+def test_reset_password_failure_reveals_nothing_about_the_token(
+    client: TestClient, auth_service: FakeAuthService
+) -> None:
+    auth_service.reset_password_error = AuthenticationError(
+        "Password reset link is invalid or expired."
+    )
+
+    body = client.post("/api/v1/auth/reset-password", json=RESET_PAYLOAD).text.lower()
+
+    for leaked in ("already used", "consumed", "superseded", "expired at", "belongs to"):
+        assert leaked not in body
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"token": RESET_TOKEN, "new_password": "short"},
+        {"token": RESET_TOKEN, "new_password": "allletters"},
+        {"token": RESET_TOKEN, "new_password": "12345678!"},
+        {"token": RESET_TOKEN, "new_password": "NoSpecial7"},
+        {"token": RESET_TOKEN, "new_password": "x" * 1025},
+        {"token": "", "new_password": NEW_PASSWORD},
+        {"new_password": NEW_PASSWORD},
+        {"token": RESET_TOKEN},
+        {},
+    ],
+)
+def test_reset_password_rejects_invalid_payloads(
+    client: TestClient, auth_service: FakeAuthService, payload: dict[str, str]
+) -> None:
+    # The password cases are the same rule registration enforces, from the same
+    # definition — a laxer reset flow would become the way to install a weak
+    # password.
+    response = client.post("/api/v1/auth/reset-password", json=payload)
+
+    assert response.status_code == 422
+    assert auth_service.reset_password_calls == []
+
+
+def test_reset_password_enforces_the_same_policy_as_registration(
+    client: TestClient, auth_service: FakeAuthService
+) -> None:
+    # Not a restatement of the rule but a comparison of the two endpoints: if
+    # they ever disagree about a password, this fails whichever way it drifted.
+    for candidate in ("nospecial7", "NoDigits!", "short1!", "correct-horse-7!"):
+        register = client.post(
+            "/api/v1/auth/register", json={**REGISTER_PAYLOAD, "password": candidate}
+        )
+        reset = client.post(
+            "/api/v1/auth/reset-password", json={"token": RESET_TOKEN, "new_password": candidate}
+        )
+        assert (register.status_code == 422) == (reset.status_code == 422), candidate
